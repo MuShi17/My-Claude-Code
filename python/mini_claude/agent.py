@@ -1,6 +1,8 @@
-"""Agent core loop — dual backend (Anthropic + OpenAI compatible), streaming,
-4-layer compression, plan mode, sub-agents, budget control.
-Mirrors Claude Code's agent architecture."""
+"""
+Agent 核心循环 — 双后端（Anthropic + OpenAI 兼容）、流式输出、
+4 层上下文压缩、Plan Mode、Sub-Agent、预算控制。
+对应 Claude Code 的 agent 架构。
+"""
 
 from __future__ import annotations
 
@@ -49,10 +51,13 @@ from .prompt import build_system_prompt
 from .subagent import get_sub_agent_config
 from .mcp_client import McpManager
 
-# ─── Retry with exponential backoff ──────────────────────────
+# ─── 指数退避重试 ──────────────────────────────────────────
+# 对 429（限流）、503/529（过载）、网络错误进行最多 3 次重试，
+# 延迟 = 1s/2s/4s（上限 30s）+ 随机抖动，避免惊群效应。
 
 
 def _is_retryable(error: Exception) -> bool:
+    """判断是否为可重试的 API 错误（限流/过载/网络错误）。"""
     status = getattr(error, "status_code", None) or getattr(error, "status", None)
     if status in (429, 503, 529):
         return True
@@ -63,6 +68,7 @@ def _is_retryable(error: Exception) -> bool:
 
 
 async def _with_retry(fn, max_retries: int = 3):
+    """对异步函数 fn 执行指数退避重试。"""
     for attempt in range(max_retries + 1):
         try:
             return await fn()
@@ -76,7 +82,8 @@ async def _with_retry(fn, max_retries: int = 3):
             await asyncio.sleep(delay)
 
 
-# ─── Model context windows ──────────────────────────────────
+# ─── 模型上下文窗口大小 ────────────────────────────────────
+# 用于判断何时需要触发会话压缩（auto-compact）。
 
 MODEL_CONTEXT = {
     "claude-opus-4-6": 200000,
@@ -93,10 +100,13 @@ def _get_context_window(model: str) -> int:
     return MODEL_CONTEXT.get(model, 200000)
 
 
-# ─── Thinking support detection ─────────────────────────────
+# ─── Thinking（扩展思考）支持检测 ────────────────────────────
+# Claude Opus/Sonnet/Haiku 4.x 支持 extended thinking，
+# Claude 3.x 系列不支持；Opus 4.6 / Sonnet 4.6 额外支持 adaptive 模式。
 
 
 def _model_supports_thinking(model: str) -> bool:
+    """判断模型是否支持扩展思考功能。"""
     m = model.lower()
     if "claude-3-" in m or "3-5-" in m or "3-7-" in m:
         return False
@@ -106,11 +116,13 @@ def _model_supports_thinking(model: str) -> bool:
 
 
 def _model_supports_adaptive_thinking(model: str) -> bool:
+    """判断模型是否支持 adaptive thinking（动态调整思考预算）。"""
     m = model.lower()
     return "opus-4-6" in m or "sonnet-4-6" in m
 
 
 def _get_max_output_tokens(model: str) -> int:
+    """获取模型最大输出 token 数，用于设置 API 的 max_tokens 参数。"""
     m = model.lower()
     if "opus-4-6" in m:
         return 64000
@@ -121,7 +133,9 @@ def _get_max_output_tokens(model: str) -> int:
     return 16384
 
 
-# ─── Convert tools to OpenAI format ─────────────────────────
+# ─── 工具转换为 OpenAI 格式 ────────────────────────────────
+# Anthropic 和 OpenAI 的工具 schema 格式不同，此函数将 Anthropic 格式
+# 的 tool_definitions 转换为 OpenAI function calling 格式。
 
 
 def _to_openai_tools(tools: list[ToolDef]) -> list[dict]:
@@ -138,16 +152,22 @@ def _to_openai_tools(tools: list[ToolDef]) -> list[dict]:
     ]
 
 
-# ─── Multi-tier compression constants ────────────────────────
+# ─── 多层压缩常量 ──────────────────────────────────────────
+# SNIPPABLE_TOOLS：可被裁剪的工具类型（结果为文本，模型可重读）
+# SNIP_THRESHOLD：利用率超过 60% 时触发 stale snip
+# MICROCOMPACT_IDLE_S：空闲 5 分钟后触发 microcompact（清除旧工具结果）
+# KEEP_RECENT_RESULTS：压缩时保留最近 3 条工具结果
 
 SNIPPABLE_TOOLS = {"read_file", "grep_search", "list_files", "run_shell"}
 SNIP_PLACEHOLDER = "[Content snipped - re-read if needed]"
 SNIP_THRESHOLD = 0.60
-MICROCOMPACT_IDLE_S = 5 * 60  # 5 minutes
+MICROCOMPACT_IDLE_S = 5 * 60  # 5 分钟
 KEEP_RECENT_RESULTS = 3
 
 
-# ─── Agent ───────────────────────────────────────────────────
+# ─── Agent 主类 ────────────────────────────────────────────
+# 核心编排类，负责：双后端流式调用、工具执行调度、权限检查、
+# 上下文压缩、Plan Mode、Sub-Agent 管理、记忆召回、MCP 集成。
 
 
 class Agent:
@@ -176,47 +196,49 @@ class Agent:
         self.max_cost_usd = max_cost_usd
         self.max_turns = max_turns
         self.confirm_fn = confirm_fn
+        # 有效上下文窗口 = 模型窗口 - 20K 留白（给 system prompt + output）
         self.effective_window = _get_context_window(model) - 20000
         self.session_id = uuid.uuid4().hex[:8]
         self.session_start_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
+        # Token 累计统计
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.last_input_token_count = 0
         self.current_turns = 0
         self.last_api_call_time = 0.0
 
-        # Abort support
+        # Ctrl+C 中断支持
         self._aborted = False
         self._current_task: asyncio.Task | None = None
 
-        # Permission whitelist
+        # 权限白名单：本次会话已确认过的路径
         self._confirmed_paths: set[str] = set()
 
-        # Plan mode state
+        # Plan Mode 状态
         self._pre_plan_mode: str | None = None
         self._plan_file_path: str | None = None
         self._plan_approval_fn: Callable[[str], Awaitable[dict]] | None = None
-        self._context_cleared: bool = False  # Set when plan approval clears context
+        self._context_cleared: bool = False  # plan 审批通过后清空上下文
 
-        # Thinking mode
+        # Thinking（扩展思考）模式：disabled / adaptive / enabled
         self._thinking_mode = self._resolve_thinking_mode()
 
-        # Output buffer (sub-agents capture output)
+        # Sub-Agent 输出缓冲区（子 Agent 通过 _output_buffer 捕获输出）
         self._output_buffer: list[str] | None = None
 
-        # Read-before-edit: track file read timestamps (absolutePath → mtime)
+        # 先读后改保护：记录每个文件上次读取时的 mtime（绝对路径 → mtime）
         self._read_file_state: dict[str, float] = {}
 
-        # MCP integration
+        # MCP 集成（主 Agent 首次聊天时惰性初始化）
         self._mcp_manager = McpManager()
         self._mcp_initialized = False
 
-        # Memory recall state — semantic prefetch per user turn
+        # 记忆召回状态 — 每个用户轮次的语义预取
         self._already_surfaced_memories: set[str] = set()
         self._session_memory_bytes = 0
 
-        # Separate message histories
+        # 双后端消息历史（分开存储，避免格式转换）
         self._anthropic_messages: list[dict] = []
         self._openai_messages: list[dict] = []
 
@@ -228,7 +250,7 @@ class Agent:
         else:
             self._system_prompt = self._base_system_prompt
 
-        # Initialize clients
+        # 初始化 API 客户端（Anthropic 或 OpenAI 兼容）
         if self.use_openai:
             self._openai_client = openai.AsyncOpenAI(base_url=api_base, api_key=api_key)
             self._anthropic_client = None
@@ -256,7 +278,9 @@ class Agent:
         return self._current_task is not None and not self._current_task.done()
 
     def _build_side_query(self):
-        """Build a sideQuery callable for memory recall, works with both backends."""
+        """构建 sideQuery 调用函数 — 用于记忆语义召回。
+        向模型发送小 prompt，从记忆列表中选出相关者。
+        双后端各有一套实现，返回 awaitable callable。"""
         if self._anthropic_client:
             client = self._anthropic_client
             model = self.model
@@ -283,6 +307,7 @@ class Agent:
         return None
 
     def abort(self) -> None:
+        """中断当前 Agent 循环（Ctrl+C 时调用）。"""
         self._aborted = True
         if self._current_task and not self._current_task.done():
             self._current_task.cancel()
@@ -293,7 +318,9 @@ class Agent:
     def set_plan_approval_fn(self, fn: Callable[[str], Awaitable[dict]]) -> None:
         self._plan_approval_fn = fn
 
-    # ─── Plan mode toggle ────────────────────────────────────
+    # ─── Plan Mode 切换 ──────────────────────────────────────
+    # 仅在交互式 REPL 中使用（/plan 命令），
+    # 手动在普通模式与只读计划模式之间切换。
 
     def toggle_plan_mode(self) -> str:
         if self.permission_mode == "plan":
@@ -318,10 +345,12 @@ class Agent:
     def get_token_usage(self) -> dict:
         return {"input": self.total_input_tokens, "output": self.total_output_tokens}
 
-    # ─── Main entry point ────────────────────────────────────
+    # ─── 主入口 ──────────────────────────────────────────────
 
     async def chat(self, user_message: str) -> None:
-        # Lazily connect to MCP servers on first chat (main agent only)
+        """Agent 主循环入口。路由到对应后端（Anthropic / OpenAI）。"""
+        # 首次聊天时惰性连接 MCP 服务器（仅主 Agent）
+
         if not self._mcp_initialized and not self.is_sub_agent:
             self._mcp_initialized = True
             try:
@@ -345,7 +374,9 @@ class Agent:
             print_divider()
             self._auto_save()
 
-    # ─── Sub-agent entry point ────────────────────────────────
+    # ─── Sub-Agent 入口 ──────────────────────────────────────
+    # 子 Agent 通过 run_once 执行单次任务并返回结果，
+    # 输出被 _output_buffer 捕获，token 消耗回计到父 Agent。
 
     async def run_once(self, prompt: str) -> dict:
         self._output_buffer = []
@@ -370,9 +401,10 @@ class Agent:
         else:
             print_assistant_text(text)
 
-    # ─── REPL commands ────────────────────────────────────────
+    # ─── REPL 命令 ───────────────────────────────────────────
 
     def clear_history(self) -> None:
+        """清空对话历史（/clear 命令）。"""
         self._anthropic_messages = []
         self._openai_messages = []
         if self.use_openai:
@@ -401,7 +433,9 @@ class Agent:
     async def compact(self) -> None:
         await self._compact_conversation()
 
-    # ─── Session ──────────────────────────────────────────────
+    # ─── 会话持久化 ──────────────────────────────────────────
+    # 每次 chat 结束自动保存到 ~/.mini-claude/sessions/，
+    # --resume 启动时恢复消息历史。
 
     def restore_session(self, data: dict) -> None:
         if data.get("anthropicMessages"):
@@ -429,7 +463,9 @@ class Agent:
         except Exception:
             pass
 
-    # ─── Autocompact ──────────────────────────────────────────
+    # ─── 自动压缩 ────────────────────────────────────────────
+    # 当上下文利用率超过 85% 时自动触发完整压缩（compact）。
+    # 压缩用模型生成摘要替代历史消息，保留关键决策和文件路径。
 
     async def _check_and_compact(self) -> None:
         if self.last_input_token_count > self.effective_window * 0.85:
@@ -488,7 +524,12 @@ class Agent:
             self._openai_messages.append(last_user_msg)
         self.last_input_token_count = 0
 
-    # ─── Multi-tier compression pipeline ──────────────────────
+    # ─── 多层压缩管线 ────────────────────────────────────────
+    # 每轮 API 调用前执行以下 3 层（Tier 1-3）：
+    #   Tier 1: budget 截断 — 超出预算的大工具结果被头尾截断
+    #   Tier 2: stale snip — 利用率 > 60% 时裁剪旧工具结果
+    #   Tier 3: microcompact — 空闲 > 5 分钟时清除旧结果
+    # Tier 4 (auto-compact) 在每轮 API 调用后检查触发。
 
     def _run_compression_pipeline(self) -> None:
         if self.use_openai:
@@ -500,7 +541,7 @@ class Agent:
             self._snip_stale_results_anthropic()
             self._microcompact_anthropic()
 
-    # Tier 1: Budget tool results
+    # Tier 1: 预算截断 — 当利用率 > 50% 时，将超长工具结果头尾保留、中间截断
     def _budget_tool_results_anthropic(self) -> None:
         utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
         if utilization < 0.5:
@@ -524,7 +565,8 @@ class Agent:
                 keep = (budget - 80) // 2
                 msg["content"] = msg["content"][:keep] + f"\n\n[... budgeted: {len(msg['content']) - keep * 2} chars truncated ...]\n\n" + msg["content"][-keep:]
 
-    # Tier 2: Snip stale results
+    # Tier 2: 过期剪除 — 利用率 > 60% 时，裁剪旧的只读工具结果
+    # 对同一文件多次读取只保留最近一次，只保留最后 KEEP_RECENT_RESULTS 个结果
     def _snip_stale_results_anthropic(self) -> None:
         utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
         if utilization < SNIP_THRESHOLD:
@@ -577,7 +619,7 @@ class Agent:
         for i in range(snip_count):
             self._openai_messages[tool_msgs[i]]["content"] = SNIP_PLACEHOLDER
 
-    # Tier 3: Microcompact
+    # Tier 3: 微压缩 — 空闲时间 > 5 分钟时，清除旧工具结果（标记为 [Old result cleared]）
     def _microcompact_anthropic(self) -> None:
         if not self.last_api_call_time or (time.time() - self.last_api_call_time) < MICROCOMPACT_IDLE_S:
             return
@@ -605,6 +647,7 @@ class Agent:
             self._openai_messages[tool_msgs[i]]["content"] = "[Old result cleared]"
 
     def _find_tool_use_by_id(self, tool_use_id: str) -> dict | None:
+        """根据 tool_use_id 在 Anthropic 消息历史中反向查找对应的工具调用信息。"""
         for msg in self._anthropic_messages:
             if msg.get("role") != "assistant" or not isinstance(msg.get("content"), list):
                 continue
@@ -613,10 +656,9 @@ class Agent:
                     return {"name": block["name"], "input": block.get("input", {})}
         return None
 
-    # ─── Large result persistence ─────────────────────────────────
-    # When a tool result exceeds 30 KB, write it to disk and replace the
-    # context entry with a short preview + file path.  The model can use
-    # read_file to retrieve the full output later — no information is lost.
+    # ─── 大结果持久化 ──────────────────────────────────────
+    # 当工具结果超过 30KB 时，写入磁盘并在上下文中仅保留预览和文件路径。
+    # 模型后续可用 read_file 读取完整结果 —— 信息零丢失。
 
     def _persist_large_result(self, tool_name: str, result: str) -> str:
         THRESHOLD = 30 * 1024  # 30 KB
@@ -639,7 +681,9 @@ class Agent:
             f"Preview (first 200 lines):\n{preview}"
         )
 
-    # ─── Execute tool (handles agent/skill/plan mode internally) ─────
+    # ─── 工具执行路由 ──────────────────────────────────────
+    # 统一分发：plan_mode / agent / skill / MCP / 标准工具。
+    # agent 和 skill 在此处理以避免循环依赖（tools.py 不引用 agent.py）。
 
     async def _execute_tool_call(self, name: str, inp: dict) -> str:
         if name in ("enter_plan_mode", "exit_plan_mode"):
@@ -653,7 +697,9 @@ class Agent:
             return await self._mcp_manager.call_tool(name, inp)
         return await execute_tool(name, inp, self._read_file_state)
 
-    # ─── Skill fork mode ─────────────────────────────────────
+    # ─── Skill 执行（支持 inline / fork 双模式）─────────────
+    # inline: 返回解析后的 prompt，注入当前对话
+    # fork: 创建独立 sub-agent 执行，输出返回当前对话
 
     async def _execute_skill_tool(self, inp: dict) -> str:
         from .skills import execute_skill
@@ -688,14 +734,16 @@ class Agent:
 
         return f'[Skill "{inp.get("skill_name", "")}" activated]\n\n{result["prompt"]}'
 
-    # ─── Plan mode helpers ──────────────────────────────────────
+    # ─── Plan Mode 辅助方法 ──────────────────────────────────
 
     def _generate_plan_file_path(self) -> str:
+        """生成计划文件路径：~/.claude/plans/plan-{session_id}.md"""
         d = Path.home() / ".claude" / "plans"
         d.mkdir(parents=True, exist_ok=True)
         return str(d / f"plan-{self.session_id}.md")
 
     def _build_plan_mode_prompt(self) -> str:
+        """构建 Plan Mode 的 system prompt 扩展：只读限制 + 计划文件路径。"""
         return f"""
 
 # Plan Mode Active
@@ -717,6 +765,8 @@ Write your plan incrementally to this file using write_file or edit_file. This i
 IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask the user to approve — exit_plan_mode handles that."""
 
     async def _execute_plan_mode_tool(self, name: str) -> str:
+        """enter_plan_mode / exit_plan_mode 工具的实现。
+        exit_plan_mode 包含审批流程：4 选项（clear-execute / execute / manual / keep-planning）。"""
         if name == "enter_plan_mode":
             if self.permission_mode == "plan":
                 return "Already in plan mode."
@@ -797,7 +847,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         return f"Unknown plan mode tool: {name}"
 
     def _clear_history_keep_system(self) -> None:
-        """Clear history but keep system prompt (used for clear-context plan approval)."""
+        """清空历史但保留 system prompt（Plan Mode 'clear-and-execute' 选项用）。"""
         self._anthropic_messages = []
         self._openai_messages = []
         if self.use_openai:
@@ -805,6 +855,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         self.last_input_token_count = 0
 
     async def _execute_agent_tool(self, inp: dict) -> str:
+        """执行 agent 工具 — fork-return 模式启动子 Agent。
+        子 Agent 使用独立上下文运行，token 消耗回计到父 Agent。"""
         agent_type = inp.get("type", "general")
         description = inp.get("description", "sub-agent task")
         prompt = inp.get("prompt", "")
@@ -831,12 +883,14 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             print_sub_agent_end(agent_type, description)
             return f"Sub-agent error: {e}"
 
-    # ─── Anthropic backend ───────────────────────────────────────
+    # ─── Anthropic 后端 ─────────────────────────────────────
+    # 流式调用 Anthropic API + 并行工具执行（streaming tool execution）。
+    # 只读工具在 content_block_stop 事件时立即启动（streaming 早期执行）。
 
     async def _chat_anthropic(self, user_message: str) -> None:
         self._anthropic_messages.append({"role": "user", "content": user_message})
 
-        # Start async memory prefetch (non-blocking, fires once per user turn)
+        # 启动异步记忆预取（非阻塞，每个用户轮次触发一次）
         memory_prefetch: MemoryPrefetch | None = None
         if not self.is_sub_agent:
             sq = self._build_side_query()
@@ -852,8 +906,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
             self._run_compression_pipeline()
 
-            # Consume memory prefetch if settled (non-blocking poll, zero-wait).
-            # Append to last user message to maintain user/assistant alternation.
+            # 消费记忆预取结果（非阻塞轮询，zero-wait）。
+            # 追加到最后一个 user 消息以保持 user/assistant 交替。
             if memory_prefetch and memory_prefetch.settled and not memory_prefetch.consumed:
                 memory_prefetch.consumed = True
                 try:
@@ -878,10 +932,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             if not self.is_sub_agent:
                 start_spinner()
 
-            # ── Streaming tool execution ──────────────────────────────
-            # As each tool_use content block completes during streaming, check
-            # if it's concurrency-safe and auto-allowed. If so, start execution
-            # immediately — the tool runs while the model still generates.
+            # ── 流式工具早期执行 ──────────────────────────────
+            # 流式输出的每个 tool_use 块完成时，如果是并发安全的只读工具
+            # 且权限检查自动通过，立即启动执行 — 模型仍在继续生成。
+            # 对应 Claude Code 的 content_block_stop 策略。
             early_executions: dict[str, asyncio.Task] = {}
 
             def _on_tool_block(block: dict):
@@ -929,7 +983,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 inp = dict(tu.input) if hasattr(tu.input, 'items') else tu.input
                 print_tool_call(tu.name, inp)
 
-                # Was this tool already started during streaming?
+                # 该工具是否已在流式阶段提前启动？
                 early_task = early_executions.get(tu.id)
                 if early_task:
                     raw = await early_task
@@ -938,7 +992,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
                     continue
 
-                # Permission check for tools not started early
+                # 非提前启动工具的权限检查
                 perm = check_permission(tu.name, inp, self.permission_mode, self._plan_file_path)
                 if perm["action"] == "deny":
                     print_info(f"Denied: {perm.get('message', '')}")
@@ -955,6 +1009,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 res = self._persist_large_result(tu.name, raw)
                 print_tool_result(tu.name, res)
 
+                # Plan Mode 'clear-and-execute' 后：直接追加工具结果并跳出
                 if self._context_cleared:
                     self._context_cleared = False
                     self._anthropic_messages.append({"role": "user", "content": res})
@@ -971,7 +1026,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
     @staticmethod
     def _block_to_dict(block) -> dict:
-        """Convert an Anthropic content block to a plain dict for storage."""
+        """将 Anthropic content block 对象转为 dict 以便 JSON 序列化存储。"""
         if block.type == "text":
             return {"type": "text", "text": block.text}
         if block.type == "tool_use":
@@ -980,10 +1035,9 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         return {"type": block.type}
 
     async def _call_anthropic_stream(self, on_tool_block_complete=None):
-        """Stream an Anthropic API call. When a tool_use content block finishes
-        during streaming, on_tool_block_complete fires immediately so the caller
-        can start execution before the full response arrives (streaming tool
-        execution -- mirrors Claude Code's content_block_stop approach)."""
+        """流式调用 Anthropic API。每个 tool_use 块完成时立即触发回调，
+        允许在完整响应到达之前提前执行工具（对应 Claude Code content_block_stop 策略）。
+        同时处理 thinking 块的过滤和文本/partial_json 的流式输出。"""
         async def _do():
             max_output = _get_max_output_tokens(self.model)
             create_params: dict[str, Any] = {
@@ -998,7 +1052,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 create_params["thinking"] = {"type": "enabled", "budget_tokens": max_output - 1}
 
             first_text = True
-            # Track in-flight tool_use blocks by index for streaming execution
+            # 跟踪流式传输中的 tool_use 块（按 index），便于 content_block_stop 时解析执行
             tool_blocks_by_index: dict[int, dict] = {}
 
             async with self._anthropic_client.messages.stream(**create_params) as stream:
@@ -1047,18 +1101,20 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
                 final_message = await stream.get_final_message()
 
-            # Filter out thinking blocks
+            # 过滤掉 thinking 块（只保留 text + tool_use，存入消息历史）
             final_message.content = [b for b in final_message.content if b.type != "thinking"]
             return final_message
 
         return await _with_retry(_do)
 
-    # ─── OpenAI-compatible backend ───────────────────────────────
+    # ─── OpenAI 兼容后端 ────────────────────────────────────
+    # 流式调用 OpenAI API，与 Anthropic 后端功能等价。
+    # 并行执行：相邻的并发安全工具通过 asyncio.gather 并行执行。
 
     async def _chat_openai(self, user_message: str) -> None:
         self._openai_messages.append({"role": "user", "content": user_message})
 
-        # Start async memory prefetch (non-blocking, fires once per user turn)
+        # 启动异步记忆预取（非阻塞，每个用户轮次触发一次）
         memory_prefetch: MemoryPrefetch | None = None
         if not self.is_sub_agent:
             sq = self._build_side_query()
@@ -1124,7 +1180,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 print_info(f"Budget exceeded: {budget['reason']}")
                 break
 
-            # Phase 1: Parse & permission-check (serial)
+            # Phase 1: 解析 & 权限检查（串行 — 因为权限确认需要用户交互）
             oai_checked: list[dict] = []
             for tc in tool_calls:
                 if self._aborted:
@@ -1152,7 +1208,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     self._confirmed_paths.add(perm["message"])
                 oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": True})
 
-            # Phase 2: Group & execute (parallel for consecutive safe tools)
+            # Phase 2: 分组 & 执行（连续的并发安全工具分组后 asyncio.gather 并行执行）
             oai_batches: list[dict] = []
             for ct in oai_checked:
                 safe = ct["allowed"] and ct["fn"] in CONCURRENCY_SAFE_TOOLS
@@ -1196,6 +1252,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             await self._check_and_compact()
 
     async def _call_openai_stream(self) -> dict:
+        """流式调用 OpenAI API，实时输出文本，收集 tool_calls 增量。
+        返回与 OpenAI API 兼容的响应格式以便统一处理。"""
         async def _do():
             stream = await self._openai_client.chat.completions.create(
                 model=self.model,
@@ -1267,9 +1325,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
         return await _with_retry(_do)
 
-    # ─── Shared ──────────────────────────────────────────────────
+    # ─── 共享方法 ────────────────────────────────────────────
 
     async def _confirm_dangerous(self, command: str) -> bool:
+        """危险操作确认：调用 confirm_fn 或 fallback 到阻塞式 input。"""
         print_confirmation(command)
         if self.confirm_fn:
             return await self.confirm_fn(command)

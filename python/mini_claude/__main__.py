@@ -7,7 +7,8 @@ import asyncio
 import os
 import signal
 import sys
-
+from dotenv import load_dotenv
+load_dotenv()
 from .agent import Agent
 from .ui import print_welcome, print_user_prompt, print_error, print_info, print_plan_for_approval, print_plan_approval_options
 from .session import load_session, get_latest_session_id
@@ -229,7 +230,7 @@ Examples:
         sys.exit(0)
 
     permission_mode = _resolve_permission_mode(args)
-    model = args.model or os.environ.get("MINI_CLAUDE_MODEL", "claude-opus-4-6")
+    model = args.model or os.getenv("MINI_CLAUDE_MODEL", "claude-opus-4-6")
     api_base = args.api_base
 
     # Resolve API config
@@ -237,21 +238,21 @@ Examples:
     resolved_api_key: str | None = None
     resolved_use_openai = bool(api_base)
 
-    if os.environ.get("OPENAI_API_KEY") and os.environ.get("OPENAI_BASE_URL"):
-        resolved_api_key = os.environ["OPENAI_API_KEY"]
-        resolved_api_base = resolved_api_base or os.environ.get("OPENAI_BASE_URL")
+    if os.getenv("OPENAI_API_KEY") and os.getenv("OPENAI_BASE_URL"):
+        resolved_api_key = os.getenv("OPENAI_API_KEY")
+        resolved_api_base = resolved_api_base or os.getenv("OPENAI_BASE_URL")
         resolved_use_openai = True
-    elif os.environ.get("ANTHROPIC_API_KEY"):
-        resolved_api_key = os.environ["ANTHROPIC_API_KEY"]
-        resolved_api_base = resolved_api_base or os.environ.get("ANTHROPIC_BASE_URL")
+    elif os.getenv("ANTHROPIC_API_KEY"):
+        resolved_api_key = os.getenv("ANTHROPIC_API_KEY")
+        resolved_api_base = resolved_api_base or os.getenv("ANTHROPIC_BASE_URL")
         resolved_use_openai = False
-    elif os.environ.get("OPENAI_API_KEY"):
-        resolved_api_key = os.environ["OPENAI_API_KEY"]
-        resolved_api_base = resolved_api_base or os.environ.get("OPENAI_BASE_URL")
+    elif os.getenv("OPENAI_API_KEY"):
+        resolved_api_key = os.getenv("OPENAI_API_KEY")
+        resolved_api_base = resolved_api_base or os.getenv("OPENAI_BASE_URL")
         resolved_use_openai = True
 
     if not resolved_api_key and api_base:
-        resolved_api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+        resolved_api_key = os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
         resolved_use_openai = True
 
     if not resolved_api_key:
