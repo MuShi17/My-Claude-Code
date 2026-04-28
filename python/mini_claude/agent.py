@@ -1255,15 +1255,18 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         """流式调用 OpenAI API，实时输出文本，收集 tool_calls 增量。
         返回与 OpenAI API 兼容的响应格式以便统一处理。"""
         async def _do():
-            stream = await self._openai_client.chat.completions.create(
-                model=self.model,
-                tools=_to_openai_tools(get_active_tool_definitions(self.tools)),
-                messages=self._openai_messages,
-                stream=True,
-                stream_options={"include_usage": True},
-            )
+            create_params = {
+                "model": self.model,
+                "tools": _to_openai_tools(get_active_tool_definitions(self.tools)),
+                "messages": self._openai_messages,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            }
+
+            stream = await self._openai_client.chat.completions.create(**create_params)
 
             content = ""
+            reasoning_content = ""
             first_text = True
             tool_calls: dict[int, dict] = {}
             finish_reason = ""
@@ -1279,6 +1282,16 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 if not chunk.choices:
                     continue
                 delta = chunk.choices[0].delta
+
+                # 捕获 reasoning_content（DeepSeek 等模型的思考内容）
+                # OpenAI SDK 可能不直接暴露此字段，需要从 model_extra 或原始数据中获取
+                rc = None
+                # 方式1: 直接属性访问
+                if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+                    rc = delta.reasoning_content
+
+                if rc:
+                    reasoning_content += rc
 
                 if delta and delta.content:
                     if first_text:
@@ -1311,13 +1324,25 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     for _, tc in sorted(tool_calls.items())
                 ]
 
+            message = {
+                "role": "assistant",
+                "content": content or None,
+                "tool_calls": assembled,
+            }
+            # DeepSeek thinking 模式要求所有 assistant 消息都包含 reasoning_content
+            # 即使为空也需要保存，以保持一致性
+            model_lower = self.model.lower()
+            is_deepseek_thinking = "deepseek" in model_lower and ("v4" in model_lower or "v3" in model_lower or "reasoner" in model_lower)
+            
+            if reasoning_content:
+                message["reasoning_content"] = reasoning_content
+            elif is_deepseek_thinking:
+                # DeepSeek thinking 模式下，即使没有 reasoning_content 也需要设置空字符串
+                message["reasoning_content"] = ""
+
             return {
                 "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": content or None,
-                        "tool_calls": assembled,
-                    },
+                    "message": message,
                     "finish_reason": finish_reason or "stop",
                 }],
                 "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0},
