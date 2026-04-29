@@ -1283,10 +1283,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     continue
                 delta = chunk.choices[0].delta
 
-                # 捕获 reasoning_content（DeepSeek 等模型的思考内容）
-                # OpenAI SDK 可能不直接暴露此字段，需要从 model_extra 或原始数据中获取
+                # 捕获 reasoning_content（DeepSeek的思考内容）
                 rc = None
-                # 方式1: 直接属性访问
                 if hasattr(delta, "reasoning_content") and delta.reasoning_content:
                     rc = delta.reasoning_content
 
