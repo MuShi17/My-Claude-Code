@@ -4,9 +4,9 @@
 
 ## 项目概述
 
-Mini Claude Code — 一个精简的编程智能体（Python 版约 3800 行，TypeScript 版约 4300 行），复现了 Claude Code 的核心架构。这是一个教学项目，包含功能一致的 Python 和 TypeScript 双实现。
+Mini Claude Code — 一个精简的编程智能体，复现了 Claude Code 的核心架构。
 
-**当前工作范围**：`python/mini_claude/`（Python 版）。
+**当前工作范围**：`python/mini_claude/`（Python）。
 
 ## 常用命令
 

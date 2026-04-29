@@ -1,9 +1,0 @@
-Metadata-Version: 2.4
-Name: claude-code-from-scratch
-Version: 1.0.0
-Summary: A minimal coding agent inspired by Claude Code, built from scratch in Python
-License-Expression: MIT
-Requires-Python: >=3.11
-Requires-Dist: anthropic>=0.40.0
-Requires-Dist: openai>=1.50.0
-Requires-Dist: rich>=13.0.0
