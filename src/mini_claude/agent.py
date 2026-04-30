@@ -957,10 +957,12 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
             tool_uses = [b for b in response.content if b.type == "tool_use"]
 
-            self._anthropic_messages.append({
+            message = {
                 "role": "assistant",
                 "content": [self._block_to_dict(b) for b in response.content],
-            })
+            }
+
+            self._anthropic_messages.append(message)
 
             if not tool_uses:
                 if not self.is_sub_agent:
@@ -1029,6 +1031,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         """将 Anthropic content block 对象转为 dict 以便 JSON 序列化存储。"""
         if block.type == "text":
             return {"type": "text", "text": block.text}
+        if block.type == "thinking":
+            return {"type": "thinking", "thinking": block.thinking}
         if block.type == "tool_use":
             return {"type": "tool_use", "id": block.id, "name": block.name, "input": dict(block.input) if hasattr(block.input, 'items') else block.input}
         # Fallback
@@ -1101,8 +1105,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
                 final_message = await stream.get_final_message()
 
-            # 过滤掉 thinking 块（只保留 text + tool_use，存入消息历史）
-            final_message.content = [b for b in final_message.content if b.type != "thinking"]
+            if "deepseek" in self.model:
+                final_message.content = [b for b in final_message.content]
+            else:
+                final_message.content = [b for b in final_message.content if b.type != "thinking"]
             return final_message
 
         return await _with_retry(_do)

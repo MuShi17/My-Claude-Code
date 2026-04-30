@@ -231,13 +231,26 @@ def get_deferred_tool_names(all_tools: list[ToolDef] | None = None) -> list[str]
 
 def _read_file(inp: dict) -> str:
     """读取文件内容，返回带行号的文本（格式：行号 | 内容）。"""
-    try:
-        content = Path(inp["file_path"]).read_text()
-        lines = content.split("\n")
-        numbered = "\n".join(f"{i+1:4d} | {line}" for i, line in enumerate(lines))
-        return numbered
-    except Exception as e:
-        return f"Error reading file: {e}"
+    file_path = inp["file_path"]
+    # 尝试的编码列表（按优先级）
+    encodings = ['utf-8', 'gbk', 'gb2312']
+    content = None
+    last_error = None
+    for enc in encodings:
+        try:
+            content = Path(file_path).read_text(encoding=enc)
+            break
+        except UnicodeDecodeError as e:
+            last_error = e
+            continue
+        except Exception as e:
+            return f"Error reading file: {e}"
+    if content is None:
+        return f"Error reading file: cannot decode with any encoding (last error: {last_error})"
+    # 添加行号
+    lines = content.split("\n")
+    numbered = "\n".join(f"{i+1:4d} | {line}" for i, line in enumerate(lines))
+    return numbered
 
 
 def _write_file(inp: dict) -> str:
