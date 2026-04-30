@@ -1056,6 +1056,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 create_params["thinking"] = {"type": "enabled", "budget_tokens": max_output - 1}
 
             first_text = True
+            first_thinking = True
             # 跟踪流式传输中的 tool_use 块（按 index），便于 content_block_stop 时解析执行
             tool_blocks_by_index: dict[int, dict] = {}
 
@@ -1080,10 +1081,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                                 first_text = False
                             self._emit_text(delta.text)
                         elif hasattr(delta, 'thinking'):
-                            if first_text:
+                            if first_thinking:
                                 stop_spinner()
-                                self._emit_text("\n  [thinking] ")
-                                first_text = False
+                                self._emit_text("[thinking]\n ")
+                                first_thinking = False
                             self._emit_text(delta.thinking)
                         elif hasattr(delta, 'partial_json'):
                             tb = tool_blocks_by_index.get(event.index)

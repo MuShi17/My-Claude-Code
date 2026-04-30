@@ -228,11 +228,8 @@ def get_deferred_tool_names(all_tools: list[ToolDef] | None = None) -> list[str]
 # 每个工具对应一个 _<tool_name>() 函数，输入为解析后的参数字典，返回字符串结果
 # agent 和 skill 工具在 agent.py 中处理，避免循环导入
 
-
-def _read_file(inp: dict) -> str:
-    """读取文件内容，返回带行号的文本（格式：行号 | 内容）。"""
-    file_path = inp["file_path"]
-    # 尝试的编码列表（按优先级）
+def _read_file_with_encoding(file_path: str) -> tuple[str, str]:
+    """读取文件内容，尝试不同的编码。"""
     encodings = ['utf-8', 'gbk', 'gb2312']
     content = None
     last_error = None
@@ -245,6 +242,14 @@ def _read_file(inp: dict) -> str:
             continue
         except Exception as e:
             return f"Error reading file: {e}"
+    return content, last_error
+
+
+def _read_file(inp: dict) -> str:
+    """读取文件内容，返回带行号的文本（格式：行号 | 内容）。"""
+    file_path = inp["file_path"]
+    # 尝试的编码列表（按优先级）
+    content, last_error = _read_file_with_encoding(file_path)
     if content is None:
         return f"Error reading file: cannot decode with any encoding (last error: {last_error})"
     # 添加行号
@@ -262,7 +267,7 @@ def _write_file(inp: dict) -> str:
     try:
         path = Path(inp["file_path"])
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(inp["content"])
+        path.write_text(inp["content"], encoding="utf-8")
         _auto_update_memory_index(str(path))
         lines = inp["content"].split("\n")
         line_count = len(lines)
@@ -469,7 +474,7 @@ def _grep_python(pattern: str, directory: str, include: str | None) -> str:
             if include_pattern and not fnmatch.fnmatch(name, include_pattern):
                 continue
             try:
-                text = Path(full).read_text(errors="replace")
+                text, _ = _read_file_with_encoding(full)
                 for i, line in enumerate(text.split("\n")):
                     if regex.search(line):
                         matches.append(f"{full}:{i+1}:{line}")
