@@ -241,7 +241,7 @@ def _read_file_with_encoding(file_path: str) -> tuple[str, str]:
             last_error = e
             continue
         except Exception as e:
-            return f"Error reading file: {e}"
+            return "", f"Error reading file: {e}"
     return content, last_error
 
 
@@ -293,7 +293,7 @@ def _auto_update_memory_index(file_path: str) -> None:
                 if f.name == "MEMORY.md":
                     continue
                 try:
-                    raw = f.read_text()
+                    raw, _ = _read_file_with_encoding(str(f))
                     # 从 YAML frontmatter 中提取元数据字段
                     name_match = re.search(r"^name:\s*(.+)$", raw, re.MULTILINE)
                     type_match = re.search(r"^type:\s*(.+)$", raw, re.MULTILINE)
@@ -305,7 +305,7 @@ def _auto_update_memory_index(file_path: str) -> None:
                         lines.append(f"- **[{n}]({f.name})** ({t}) — {d}")
                 except Exception:
                     pass
-            (mem_path / "MEMORY.md").write_text("\n".join(lines))
+            (mem_path / "MEMORY.md").write_text("\n".join(lines), encoding="utf-8")
     except Exception:
         pass
 
@@ -363,7 +363,7 @@ def _edit_file(inp: dict) -> str:
     """
     try:
         path = Path(inp["file_path"])
-        content = path.read_text()
+        content, _ = _read_file_with_encoding(inp["file_path"])
 
         actual = _find_actual_string(content, inp["old_string"])
         if not actual:
@@ -374,7 +374,7 @@ def _edit_file(inp: dict) -> str:
             return f"Error: old_string found {count} times in {inp['file_path']}. Must be unique."
 
         new_content = content.replace(actual, inp["new_string"], 1)
-        path.write_text(new_content)
+        path.write_text(new_content, encoding="utf-8")
 
         diff = _generate_diff(content, actual, inp["new_string"])
         quote_note = " (matched via quote normalization)" if actual != inp["old_string"] else ""

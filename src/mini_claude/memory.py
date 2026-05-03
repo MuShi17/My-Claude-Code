@@ -27,6 +27,7 @@ MAX_INDEX_BYTES = 25000
 
 
 class MemoryEntry:
+    """内存条目的完整信息类。"""
     __slots__ = ("name", "description", "type", "filename", "content")
 
     def __init__(self, name: str, description: str, type: str, filename: str, content: str):
@@ -41,16 +42,19 @@ class MemoryEntry:
 
 
 def _project_hash() -> str:
+    """基于当前工作目录生成项目哈希（用于隔离不同项目的内存）。"""
     return hashlib.sha256(str(Path.cwd()).encode()).hexdigest()[:16]
 
 
 def get_memory_dir() -> Path:
+    """获取当前项目的内存目录路径，如果不存在则创建。"""
     d = Path.home() / ".mini-claude" / "projects" / _project_hash() / "memory"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
 def _get_index_path() -> Path:
+    """获取 MEMORY.md 索引文件的路径。"""
     return get_memory_dir() / "MEMORY.md"
 
 
@@ -58,6 +62,7 @@ def _get_index_path() -> Path:
 
 
 def _slugify(text: str) -> str:
+    """将文本转换为适合文件名的格式（小写、下划线连接、限制长度）。"""
     s = re.sub(r"[^a-z0-9]+", "_", text.lower())
     s = s.strip("_")
     return s[:40]
@@ -67,6 +72,7 @@ def _slugify(text: str) -> str:
 
 
 def list_memories() -> list[MemoryEntry]:
+    """列出所有内存条目，按修改时间倒序排列。"""
     d = get_memory_dir()
     entries: list[MemoryEntry] = []
     for f in sorted(d.glob("*.md")):
@@ -93,6 +99,7 @@ def list_memories() -> list[MemoryEntry]:
 
 
 def save_memory(name: str, description: str, type: str, content: str) -> str:
+    """保存一条内存，自动更新索引文件。"""
     d = get_memory_dir()
     filename = f"{type}_{_slugify(name)}.md"
     text = format_frontmatter({"name": name, "description": description, "type": type}, content)
@@ -102,6 +109,7 @@ def save_memory(name: str, description: str, type: str, content: str) -> str:
 
 
 def delete_memory(filename: str) -> bool:
+    """删除指定内存文件，自动更新索引文件。"""
     filepath = get_memory_dir() / filename
     if not filepath.exists():
         return False
@@ -114,6 +122,7 @@ def delete_memory(filename: str) -> bool:
 
 
 def _update_memory_index() -> None:
+    """根据当前所有内存文件更新 MEMORY.md 索引。"""
     memories = list_memories()
     lines = ["# Memory Index", ""]
     for m in memories:
@@ -122,6 +131,7 @@ def _update_memory_index() -> None:
 
 
 def load_memory_index() -> str:
+    """加载内存索引内容，如果过大则截断。"""
     index_path = _get_index_path()
     if not index_path.exists():
         return ""
@@ -137,6 +147,7 @@ def load_memory_index() -> str:
 # ─── Memory Header (lightweight scan) ──────────────────────
 
 class MemoryHeader:
+    """内存条目的轻量级头部信息（用于快速扫描，不加载完整内容）。"""
     __slots__ = ("filename", "file_path", "mtime_ms", "description", "type")
 
     def __init__(self, filename: str, file_path: str, mtime_ms: float,
@@ -196,6 +207,7 @@ def format_memory_manifest(headers: list[MemoryHeader]) -> str:
 # ─── Memory Age / Freshness ────────────────────────────────
 
 def memory_age(mtime_ms: float) -> str:
+    """计算内存文件的年龄（今天/昨天/X天前）。"""
     days = max(0, int((time.time() * 1000 - mtime_ms) / 86_400_000))
     if days == 0:
         return "today"
@@ -205,6 +217,7 @@ def memory_age(mtime_ms: float) -> str:
 
 
 def memory_freshness_warning(mtime_ms: float) -> str:
+    """如果内存较旧，返回警告提示（超过1天）。"""
     days = max(0, int((time.time() * 1000 - mtime_ms) / 86_400_000))
     if days <= 1:
         return ""
@@ -223,6 +236,7 @@ Return a JSON object with a "selected_memories" array of filenames for the memor
 
 
 class RelevantMemory:
+    """被选中用于注入的相关内存。"""
     __slots__ = ("path", "content", "mtime_ms", "header")
 
     def __init__(self, path: str, content: str, mtime_ms: float, header: str):
@@ -289,12 +303,14 @@ async def select_relevant_memories(
 # ─── Prefetch Handle ────────────────────────────────────────
 
 class MemoryPrefetch:
+    """内存预取任务的包装类，用于轮询任务是否完成。"""
     def __init__(self, task: asyncio.Task):
         self.task = task
         self.consumed = False
 
     @property
     def settled(self) -> bool:
+        """检查预取任务是否已完成。"""
         return self.task.done()
 
 
@@ -337,6 +353,7 @@ def format_memories_for_injection(memories: list[RelevantMemory]) -> str:
 
 
 def build_memory_prompt_section() -> str:
+    """构建系统提示中关于内存系统的说明部分。"""
     index = load_memory_index()
     memory_dir = str(get_memory_dir())
 

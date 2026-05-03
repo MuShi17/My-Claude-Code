@@ -1,0 +1,17 @@
+// ~/.claude/settings.json（用户级，全局生效）
+{
+  "permissions": {
+    "allow": [
+      "read_file",
+      "list_files",
+      "grep_search",
+      "run_shell(npm test*)",
+      "run_shell(git status)",
+      "run_shell(git diff*)"
+    ],
+    "deny": [
+      "run_shell(rm -rf*)",
+      "run_shell(git push --force*)"
+    ]
+  }
+}
