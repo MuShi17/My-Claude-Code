@@ -379,6 +379,12 @@ a:hover { opacity: 0.8; }
   padding: 8px 12px;
 }
 
+/* Response text layer — below thinking */
+.text-body {
+  display: block;
+  min-height: 1em;
+}
+
 /* Diff lines */
 .diff-line { font-family: var(--font-mono); font-size: 12px; line-height: 1.5; white-space: pre-wrap; }
 .diff-line.add { color: var(--green); }

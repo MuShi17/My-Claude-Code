@@ -211,9 +211,9 @@ function appendMessage(role, text) {
     const div = document.createElement('div');
     div.className = `message ${role}`;
     if (text) div.textContent = text;
-    // For assistant messages, add a content wrapper for thinking + text
+    // For assistant messages, add content layers for thinking + text
     if (role === 'assistant' && !text) {
-        const body = document.createElement('span');
+        const body = document.createElement('div');
         body.className = 'text-body';
         div.appendChild(body);
     }
