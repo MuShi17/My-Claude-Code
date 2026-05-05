@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mini Claude Code — 管理面板</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <header>
+        <span class="title">管理面板</span>
+        <span class="nav"><a href="/">← 返回聊天</a></span>
+    </header>
+
+    <div class="admin-tabs">
+        <div class="admin-tab active" data-tab="sessions">会话</div>
+        <div class="admin-tab" data-tab="memories">记忆</div>
+        <div class="admin-tab" data-tab="skills">技能</div>
+        <div class="admin-tab" data-tab="config">配置</div>
+    </div>
+
+    <div class="admin-content">
+        <div id="tab-sessions" class="tab-panel active"><p style="color:var(--dim)">Loading...</p></div>
+        <div id="tab-memories" class="tab-panel"><p style="color:var(--dim)">Loading...</p></div>
+        <div id="tab-skills" class="tab-panel"><p style="color:var(--dim)">Loading...</p></div>
+        <div id="tab-config" class="tab-panel"><p style="color:var(--dim)">Loading...</p></div>
+    </div>
+
+    <div id="toast"></div>
+
+    <script src="/static/app.js"></script>
+    <script>initAdmin();</script>
+</body>
+</html>

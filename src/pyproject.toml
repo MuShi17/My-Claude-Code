@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "A concise programming agent mimicking Claude Code"
 readme = "README.md"
 requires-python = ">=3.8"
-dependencies = []
+dependencies = [
+    "fastapi>=0.100.0",
+    "uvicorn[standard]>=0.23.0",
+]
 
 [project.scripts]
 mini-claude-py = "mini_claude.__main__:main"
