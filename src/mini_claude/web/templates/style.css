@@ -12,6 +12,7 @@
   --border: #e5e5e7;
   --text: #1a1a2e;
   --text-secondary: #6b6b80;
+  --dim: #6b6b80;
   --accent: #6c5ce7;
   --accent-light: #a29bfe;
   --accent-bg: #f0eeff;
@@ -37,6 +38,7 @@
     --border: #2d2d3d;
     --text: #e8e8ed;
     --text-secondary: #8888a0;
+    --dim: #8888a0;
     --accent: #7c6ff7;
     --accent-light: #a29bfe;
     --accent-bg: #1e1a3a;
