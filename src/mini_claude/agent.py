@@ -1298,6 +1298,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     rc = delta.reasoning_content
 
                 if rc:
+                    # First reasoning chunk gets a marker so the web frontend can
+                    # detect and route it to the collapsible thinking section
+                    prefix = "[thinking]\n" if not reasoning_content else ""
+                    self._emit_text(f"{prefix}{rc}")
                     reasoning_content += rc
 
                 if delta and delta.content:
