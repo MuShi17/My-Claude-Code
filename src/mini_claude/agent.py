@@ -323,6 +323,7 @@ class Agent:
     # 手动在普通模式与只读计划模式之间切换。
 
     def toggle_plan_mode(self) -> str:
+        # 退出plan模式
         if self.permission_mode == "plan":
             self.permission_mode = self._pre_plan_mode or "default"
             self._pre_plan_mode = None
@@ -332,6 +333,7 @@ class Agent:
                 self._openai_messages[0]["content"] = self._system_prompt
             print_info(f"Exited plan mode → {self.permission_mode} mode")
             return self.permission_mode
+        # 进入plan模式
         else:
             self._pre_plan_mode = self.permission_mode
             self.permission_mode = "plan"
@@ -731,7 +733,7 @@ class Agent:
             except Exception as e:
                 print_sub_agent_end("skill-fork", inp.get("skill_name", ""))
                 return f"Skill fork error: {e}"
-
+        # inline mode
         return f'[Skill "{inp.get("skill_name", "")}" activated]\n\n{result["prompt"]}'
 
     # ─── Plan Mode 辅助方法 ──────────────────────────────────

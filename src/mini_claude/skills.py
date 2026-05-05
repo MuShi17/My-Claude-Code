@@ -69,7 +69,7 @@ def _parse_skill_file(
     file_path: Path, source: str, skill_dir: str
 ) -> SkillDefinition | None:
     try:
-        raw = file_path.read_text()
+        raw = file_path.read_text(encoding="utf-8")
         result = parse_frontmatter(raw)
         meta = result.meta
 

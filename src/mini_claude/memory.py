@@ -79,7 +79,7 @@ def list_memories() -> list[MemoryEntry]:
         if f.name == "MEMORY.md":
             continue
         try:
-            result = parse_frontmatter(f.read_text())
+            result = parse_frontmatter(f.read_text(encoding="utf-8"))
             meta = result.meta
             if not meta.get("name") or not meta.get("type"):
                 continue
@@ -135,7 +135,7 @@ def load_memory_index() -> str:
     index_path = _get_index_path()
     if not index_path.exists():
         return ""
-    content = index_path.read_text()
+    content = index_path.read_text(encoding="utf-8")
     lines = content.split("\n")
     if len(lines) > MAX_INDEX_LINES:
         content = "\n".join(lines[:MAX_INDEX_LINES]) + "\n\n[... truncated, too many memory entries ...]"
@@ -173,7 +173,7 @@ def scan_memory_headers() -> list[MemoryHeader]:
             continue
         try:
             stat = f.stat()
-            raw = f.read_text()
+            raw = f.read_text(encoding="utf-8")
             first30 = "\n".join(raw.split("\n")[:30])
             result = parse_frontmatter(first30)
             meta = result.meta
@@ -280,7 +280,7 @@ async def select_relevant_memories(
 
         result: list[RelevantMemory] = []
         for h in selected:
-            content = Path(h.file_path).read_text()
+            content = Path(h.file_path).read_text(encoding="utf-8")
             if len(content.encode()) > MAX_MEMORY_BYTES_PER_FILE:
                 content = content[:MAX_MEMORY_BYTES_PER_FILE] + "\n\n[... truncated, memory file too large ...]"
             freshness = memory_freshness_warning(h.mtime_ms)

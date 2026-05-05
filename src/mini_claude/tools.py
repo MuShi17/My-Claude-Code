@@ -613,7 +613,7 @@ def _load_settings(file_path: Path) -> dict | None:
     if not file_path.exists():
         return None
     try:
-        return json.loads(file_path.read_text())
+        return json.loads(file_path.read_text(encoding="utf-8"))
     except Exception:
         return None
 

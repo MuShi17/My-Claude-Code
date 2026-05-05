@@ -23,7 +23,7 @@ def load_session(session_id: str) -> dict[str, Any] | None:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
 
@@ -33,7 +33,7 @@ def list_sessions() -> list[dict[str, Any]]:
     results = []
     for f in SESSION_DIR.glob("*.json"):
         try:
-            data = json.loads(f.read_text())
+            data = json.loads(f.read_text(encoding="utf-8"))
             if "metadata" in data:
                 results.append(data["metadata"])
         except Exception:
