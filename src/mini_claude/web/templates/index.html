@@ -7,34 +7,55 @@
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-    <header>
-        <span class="title">Mini Claude Code Web</span>
-        <div>
-            <span class="status-bar" id="status-info">Loading...</span>
-            <span class="nav"><a href="/admin">管理面板</a></span>
+<div id="app">
+
+    <!-- Sidebar -->
+    <aside id="sidebar">
+        <div class="sidebar-header">
+            <span class="logo-dot"></span>Mini Claude Code
         </div>
-    </header>
-
-    <div id="banner" class="banner" style="display:none"></div>
-
-    <div id="messages"></div>
-
-    <div id="input-area">
-        <div class="shortcuts">
-            <span class="shortcut" data-cmd="/clear">/clear</span>
-            <span class="shortcut" data-cmd="/compact">/compact</span>
-            <span class="shortcut" data-cmd="/cost">/cost</span>
-            <span class="shortcut" data-cmd="/plan">/plan</span>
+        <button class="btn-new-chat" id="btn-new-chat">+ 新对话</button>
+        <div class="sidebar-body" id="session-list">
+            <div style="padding:12px;color:var(--text-secondary);font-size:12px">暂无会话</div>
         </div>
-        <div class="row">
-            <textarea id="user-input" rows="1" placeholder="输入你的问题..."></textarea>
-            <button class="btn primary" id="send-btn">发送</button>
+        <div class="sidebar-footer">
+            <a class="sidebar-link" href="/admin">管理面板 →</a>
         </div>
-    </div>
+    </aside>
 
-    <div id="toast"></div>
+    <!-- Main -->
+    <main id="main">
+        <header id="topbar">
+            <div style="display:flex;align-items:center">
+                <button class="hamburger" id="hamburger" aria-label="菜单">☰</button>
+                <span class="current-title" id="current-title">新对话</span>
+            </div>
+            <span class="status-text" id="status-info">Loading...</span>
+        </header>
 
-    <script src="/static/app.js"></script>
-    <script>initChat();</script>
+        <div id="banner" style="display:none"></div>
+
+        <div id="messages"></div>
+
+        <div id="input-area">
+            <div class="shortcuts">
+                <span class="shortcut" data-cmd="/clear">/clear</span>
+                <span class="shortcut" data-cmd="/compact">/compact</span>
+                <span class="shortcut" data-cmd="/cost">/cost</span>
+                <span class="shortcut" data-cmd="/plan">/plan</span>
+            </div>
+            <div class="input-row">
+                <textarea id="user-input" rows="1" placeholder="输入消息... (Enter 发送，Shift+Enter 换行)"></textarea>
+                <button class="btn-send" id="send-btn" title="发送">↑</button>
+            </div>
+        </div>
+    </main>
+
+</div>
+
+<div id="toast"></div>
+
+<script src="/static/app.js"></script>
+<script>initChat();</script>
 </body>
 </html>

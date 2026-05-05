@@ -7,28 +7,43 @@
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-    <header>
-        <span class="title">管理面板</span>
-        <span class="nav"><a href="/">← 返回聊天</a></span>
-    </header>
+<div id="app">
 
-    <div class="admin-tabs">
-        <div class="admin-tab active" data-tab="sessions">会话</div>
-        <div class="admin-tab" data-tab="memories">记忆</div>
-        <div class="admin-tab" data-tab="skills">技能</div>
-        <div class="admin-tab" data-tab="config">配置</div>
-    </div>
+    <aside id="sidebar">
+        <div class="sidebar-header">
+            <span class="logo-dot"></span>Mini Claude Code
+        </div>
+        <div class="sidebar-body" style="padding:10px">
+            <a class="sidebar-link" href="/">← 返回聊天</a>
+        </div>
+    </aside>
 
-    <div class="admin-content">
-        <div id="tab-sessions" class="tab-panel active"><p style="color:var(--dim)">Loading...</p></div>
-        <div id="tab-memories" class="tab-panel"><p style="color:var(--dim)">Loading...</p></div>
-        <div id="tab-skills" class="tab-panel"><p style="color:var(--dim)">Loading...</p></div>
-        <div id="tab-config" class="tab-panel"><p style="color:var(--dim)">Loading...</p></div>
-    </div>
+    <main id="main">
+        <header id="topbar">
+            <span class="current-title">管理面板</span>
+            <span class="status-text"></span>
+        </header>
 
-    <div id="toast"></div>
+        <nav class="admin-nav">
+            <div class="admin-tab active" data-tab="sessions">会话</div>
+            <div class="admin-tab" data-tab="memories">记忆</div>
+            <div class="admin-tab" data-tab="skills">技能</div>
+            <div class="admin-tab" data-tab="config">配置</div>
+        </nav>
 
-    <script src="/static/app.js"></script>
-    <script>initAdmin();</script>
+        <div class="admin-content">
+            <div id="tab-sessions" class="tab-panel active"><p style="color:var(--text-secondary)">Loading...</p></div>
+            <div id="tab-memories" class="tab-panel"><p style="color:var(--text-secondary)">Loading...</p></div>
+            <div id="tab-skills" class="tab-panel"><p style="color:var(--text-secondary)">Loading...</p></div>
+            <div id="tab-config" class="tab-panel"><p style="color:var(--text-secondary)">Loading...</p></div>
+        </div>
+    </main>
+
+</div>
+
+<div id="toast"></div>
+
+<script src="/static/app.js"></script>
+<script>initAdmin();</script>
 </body>
 </html>

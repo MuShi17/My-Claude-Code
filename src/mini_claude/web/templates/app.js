@@ -71,6 +71,36 @@ function initChat() {
             updateStatusBar(s);
         })
         .catch(() => showBanner('Cannot reach server', 'error'));
+
+    // Sidebar: new chat
+    const btnNewChat = document.getElementById('btn-new-chat');
+    if (btnNewChat) {
+        btnNewChat.addEventListener('click', () => {
+            fetch('/api/clear', { method: 'POST' });
+            document.getElementById('messages').innerHTML = '';
+            document.getElementById('current-title').textContent = '新对话';
+            addToast('新对话已创建');
+        });
+    }
+
+    // Sidebar: hamburger menu for mobile
+    const hamburger = document.getElementById('hamburger');
+    if (hamburger) {
+        hamburger.addEventListener('click', () => {
+            document.getElementById('sidebar').classList.toggle('open');
+        });
+    }
+
+    // Sidebar: close on main click (mobile)
+    const main = document.getElementById('main');
+    if (main) {
+        main.addEventListener('click', () => {
+            document.getElementById('sidebar').classList.remove('open');
+        });
+    }
+
+    // Load session list into sidebar
+    loadSidebarSessions();
 }
 
 async function sendMessage() {
@@ -82,6 +112,11 @@ async function sendMessage() {
 
     // Add user message bubble
     appendMessage('user', message);
+
+    // Update current title from first message content
+    const title = message.slice(0, 40) + (message.length > 40 ? '...' : '');
+    const titleEl = document.getElementById('current-title');
+    if (titleEl) titleEl.textContent = title;
 
     // Create assistant message container
     _currentAssistantDiv = appendMessage('assistant', '');
@@ -125,6 +160,8 @@ async function sendMessage() {
 
     _currentAssistantDiv = null;
     updateStatus();
+    // Refresh sidebar session list
+    setTimeout(() => loadSidebarSessions(), 500);
 }
 
 function handleSSE(type, data) {
@@ -266,7 +303,7 @@ function showBanner(msg, level) {
     const banner = document.getElementById('banner');
     if (banner) {
         banner.textContent = msg;
-        banner.className = 'banner ' + level;
+        banner.className = level;
         banner.style.display = 'block';
     }
 }
@@ -316,6 +353,49 @@ function escapeHtml(s) {
     const d = document.createElement('div');
     d.textContent = s;
     return d.innerHTML;
+}
+
+// ─── Sidebar sessions ──────────────────────────────────────
+
+async function loadSidebarSessions() {
+    try {
+        const sessions = await API.fetchJSON('/api/sessions');
+        const container = document.getElementById('session-list');
+        if (!container) return;
+        if (!sessions.length) {
+            container.innerHTML = '<div style="padding:12px;color:var(--text-secondary);font-size:12px">暂无会话</div>';
+            return;
+        }
+        container.innerHTML = sessions.map(s => `
+            <div class="session-item" data-id="${escapeHtml(s.id)}" onclick="switchSession('${escapeHtml(s.id)}')">
+                <div class="session-info">
+                    <div class="session-title">${escapeHtml(s.id)}</div>
+                    <div class="session-date">${escapeHtml(s.start_time)}</div>
+                </div>
+                <button class="session-delete" onclick="event.stopPropagation();deleteSidebarSession('${escapeHtml(s.id)}')" title="删除">&times;</button>
+            </div>
+        `).join('');
+    } catch(e) { /* silent - sidebar sessions are non-critical */ }
+}
+
+async function switchSession(id) {
+    const r = await API.fetchJSON(`/api/sessions/${id}/resume`, { method: 'POST' });
+    if (r.ok) {
+        document.getElementById('current-title').textContent = id;
+        document.getElementById('messages').innerHTML = '';
+        document.querySelectorAll('.session-item').forEach(el => el.classList.remove('active'));
+        const el = document.querySelector(`.session-item[data-id="${id}"]`);
+        if (el) el.classList.add('active');
+        addToast('会话已恢复');
+    } else {
+        addToast('恢复失败: ' + (r.error || 'unknown'));
+    }
+}
+
+async function deleteSidebarSession(id) {
+    await API.fetchJSON(`/api/sessions/${id}`, { method: 'DELETE' });
+    loadSidebarSessions();
+    addToast('会话已删除');
 }
 
 // ─── Admin page ─────────────────────────────────────────────
