@@ -335,6 +335,50 @@ a:hover { opacity: 0.8; }
   margin: 0;
 }
 
+/* Thinking section */
+.thinking-section {
+  margin-bottom: 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  font-size: 13px;
+}
+.thinking-section .thinking-header {
+  padding: 7px 12px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+  user-select: none;
+  font-size: 12px;
+  font-weight: 500;
+  transition: background 0.15s;
+}
+.thinking-section .thinking-header:hover { background: var(--hover); }
+.thinking-section .thinking-chevron {
+  font-size: 10px;
+  transition: transform 0.2s;
+  display: inline-block;
+}
+.thinking-section.open .thinking-chevron { transform: rotate(90deg); }
+.thinking-section .thinking-body {
+  padding: 0 12px;
+  max-height: 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  line-height: 1.5;
+  transition: max-height 0.25s ease, padding 0.25s ease;
+  font-size: 12px;
+}
+.thinking-section.open .thinking-body {
+  max-height: 300px;
+  overflow-y: auto;
+  padding: 8px 12px;
+}
+
 /* Diff lines */
 .diff-line { font-family: var(--font-mono); font-size: 12px; line-height: 1.5; white-space: pre-wrap; }
 .diff-line.add { color: var(--green); }

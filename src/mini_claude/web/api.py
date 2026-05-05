@@ -46,10 +46,27 @@ async def chat(req: ChatRequest, request: Request):
         _queue: list[tuple[str, any]] = []
 
         # 1) Override _emit_text to push SSE text events
+        # Detect thinking blocks: agent emits "[thinking]\n " prefix and "\n" suffix
         original_emit = agent._emit_text
+        _thinking = False
 
         def _web_emit(text: str):
-            _queue.append(("text", text))
+            nonlocal _thinking
+            if '[thinking]' in text:
+                _thinking = True
+                _queue.append(("thinking_start", None))
+                clean = text.replace('[thinking]\n ', '').replace('[thinking]\n', '')
+                if clean.strip():
+                    _queue.append(("thinking", clean))
+                return
+            if _thinking and text == '\n':
+                _thinking = False
+                _queue.append(("thinking_end", None))
+                return
+            if _thinking:
+                _queue.append(("thinking", text))
+            else:
+                _queue.append(("text", text))
 
         agent._emit_text = _web_emit
 

@@ -164,10 +164,21 @@ async function sendMessage() {
     setTimeout(() => loadSidebarSessions(), 500);
 }
 
+let _thinkingDiv = null;
+
 function handleSSE(type, data) {
     switch (type) {
         case 'text':
             appendText(data);
+            break;
+        case 'thinking_start':
+            addThinkingSection();
+            break;
+        case 'thinking':
+            appendThinking(data);
+            break;
+        case 'thinking_end':
+            endThinking();
             break;
         case 'tool':
             addToolCard(data.name, data.input);
@@ -200,6 +211,12 @@ function appendMessage(role, text) {
     const div = document.createElement('div');
     div.className = `message ${role}`;
     if (text) div.textContent = text;
+    // For assistant messages, add a content wrapper for thinking + text
+    if (role === 'assistant' && !text) {
+        const body = document.createElement('span');
+        body.className = 'text-body';
+        div.appendChild(body);
+    }
     msgs.appendChild(div);
     msgs.scrollTop = msgs.scrollHeight;
     return div;
@@ -209,8 +226,45 @@ function appendText(text) {
     if (_currentAssistantDiv) {
         const spinner = _currentAssistantDiv.querySelector('.spinner');
         if (spinner) spinner.remove();
-        _currentAssistantDiv.textContent += text;
+        const body = _currentAssistantDiv.querySelector('.text-body');
+        if (body) {
+            body.textContent += text;
+        } else {
+            _currentAssistantDiv.textContent += text;
+        }
         document.getElementById('messages').scrollTop = document.getElementById('messages').scrollHeight;
+    }
+}
+
+// ─── Thinking section ──────────────────────────────────────
+
+function addThinkingSection() {
+    if (!_currentAssistantDiv) return;
+    const section = document.createElement('div');
+    section.className = 'thinking-section';
+    section.innerHTML = `
+        <div class="thinking-header" onclick="this.parentElement.classList.toggle('open')">
+            <span class="thinking-chevron">&#9654;</span> 思考过程
+        </div>
+        <div class="thinking-body"></div>
+    `;
+    _currentAssistantDiv.insertBefore(section, _currentAssistantDiv.firstChild);
+    _thinkingDiv = section.querySelector('.thinking-body');
+}
+
+function appendThinking(text) {
+    if (_thinkingDiv) {
+        _thinkingDiv.textContent += text;
+        document.getElementById('messages').scrollTop = document.getElementById('messages').scrollHeight;
+    }
+}
+
+function endThinking() {
+    _thinkingDiv = null;
+    // Auto-collapse the thinking section
+    if (_currentAssistantDiv) {
+        const section = _currentAssistantDiv.querySelector('.thinking-section');
+        if (section) section.classList.remove('open');
     }
 }
 
