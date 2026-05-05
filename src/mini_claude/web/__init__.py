@@ -28,7 +28,9 @@ def create_app(agent) -> FastAPI:
     async def static_file(filename: str):
         from fastapi.responses import FileResponse
         from fastapi import HTTPException
-        filepath = _TEMPLATES_DIR / filename
+        filepath = (_TEMPLATES_DIR / filename).resolve()
+        if not filepath.is_relative_to(_TEMPLATES_DIR.resolve()):
+            raise HTTPException(403, "Path traversal not allowed")
         if not filepath.exists():
             raise HTTPException(404)
         if filename.endswith(".css"):

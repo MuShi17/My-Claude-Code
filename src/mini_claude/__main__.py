@@ -33,6 +33,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true", help="Resume last session")
     parser.add_argument("--max-cost", type=float, default=None, help="Max USD spend")
     parser.add_argument("--max-turns", type=int, default=None, help="Max agentic turns")
+    parser.add_argument("--web", action="store_true", help="Start web interface (FastAPI)")
+    parser.add_argument("--port", type=int, default=8000, help="Web server port (default: 8000)")
     parser.add_argument("--help", "-h", action="store_true", help="Show help")
     return parser.parse_args()
 
@@ -207,6 +209,8 @@ Options:
   --resume            Resume the last session
   --max-cost USD      Stop when estimated cost exceeds this amount
   --max-turns N       Stop after N agentic turns
+  --web                Start web interface (http://localhost:8000)
+  --port N             Web server port (default: 8000)
   --help, -h          Show this help
 
 REPL commands:
@@ -225,6 +229,8 @@ Examples:
   mini-claude --max-cost 0.50 --max-turns 20 "implement feature X"
   OPENAI_API_KEY=sk-xxx mini-claude --api-base https://aihubmix.com/v1 --model gpt-4o "hello"
   mini-claude --resume
+  mini-claude --web                # starts web interface
+  mini-claude --web --port 3000    # web interface on port 3000
   mini-claude  # starts interactive REPL
 """)
         sys.exit(0)
@@ -288,6 +294,15 @@ Examples:
                 print_info("No session found to resume.")
         else:
             print_info("No previous sessions found.")
+
+    # ─── Web 模式 ──────────────────────────────────────
+    if args.web:
+        import uvicorn
+        from .web import create_app
+        app = create_app(agent)
+        print_info(f"Starting web server at http://localhost:{args.port}")
+        uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="info")
+        return
 
     prompt = " ".join(args.prompt) if args.prompt else None
 
