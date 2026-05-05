@@ -252,6 +252,45 @@ async def resume_session(session_id: str, request: Request):
     return {"ok": True}
 
 
+@router.get("/sessions/{session_id}/messages")
+async def get_session_messages(session_id: str):
+    """Return extracted user/assistant messages from a session file."""
+    if ".." in session_id or "/" in session_id or "\\" in session_id:
+        return {"ok": False, "error": "Invalid session ID"}
+    from ..session import load_session
+    data = load_session(session_id)
+    if not data:
+        return {"ok": False, "error": "Session not found"}
+
+    raw = data.get("anthropicMessages") or data.get("openaiMessages") or []
+    messages = []
+    for msg in raw:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+
+        # Anthropic content blocks: extract text
+        if isinstance(content, list):
+            texts = []
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        texts.append(block.get("text", ""))
+                    elif block.get("type") == "tool_use":
+                        texts.append(f"[tool: {block.get('name', '')}]")
+                    elif block.get("type") == "tool_result":
+                        c = block.get("content", "")
+                        if isinstance(c, str) and len(c) > 200:
+                            c = c[:200] + "..."
+                        texts.append(f"[result: {c}]")
+            content = "\n".join(texts) if texts else ""
+
+        if role in ("user", "assistant") and content:
+            # Skip system messages and empty content
+            messages.append({"role": role, "content": str(content)})
+
+    return {"ok": True, "messages": messages}
+
+
 @router.delete("/sessions/{session_id}")
 async def delete_session(session_id: str):
     if ".." in session_id or "/" in session_id or "\\" in session_id:

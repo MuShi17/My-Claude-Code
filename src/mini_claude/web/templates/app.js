@@ -386,6 +386,17 @@ async function switchSession(id) {
         document.querySelectorAll('.session-item').forEach(el => el.classList.remove('active'));
         const el = document.querySelector(`.session-item[data-id="${id}"]`);
         if (el) el.classList.add('active');
+
+        // Load and render historical messages
+        try {
+            const mr = await API.fetchJSON(`/api/sessions/${id}/messages`);
+            if (mr.ok && mr.messages) {
+                for (const msg of mr.messages) {
+                    appendMessage(msg.role, msg.content);
+                }
+            }
+        } catch(e) { /* messages are best-effort */ }
+
         addToast('会话已恢复');
     } else {
         addToast('恢复失败: ' + (r.error || 'unknown'));
