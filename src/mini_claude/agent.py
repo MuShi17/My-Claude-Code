@@ -444,6 +444,10 @@ class Agent:
             self._anthropic_messages = data["anthropicMessages"]
         if data.get("openaiMessages"):
             self._openai_messages = data["openaiMessages"]
+        # Update session_id so _auto_save writes back to the same session file
+        meta = data.get("metadata")
+        if meta and meta.get("id"):
+            self.session_id = meta["id"]
         print_info(f"Session restored ({self._get_message_count()} messages).")
 
     def _get_message_count(self) -> int:
