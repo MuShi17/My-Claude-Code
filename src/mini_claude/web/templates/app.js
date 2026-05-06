@@ -58,10 +58,9 @@ function initChat() {
     const shutdownBtn = document.getElementById('btn-shutdown');
     if (shutdownBtn) {
         shutdownBtn.addEventListener('click', () => {
-            if (confirm('确定要关闭服务吗？')) {
-                fetch('/api/shutdown', { method: 'POST' });
-                showBanner('服务已关闭，可以关闭此页面', 'error');
-            }
+            addToast('正在关闭服务...');
+            fetch('/api/shutdown', { method: 'POST' });
+            showBanner('服务已关闭', 'error');
         });
     }
 
