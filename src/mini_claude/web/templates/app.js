@@ -54,6 +54,17 @@ function initChat() {
         });
     }
 
+    // Shutdown button
+    const shutdownBtn = document.getElementById('btn-shutdown');
+    if (shutdownBtn) {
+        shutdownBtn.addEventListener('click', () => {
+            if (confirm('确定要关闭服务吗？')) {
+                fetch('/api/shutdown', { method: 'POST' });
+                showBanner('服务已关闭，可以关闭此页面', 'error');
+            }
+        });
+    }
+
     // Shortcut buttons
     document.querySelectorAll('.shortcut').forEach(btn => {
         btn.addEventListener('click', () => {
