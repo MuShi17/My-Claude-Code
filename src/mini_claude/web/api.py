@@ -238,11 +238,11 @@ async def abort_agent(request: Request):
 
 @router.post("/shutdown")
 async def shutdown():
-    """Shut down the entire server after responding."""
-    import sys as _sys
+    """Shut down the entire server immediately."""
+    import os as _os
 
     def _do_exit():
-        _sys.exit(0)
+        _os._exit(0)
 
     import asyncio as _asyncio
     _asyncio.get_running_loop().call_later(0.3, _do_exit)
