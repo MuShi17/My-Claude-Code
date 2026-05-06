@@ -472,6 +472,22 @@ a:hover { opacity: 0.8; }
 }
 #input-area .btn-send:hover { opacity: 0.85; transform: scale(1.04); }
 #input-area .btn-send:active { transform: scale(0.96); }
+#input-area .btn-stop {
+  width: 48px; height: 48px;
+  background: var(--red);
+  color: #fff;
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+  font-size: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: opacity 0.15s, transform 0.15s;
+  flex-shrink: 0;
+}
+#input-area .btn-stop:hover { opacity: 0.85; transform: scale(1.04); }
+#input-area .btn-stop:active { transform: scale(0.96); }
 
 #input-area textarea::placeholder {
     color: var(--text-secondary);

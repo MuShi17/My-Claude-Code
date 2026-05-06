@@ -45,6 +45,15 @@ function initChat() {
         }
     });
 
+    // Stop button
+    const stopBtn = document.getElementById('stop-btn');
+    if (stopBtn) {
+        stopBtn.addEventListener('click', () => {
+            fetch('/api/abort', { method: 'POST' });
+            addToast('正在终止...');
+        });
+    }
+
     // Shortcut buttons
     document.querySelectorAll('.shortcut').forEach(btn => {
         btn.addEventListener('click', () => {
@@ -110,6 +119,12 @@ async function sendMessage() {
     input.value = '';
     input.focus();
 
+    // Swap send/stop buttons
+    const sendBtn = document.getElementById('send-btn');
+    const stopBtn = document.getElementById('stop-btn');
+    sendBtn.style.display = 'none';
+    stopBtn.style.display = 'flex';
+
     // Add user message bubble
     appendMessage('user', message);
 
@@ -159,9 +174,17 @@ async function sendMessage() {
     }
 
     _currentAssistantDiv = null;
+    doneSending();
     updateStatus();
     // Refresh sidebar session list
     setTimeout(() => loadSidebarSessions(), 500);
+}
+
+function doneSending() {
+    const sendBtn = document.getElementById('send-btn');
+    const stopBtn = document.getElementById('stop-btn');
+    if (sendBtn) sendBtn.style.display = 'flex';
+    if (stopBtn) stopBtn.style.display = 'none';
 }
 
 let _thinkingDiv = null;
@@ -194,6 +217,7 @@ function handleSSE(type, data) {
             break;
         case 'error':
             appendError(data);
+            doneSending();
             break;
         case 'info':
             addToast(data);
@@ -202,6 +226,7 @@ function handleSSE(type, data) {
             updateStatusBarCost(data);
             break;
         case 'done':
+            doneSending();
             break;
     }
 }

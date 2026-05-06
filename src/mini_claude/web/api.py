@@ -229,6 +229,13 @@ async def toggle_plan(request: Request):
     return {"mode": mode}
 
 
+@router.post("/abort")
+async def abort_agent(request: Request):
+    agent = _get_agent(request)
+    agent.abort()
+    return {"ok": True}
+
+
 # ─── Sessions ────────────────────────────────────────────────
 
 @router.get("/sessions", response_model=list[SessionItem])
