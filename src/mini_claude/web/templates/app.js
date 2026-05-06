@@ -34,8 +34,18 @@ let _currentAssistantDiv = null;
 let _toolCardMap = {};
 
 function initChat() {
+    // Shutdown button — must be first so it always registers
+    (function(){
+        var btn = document.getElementById('btn-shutdown');
+        if (btn) btn.onclick = function(){
+            fetch('/api/shutdown', { method: 'POST' });
+            document.body.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;color:#888">服务已关闭</div>';
+        };
+    })();
+
     const input = document.getElementById('user-input');
     const sendBtn = document.getElementById('send-btn');
+    if (!input || !sendBtn) return;
 
     sendBtn.addEventListener('click', sendMessage);
     input.addEventListener('keydown', (e) => {
@@ -51,16 +61,6 @@ function initChat() {
         stopBtn.addEventListener('click', () => {
             fetch('/api/abort', { method: 'POST' });
             addToast('正在终止...');
-        });
-    }
-
-    // Shutdown button
-    const shutdownBtn = document.getElementById('btn-shutdown');
-    if (shutdownBtn) {
-        shutdownBtn.addEventListener('click', () => {
-            addToast('正在关闭服务...');
-            fetch('/api/shutdown', { method: 'POST' });
-            showBanner('服务已关闭', 'error');
         });
     }
 
