@@ -223,21 +223,21 @@ a:hover { opacity: 0.8; }
   color: var(--text-secondary);
 }
 #topbar .btn-shutdown {
-  background: none;
-  border: 1px solid var(--border);
-  color: var(--text-secondary);
+  width: 24px; height: 24px;
+  background: var(--red);
+  border: none;
+  color: #fff;
   cursor: pointer;
-  font-size: 13px;
-  padding: 4px 8px;
-  border-radius: var(--radius-sm);
-  font-family: var(--font);
-  transition: all 0.15s;
-  line-height: 1;
+  font-size: 12px;
+  font-weight: 700;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: opacity 0.15s;
+  flex-shrink: 0;
 }
-#topbar .btn-shutdown:hover {
-  color: var(--red);
-  border-color: var(--red);
-}
+#topbar .btn-shutdown:hover { opacity: 0.8; }
 #topbar .hamburger {
   display: none;
   background: none;
