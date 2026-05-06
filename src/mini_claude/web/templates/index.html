@@ -32,7 +32,7 @@
             </div>
             <div style="display:flex;align-items:center;gap:12px">
                 <span class="status-text" id="status-info">Loading...</span>
-                <button class="btn danger" id="btn-shutdown" title="关闭服务" style="padding:4px 14px;font-size:12px">关闭</button>
+                <button class="btn danger" id="btn-shutdown" title="关闭服务" style="padding:4px 14px;font-size:12px" onclick="fetch('/api/shutdown',{method:'POST'});this.textContent='...';setTimeout(function(){document.body.innerHTML='<div style=display:flex;align-items:center;justify-content:center;height:100vh;font-family:sans-serif;color:#888>服务已关闭</div>'},500)">关闭</button>
             </div>
         </header>
 
