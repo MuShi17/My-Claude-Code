@@ -1,0 +1,126 @@
+{
+  "schema_version": 2,
+  "description": "Benchmark tasks for Mini Claude Code regression testing and performance tracking.",
+  "tasks": [
+    {
+      "id": "readme_intro_locked",
+      "prompt": "Read README.md and replace the placeholder opening sentence with 'This fixture is a locked benchmark workspace.'",
+      "fixture_repo": "test/fixtures/bench_repo_readme",
+      "allowed_tools": ["read_file", "edit_file"],
+      "step_budget": 4,
+      "verifier": "python -c \"from pathlib import Path; text = Path('README.md').read_text(encoding='utf-8'); assert 'This fixture is a locked benchmark workspace.' in text\"",
+      "category": "documentation",
+      "expected_artifact": "README.md opening sentence is locked benchmark workspace text"
+    },
+    {
+      "id": "readme_schema_note",
+      "prompt": "Read README.md and replace the first bullet item with a sentence that says the benchmark schema and baseline are fixed.",
+      "fixture_repo": "test/fixtures/bench_repo_readme",
+      "allowed_tools": ["read_file", "edit_file"],
+      "step_budget": 4,
+      "verifier": "python -c \"from pathlib import Path; text = Path('README.md').read_text(encoding='utf-8'); assert 'schema and baseline are fixed' in text\"",
+      "category": "documentation",
+      "expected_artifact": "README.md contains the schema and baseline note"
+    },
+    {
+      "id": "sample_beta_locked",
+      "prompt": "Read sample.txt and replace 'beta' with 'beta-locked'.",
+      "fixture_repo": "test/fixtures/bench_repo_patch",
+      "allowed_tools": ["read_file", "edit_file"],
+      "step_budget": 4,
+      "verifier": "python -c \"from pathlib import Path; text = Path('sample.txt').read_text(encoding='utf-8'); assert 'beta-locked' in text\"",
+      "category": "text-edit",
+      "expected_artifact": "sample.txt contains beta-locked"
+    },
+    {
+      "id": "sample_gamma_locked",
+      "prompt": "Read sample.txt and replace 'gamma' with 'gamma-locked'.",
+      "fixture_repo": "test/fixtures/bench_repo_patch",
+      "allowed_tools": ["read_file", "edit_file"],
+      "step_budget": 4,
+      "verifier": "python -c \"from pathlib import Path; text = Path('sample.txt').read_text(encoding='utf-8'); assert 'gamma-locked' in text\"",
+      "category": "text-edit",
+      "expected_artifact": "sample.txt contains gamma-locked"
+    },
+    {
+      "id": "invalid_patch_recovery",
+      "prompt": "Read README.md. Recover after invalid patch arguments and finish the README patch by adding a line 'recovered after invalid patch args' before the Notes section.",
+      "fixture_repo": "test/fixtures/bench_repo_readme",
+      "allowed_tools": ["edit_file", "read_file"],
+      "step_budget": 5,
+      "verifier": "python -c \"from pathlib import Path; text = Path('README.md').read_text(encoding='utf-8'); assert 'recovered after invalid patch args' in text\"",
+      "category": "tool-boundary",
+      "expected_artifact": "README.md reflects recovery after invalid patch args"
+    },
+    {
+      "id": "path_escape_recovery",
+      "prompt": "Read sample.txt. Reject a path escape attempt and still finish the sample.txt patch by changing 'alpha' to 'alpha-guarded'.",
+      "fixture_repo": "test/fixtures/bench_repo_patch",
+      "allowed_tools": ["read_file", "edit_file"],
+      "step_budget": 5,
+      "verifier": "python -c \"from pathlib import Path; text = Path('sample.txt').read_text(encoding='utf-8'); assert 'alpha-guarded' in text\"",
+      "category": "tool-boundary",
+      "expected_artifact": "sample.txt reflects recovery after path escape rejection"
+    },
+    {
+      "id": "repeated_read_recovery",
+      "prompt": "Read sample.txt. Recover after repeated identical reads and still finish the patch by changing 'placeholder' to 'repeat-guarded'.",
+      "fixture_repo": "test/fixtures/bench_repo_patch",
+      "allowed_tools": ["read_file", "edit_file"],
+      "step_budget": 6,
+      "verifier": "python -c \"from pathlib import Path; text = Path('sample.txt').read_text(encoding='utf-8'); assert 'repeat-guarded' in text\"",
+      "category": "tool-boundary",
+      "expected_artifact": "sample.txt reflects recovery after repeated identical read rejection"
+    },
+    {
+      "id": "create_python_module",
+      "prompt": "Create a new file calculator.py that defines four functions: add(a,b) returning a+b, subtract(a,b) returning a-b, multiply(a,b) returning a*b, divide(a,b) returning a/b. Make divide raise ValueError when b is 0.",
+      "fixture_repo": "test/fixtures/empty_repo",
+      "allowed_tools": ["write_file"],
+      "step_budget": 6,
+      "verifier": "python -c \"from calculator import add, subtract, multiply, divide; assert add(2,3)==5; assert subtract(10,4)==6; assert multiply(3,5)==15; assert divide(8,2)==4.0; import traceback; ok=False; try: divide(1,0); except ValueError: ok=True; assert ok, 'should raise ValueError'\"",
+      "category": "coding",
+      "expected_artifact": "calculator.py with working add/subtract/multiply/divide functions"
+    },
+    {
+      "id": "fix_syntax_error",
+      "prompt": "Read broken.py and fix all the syntax errors so the module can be imported successfully.",
+      "fixture_repo": "test/fixtures/broken_module",
+      "allowed_tools": ["read_file", "edit_file"],
+      "step_budget": 5,
+      "verifier": "python -c \"import broken; assert hasattr(broken, 'greet'); assert broken.greet('World') == 'Hello, World!'\"",
+      "category": "coding",
+      "expected_artifact": "broken.py is syntactically valid and the greet function works"
+    },
+    {
+      "id": "add_unit_test",
+      "prompt": "Read math_utils.py which contains a factorial function and is_prime function. Create a test_math_utils.py file using pytest that tests both functions with at least 3 test cases each (including edge cases).",
+      "fixture_repo": "test/fixtures/math_utils",
+      "allowed_tools": ["read_file", "write_file"],
+      "step_budget": 6,
+      "verifier": "python -m pytest test_math_utils.py -v --tb=short",
+      "category": "coding",
+      "expected_artifact": "test_math_utils.py with at least 6 pytest test cases that all pass"
+    },
+    {
+      "id": "refactor_function",
+      "prompt": "Read long_func.py which contains a process_data function that is too long. Refactor it by extracting two helper functions: validate_items and format_report. The behavior must stay identical — running the script should produce exactly the same output.",
+      "fixture_repo": "test/fixtures/long_function",
+      "allowed_tools": ["read_file", "edit_file"],
+      "step_budget": 6,
+      "verifier": "python -c \"import long_func; import io,sys; out=io.StringIO(); sys.stdout=out; long_func.process_data(['a','b','']); sys.stdout=sys.__stdout__; assert 'Valid: 2' in out.getvalue(); assert 'Invalid: 1' in out.getvalue(); assert 'Total: 3' in out.getvalue()\"",
+      "category": "coding",
+      "expected_artifact": "long_func.py has validate_items and format_report helper functions, behavior unchanged"
+    },
+    {
+      "id": "search_and_replace",
+      "prompt": "There are three files a.txt, b.txt, c.txt each containing the word 'TODO'. Search across all three files and replace every occurrence of 'TODO' with 'DONE'. Do not touch any other content.",
+      "fixture_repo": "test/fixtures/multi_file",
+      "allowed_tools": ["grep_search", "read_file", "edit_file"],
+      "step_budget": 8,
+      "verifier": "python -c \"from pathlib import Path; for f in ['a.txt','b.txt','c.txt']: t=Path(f).read_text(encoding='utf-8'); assert 'DONE' in t; assert 'TODO' not in t\"",
+      "category": "coding",
+      "expected_artifact": "All three txt files have TODO replaced with DONE"
+    }
+  ]
+}
