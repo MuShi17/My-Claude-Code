@@ -1264,7 +1264,17 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             if self._aborted:
                 break
 
+            _pre_size = self._msg_char_count()
             self._run_compression_pipeline()
+            _post_size = self._msg_char_count()
+            if _post_size < _pre_size:
+                utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
+                tier = 1 if utilization > 0.5 else 2 if utilization > SNIP_THRESHOLD else 3
+                await self._emit("compaction", {"tier": tier})
+
+            # 本轮 index
+            turn_index = self.current_turns + 1
+            await self._emit("turn_start", {"turn_index": turn_index})
 
             # Consume memory prefetch if settled (non-blocking poll, zero-wait)
             if memory_prefetch and memory_prefetch.settled and not memory_prefetch.consumed:
@@ -1294,10 +1304,11 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
             self.last_api_call_time = time.time()
 
-            if response.get("usage"):
-                self.total_input_tokens += response["usage"]["prompt_tokens"]
-                self.total_output_tokens += response["usage"]["completion_tokens"]
-                self.last_input_token_count = response["usage"]["prompt_tokens"]
+            usage = response.get("usage", {})
+            if usage:
+                self.total_input_tokens += usage["prompt_tokens"]
+                self.total_output_tokens += usage["completion_tokens"]
+                self.last_input_token_count = usage["prompt_tokens"]
 
             choice = response.get("choices", [{}])[0] if response.get("choices") else {}
             message = choice.get("message", {})
@@ -1305,6 +1316,21 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             self._openai_messages.append(message)
 
             tool_calls = message.get("tool_calls")
+
+            # ★ 发射 turn_end
+            cache_read = 0
+            pt_details = usage.get("prompt_tokens_details")
+            if isinstance(pt_details, dict):
+                cache_read = pt_details.get("cached_tokens", 0)
+            finish = "end_turn" if tool_calls else "stop"
+            await self._emit("turn_end", {
+                "turn_index": turn_index,
+                "input_tokens": usage.get("prompt_tokens", 0),
+                "output_tokens": usage.get("completion_tokens", 0),
+                "cache_read_tokens": cache_read,
+                "cache_create_tokens": 0,  # OpenAI 不单独报告创建
+                "finish_reason": finish,
+            })
             if not tool_calls:
                 if not self.is_sub_agent:
                     print_cost(self.total_input_tokens, self.total_output_tokens)
@@ -1338,6 +1364,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     continue
                 if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self._confirmed_paths:
                     confirmed = await self._confirm_dangerous(perm["message"])
+                    await self._emit("permission", {"message": perm["message"], "allowed": confirmed})
                     if not confirmed:
                         oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": "User denied this action."})
                         continue
@@ -1359,23 +1386,43 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     break
 
                 if batch["concurrent"]:
+                    for ct in batch["items"]:
+                        await self._emit("tool_start", {"tool_name": ct["fn"], "tool_input": ct["inp"]})
+
                     async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
                         raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
                         res = self._persist_large_result(ct_item["fn"], raw)
-                        print_tool_result(ct_item["fn"], res)
                         return ct_item, res
 
+                    t0_batch = time.time()
                     results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
                     for ct_item, res in results:
+                        tool_duration = int((time.time() - t0_batch) * 1000)
+                        await self._emit("tool_end", {
+                            "tool_name": ct_item["fn"],
+                            "tool_input": ct_item["inp"],
+                            "duration_ms": tool_duration,
+                            "result_length": len(res.encode()) if res else 0,
+                        })
+                        print_tool_result(ct_item["fn"], res)
                         self._openai_messages.append({"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
                 else:
                     for ct in batch["items"]:
                         if not ct["allowed"]:
                             self._openai_messages.append({"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]})
                             continue
+                        t0 = time.time()
+                        await self._emit("tool_start", {"tool_name": ct["fn"], "tool_input": ct["inp"]})
                         raw = await self._execute_tool_call(ct["fn"], ct["inp"])
+                        tool_duration = int((time.time() - t0) * 1000)
                         res = self._persist_large_result(ct["fn"], raw)
                         print_tool_result(ct["fn"], res)
+                        await self._emit("tool_end", {
+                            "tool_name": ct["fn"],
+                            "tool_input": ct["inp"],
+                            "duration_ms": tool_duration,
+                            "result_length": len(raw.encode()) if raw else 0,
+                        })
 
                         if self._context_cleared:
                             self._context_cleared = False
@@ -1427,6 +1474,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 if rc:
                     # First reasoning chunk gets a marker so the web frontend can
                     # detect and route it to the collapsible thinking section
+                    if not reasoning_content:
+                        asyncio.create_task(
+                            self._emit("first_token", {"is_thinking": True})
+                        )
                     prefix = "[thinking]\n" if not reasoning_content else ""
                     self._emit_text(f"{prefix}{rc}")
                     reasoning_content += rc
@@ -1436,6 +1487,9 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         stop_spinner()
                         self._emit_text("\n")
                         first_text = False
+                        asyncio.create_task(
+                            self._emit("first_token", {"is_thinking": False})
+                        )
                     self._emit_text(delta.content)
                     content += delta.content
 
