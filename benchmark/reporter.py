@@ -54,9 +54,9 @@ def load_trace_data(trace_path: Path) -> dict[str, Any]:
         if t.get("compaction_triggered"):
             compactions += 1
 
-    # 缓存命中率
+    # 缓存命中率（多轮对话中 cache_read 可能 > input，cap 在 1.0）
     cache_total = total_input if total_input > 0 else 1
-    cache_hit_rate = total_cache_read / cache_total
+    cache_hit_rate = min(total_cache_read / cache_total, 1.0)
 
     return {
         "turns": total_turns,
@@ -116,7 +116,7 @@ def build_report(
     first_tokens = [t["first_token_ms"] for t in tasks if t["first_token_ms"] > 0]
     avg_first_token = sum(first_tokens) // len(first_tokens) if first_tokens else 0
     cache_total = sum(t["input_tokens"] for t in tasks)
-    cache_hit_rate = (total_cache_read / cache_total) if cache_total > 0 else 0.0
+    cache_hit_rate = min(total_cache_read / cache_total, 1.0) if cache_total > 0 else 0.0
 
     # By category
     by_category: dict[str, dict] = {}
