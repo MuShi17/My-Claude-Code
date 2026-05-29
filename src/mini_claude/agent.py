@@ -238,6 +238,12 @@ class Agent:
         self._already_surfaced_memories: set[str] = set()
         self._session_memory_bytes = 0
 
+        # 事件钩子系统（观测/Observer模式）
+        self._event_hooks: dict[str, list] = {}
+
+        # Ask 计数（每次 chat() 入口自增，用于 trace 文件编号）
+        self._ask_count: int = 0
+
         # 双后端消息历史（分开存储，避免格式转换）
         self._anthropic_messages: list[dict] = []
         self._openai_messages: list[dict] = []
@@ -462,6 +468,7 @@ class Agent:
                     "cwd": str(Path.cwd()),
                     "startTime": self.session_start_time,
                     "messageCount": self._get_message_count(),
+                    "askCount": self._ask_count,
                 },
                 "anthropicMessages": self._anthropic_messages if not self.use_openai else None,
                 "openaiMessages": self._openai_messages if self.use_openai else None,
