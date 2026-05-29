@@ -386,7 +386,6 @@ class Agent:
     async def chat(self, user_message: str) -> None:
         """Agent 主循环入口。路由到对应后端（Anthropic / OpenAI）。"""
         # 首次聊天时惰性连接 MCP 服务器（仅主 Agent）
-
         if not self._mcp_initialized and not self.is_sub_agent:
             self._mcp_initialized = True
             try:
@@ -398,14 +397,52 @@ class Agent:
                 print(f"[mcp] Init failed: {e}", flush=True)
 
         self._aborted = False
+        self._ask_count += 1
+
+        # 创建观测器（仅主 Agent）
+        tracer: Any = None
+        if not self.is_sub_agent:
+            from .tracer import SessionTracer
+            tracer = SessionTracer(self._ask_count, user_message)
+            self.on("turn_start", tracer.on_turn_start)
+            self.on("first_token", tracer.on_first_token)
+            self.on("turn_end", tracer.on_turn_end)
+            self.on("tool_start", tracer.on_tool_start)
+            self.on("tool_end", tracer.on_tool_end)
+            self.on("compaction", tracer.on_compaction)
+            self.on("permission", tracer.on_permission)
+
+        await self._emit("chat_start", {"message": user_message, "timestamp": time.time()})
+
         coro = self._chat_openai(user_message) if self.use_openai else self._chat_anthropic(user_message)
         self._current_task = asyncio.current_task()
         try:
             await coro
         except asyncio.CancelledError:
             self._aborted = True
+        except Exception as e:
+            await self._emit("chat_error", {"error": str(e)})
+            raise
         finally:
             self._current_task = None
+            # 取消观测订阅 + 写 trace
+            if tracer:
+                for evt, cb in [
+                    ("turn_start", tracer.on_turn_start),
+                    ("first_token", tracer.on_first_token),
+                    ("turn_end", tracer.on_turn_end),
+                    ("tool_start", tracer.on_tool_start),
+                    ("tool_end", tracer.on_tool_end),
+                    ("compaction", tracer.on_compaction),
+                    ("permission", tracer.on_permission),
+                ]:
+                    self.off(evt, cb)
+                try:
+                    from .session import save_trace
+                    save_trace(self.session_id, self._ask_count, tracer.finalize())
+                except Exception:
+                    pass
+
         if not self.is_sub_agent:
             print_divider()
             self._auto_save()
@@ -511,6 +548,7 @@ class Agent:
     async def _check_and_compact(self) -> None:
         if self.last_input_token_count > self.effective_window * 0.85:
             print_info("Context window filling up, compacting conversation...")
+            await self._emit("compaction", {"tier": 4})
             await self._compact_conversation()
 
     async def _compact_conversation(self) -> None:
@@ -945,7 +983,17 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             if self._aborted:
                 break
 
+            _pre_size = self._msg_char_count()
             self._run_compression_pipeline()
+            _post_size = self._msg_char_count()
+            if _post_size < _pre_size:
+                utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
+                tier = 1 if utilization > 0.5 else 2 if utilization > SNIP_THRESHOLD else 3
+                await self._emit("compaction", {"tier": tier})
+
+            # 本轮 index
+            turn_index = self.current_turns + 1
+            await self._emit("turn_start", {"turn_index": turn_index})
 
             # 消费记忆预取结果（非阻塞轮询，zero-wait）。
             # 追加到最后一个 user 消息以保持 user/assistant 交替。
@@ -998,6 +1046,19 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
             tool_uses = [b for b in response.content if b.type == "tool_use"]
 
+            # ★ 发射 turn_end 事件
+            cache_read = getattr(response.usage, "cache_read_input_tokens", 0) or 0
+            cache_create = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
+            finish = "end_turn" if tool_uses else "stop"
+            await self._emit("turn_end", {
+                "turn_index": turn_index,
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+                "cache_read_tokens": cache_read,
+                "cache_create_tokens": cache_create,
+                "finish_reason": finish,
+            })
+
             message = {
                 "role": "assistant",
                 "content": [self._block_to_dict(b) for b in response.content],
@@ -1029,8 +1090,17 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 # 该工具是否已在流式阶段提前启动？
                 early_task = early_executions.get(tu.id)
                 if early_task:
+                    t0 = time.time()
+                    await self._emit("tool_start", {"tool_name": tu.name, "tool_input": inp})
                     raw = await early_task
+                    tool_duration = int((time.time() - t0) * 1000)
                     res = self._persist_large_result(tu.name, raw)
+                    await self._emit("tool_end", {
+                        "tool_name": tu.name,
+                        "tool_input": inp,
+                        "duration_ms": tool_duration,
+                        "result_length": len(raw.encode()) if raw else 0,
+                    })
                     print_tool_result(tu.name, res)
                     tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
                     continue
@@ -1043,13 +1113,23 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     continue
                 if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self._confirmed_paths:
                     confirmed = await self._confirm_dangerous(perm["message"])
+                    await self._emit("permission", {"message": perm["message"], "allowed": confirmed})
                     if not confirmed:
                         tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": "User denied this action."})
                         continue
                     self._confirmed_paths.add(perm["message"])
 
+                t0 = time.time()
+                await self._emit("tool_start", {"tool_name": tu.name, "tool_input": inp})
                 raw = await self._execute_tool_call(tu.name, inp)
+                tool_duration = int((time.time() - t0) * 1000)
                 res = self._persist_large_result(tu.name, raw)
+                await self._emit("tool_end", {
+                    "tool_name": tu.name,
+                    "tool_input": inp,
+                    "duration_ms": tool_duration,
+                    "result_length": len(raw.encode()) if raw else 0,
+                })
                 print_tool_result(tu.name, res)
 
                 # Plan Mode 'clear-and-execute' 后：直接追加工具结果并跳出
@@ -1120,12 +1200,20 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                                 stop_spinner()
                                 self._emit_text("\n")
                                 first_text = False
+                                # ★ 发射 first_token 事件
+                                asyncio.create_task(
+                                    self._emit("first_token", {"is_thinking": False})
+                                )
                             self._emit_text(delta.text)
                         elif hasattr(delta, 'thinking'):
                             if first_thinking:
                                 stop_spinner()
                                 self._emit_text("[thinking]\n ")
                                 first_thinking = False
+                                # ★ 发射 first_token 事件
+                                asyncio.create_task(
+                                    self._emit("first_token", {"is_thinking": True})
+                                )
                             self._emit_text(delta.thinking)
                         elif hasattr(delta, 'partial_json'):
                             tb = tool_blocks_by_index.get(event.index)
