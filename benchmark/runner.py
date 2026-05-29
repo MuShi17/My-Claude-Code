@@ -137,11 +137,9 @@ def _find_latest_session_traces_dir() -> Path | None:
     return None
 
 
-def run_all(verbose: bool = True) -> dict[str, Any]:
-    """执行所有 benchmark task，返回最终 report。"""
-    tasks = load_tasks()
-    run_id = time.strftime("%Y%m%dT%H%M%S")
-    run_dir = RUNS_DIR / run_id
+def _run_single_pass(tasks: list[dict[str, Any]], run_id: str, run_label: str, verbose: bool) -> dict[str, Any]:
+    """执行一次完整的 benchmark（所有 tasks 串行一遍）。"""
+    run_dir = RUNS_DIR / run_id / run_label
     traces_dir = run_dir / "traces"
     traces_dir.mkdir(parents=True, exist_ok=True)
 
@@ -149,15 +147,13 @@ def run_all(verbose: bool = True) -> dict[str, Any]:
     for i, task in enumerate(tasks):
         task_id = task["id"]
         if verbose:
-            print(f"[{i+1}/{len(tasks)}] {task_id} ... ", end="", flush=True)
+            print(f"  [{i+1}/{len(tasks)}] {task_id} ... ", end="", flush=True)
 
-        # 创建隔离工作区
-        fixture_src = PROJECT_ROOT / task.get("fixture_repo", "")
         workspace = Path(tempfile.mkdtemp(prefix=f"bench_{task_id}_"))
+        fixture_src = PROJECT_ROOT / task.get("fixture_repo", "")
         if fixture_src.exists():
             shutil.copytree(fixture_src, workspace, dirs_exist_ok=True)
 
-        # 执行
         result = run_task(task, workspace, run_id)
         task_results.append(result)
 
@@ -167,28 +163,60 @@ def run_all(verbose: bool = True) -> dict[str, Any]:
                 status += f" ({result['error']})"
             print(status)
 
-        # 复制 trace
         latest_traces = _find_latest_session_traces_dir()
         if latest_traces:
             for tf in sorted(latest_traces.glob("*.jsonl")):
-                dest = traces_dir / f"{task_id}.jsonl"
-                shutil.copy2(tf, dest)
+                shutil.copy2(tf, traces_dir / f"{task_id}.jsonl")
                 break
 
-        # 清理
         shutil.rmtree(workspace, ignore_errors=True)
 
-    # 生成报告
-    report = build_report(run_id, task_results, traces_dir)
-    report_path = run_dir / "report.json"
-    save_report(report, report_path)
+    return build_report(run_id, task_results, traces_dir)
 
-    return report
+
+def run_all(num_runs: int = 1, verbose: bool = True) -> dict[str, Any]:
+    """执行所有 benchmark task，可选多次运行取平均。"""
+    tasks = load_tasks()
+    run_id = time.strftime("%Y%m%dT%H%M%S")
+
+    reports = []
+    for r in range(num_runs):
+        label = f"run{r+1:02d}"
+        if verbose and num_runs > 1:
+            print(f"\n--- Run {r+1}/{num_runs} ---")
+        report = _run_single_pass(tasks, run_id, label, verbose)
+        reports.append(report)
+
+    if num_runs == 1:
+        final_report = reports[0]
+        save_report(final_report, RUNS_DIR / run_id / "run01" / "report.json")
+    else:
+        from .reporter import aggregate_reports
+        final_report = aggregate_reports(run_id, reports)
+        agg_path = RUNS_DIR / run_id / "aggregate_report.json"
+        save_report(final_report, agg_path)
+        if verbose:
+            avg = final_report["aggregate"]
+            passed_rate = avg["summary"]["avg_pass_rate"]
+            print(f"\nAggregate ({num_runs} runs): pass_rate={passed_rate:.1%}, "
+                  f"duration_mean={avg['summary']['total_duration_ms_mean']:.0f}ms, "
+                  f"first_token={avg['summary']['avg_first_token_ms']:.0f}ms")
+
+    return final_report
 
 
 if __name__ == "__main__":
-    report = run_all()
-    passed = report["summary"]["passed"]
-    total = report["summary"]["total"]
-    print(f"\nResult: {passed}/{total} passed ({report['summary']['pass_rate']:.1%})")
-    sys.exit(0 if passed == total else 1)
+    num_runs = 1
+    args = sys.argv[1:]
+    if len(args) >= 2 and args[0] == "--runs":
+        num_runs = int(args[1])
+    report = run_all(num_runs=num_runs)
+    if "aggregate" in report:
+        summary = report["aggregate"]["summary"]
+        print(f"\nResult: pass_rate={summary['avg_pass_rate']:.1%}, "
+              f"duration={summary['total_duration_ms_mean']:.0f}ms, "
+              f"first_token={summary['avg_first_token_ms']:.0f}ms")
+    else:
+        s = report["summary"]
+        print(f"\nResult: {s['passed']}/{s['total']} passed ({s['pass_rate']:.1%})")
+    sys.exit(0)
