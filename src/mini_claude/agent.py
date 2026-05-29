@@ -519,6 +519,7 @@ class Agent:
         meta = data.get("metadata")
         if meta and meta.get("id"):
             self.session_id = meta["id"]
+            self._ask_count = meta.get("askCount", 0)
         print_info(f"Session restored ({self._get_message_count()} messages).")
 
     def _get_message_count(self) -> int:
