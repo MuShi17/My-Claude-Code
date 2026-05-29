@@ -49,7 +49,10 @@ class SessionTracer:
         pass  # 仅标记，实际数据在 on_tool_end 中累积
 
     def on_tool_end(self, payload: dict) -> None:
-        self._current_turn.setdefault("tool_calls", []).append({
+        # turn_end 在工具执行前触发，此时 _current_turn 已清空。
+        # 工具数据应追加到最近完成的 turn（_turns[-1]）
+        target = self._current_turn if self._current_turn else (self._turns[-1] if self._turns else {})
+        target.setdefault("tool_calls", []).append({
             "name": payload["tool_name"],
             "input": payload.get("tool_input", {}),
             "duration_ms": payload.get("duration_ms", 0),

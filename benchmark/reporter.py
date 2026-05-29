@@ -43,7 +43,6 @@ def load_trace_data(trace_path: Path) -> dict[str, Any]:
     # 从 turn 行提取
     first_token_ms = 0
     total_cache_read = 0
-    total_cache_create = 0
     compactions = 0
     per_turn_cache_rates: list[float] = []
     for t in turns:
@@ -51,7 +50,6 @@ def load_trace_data(trace_path: Path) -> dict[str, Any]:
             if first_token_ms == 0:
                 first_token_ms = t["first_token_ms"]
         total_cache_read += t.get("cache_read_tokens", 0)
-        total_cache_create += t.get("cache_create_tokens", 0)
         if t.get("compaction_triggered"):
             compactions += 1
         # 每轮缓存命中率（cap 在 1.0）
@@ -68,7 +66,6 @@ def load_trace_data(trace_path: Path) -> dict[str, Any]:
         "input_tokens": total_input,
         "output_tokens": total_output,
         "cache_read_tokens": total_cache_read,
-        "cache_create_tokens": total_cache_create,
         "tool_calls": total_tool_calls,
         "compactions": compactions,
         "cache_hit_rate": round(cache_hit_rate, 4),
@@ -79,7 +76,7 @@ def _empty_trace_result() -> dict[str, Any]:
     return {
         "turns": 0, "duration_ms": 0, "first_token_ms": 0,
         "input_tokens": 0, "output_tokens": 0,
-        "cache_read_tokens": 0, "cache_create_tokens": 0,
+        "cache_read_tokens": 0,
         "tool_calls": 0, "compactions": 0, "cache_hit_rate": 0.0,
     }
 
