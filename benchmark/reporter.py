@@ -45,6 +45,7 @@ def load_trace_data(trace_path: Path) -> dict[str, Any]:
     total_cache_read = 0
     total_cache_create = 0
     compactions = 0
+    per_turn_cache_rates: list[float] = []
     for t in turns:
         if t.get("first_token_ms", 0) > 0:
             if first_token_ms == 0:
@@ -53,10 +54,12 @@ def load_trace_data(trace_path: Path) -> dict[str, Any]:
         total_cache_create += t.get("cache_create_tokens", 0)
         if t.get("compaction_triggered"):
             compactions += 1
+        # 每轮缓存命中率（cap 在 1.0）
+        turn_input = t.get("input_tokens", 1) or 1
+        per_turn_cache_rates.append(min(t.get("cache_read_tokens", 0) / turn_input, 1.0))
 
-    # 缓存命中率（多轮对话中 cache_read 可能 > input，cap 在 1.0）
-    cache_total = total_input if total_input > 0 else 1
-    cache_hit_rate = min(total_cache_read / cache_total, 1.0)
+    # 缓存命中率 = 各轮平均值
+    cache_hit_rate = sum(per_turn_cache_rates) / len(per_turn_cache_rates) if per_turn_cache_rates else 0.0
 
     return {
         "turns": total_turns,
@@ -115,8 +118,7 @@ def build_report(
     total_cache_read = sum(t["cache_read_tokens"] for t in tasks)
     first_tokens = [t["first_token_ms"] for t in tasks if t["first_token_ms"] > 0]
     avg_first_token = sum(first_tokens) // len(first_tokens) if first_tokens else 0
-    cache_total = sum(t["input_tokens"] for t in tasks)
-    cache_hit_rate = min(total_cache_read / cache_total, 1.0) if cache_total > 0 else 0.0
+    cache_hit_rate = sum(t["cache_hit_rate"] for t in tasks) / total if total > 0 else 0.0
 
     # By category
     by_category: dict[str, dict] = {}
