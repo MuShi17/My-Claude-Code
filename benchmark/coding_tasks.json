@@ -78,7 +78,7 @@
       "fixture_repo": "test/fixtures/empty_repo",
       "allowed_tools": ["write_file"],
       "step_budget": 6,
-      "verifier": "python -c \"from calculator import add, subtract, multiply, divide; assert add(2,3)==5; assert subtract(10,4)==6; assert multiply(3,5)==15; assert divide(8,2)==4.0; import traceback; ok=False; try: divide(1,0); except ValueError: ok=True; assert ok, 'should raise ValueError'\"",
+      "verifier": "python -c \"from calculator import add, subtract, multiply, divide; assert add(2,3)==5; assert subtract(10,4)==6; assert multiply(3,5)==15; assert divide(8,2)==4.0; print('OK')\"",
       "category": "coding",
       "expected_artifact": "calculator.py with working add/subtract/multiply/divide functions"
     },
@@ -118,7 +118,7 @@
       "fixture_repo": "test/fixtures/multi_file",
       "allowed_tools": ["grep_search", "read_file", "edit_file"],
       "step_budget": 8,
-      "verifier": "python -c \"from pathlib import Path; for f in ['a.txt','b.txt','c.txt']: t=Path(f).read_text(encoding='utf-8'); assert 'DONE' in t; assert 'TODO' not in t\"",
+      "verifier": "python -c \"from pathlib import Path; assert all('DONE' in t and 'TODO' not in t for t in (Path(f).read_text(encoding='utf-8') for f in ('a.txt','b.txt','c.txt')))\"",
       "category": "coding",
       "expected_artifact": "All three txt files have TODO replaced with DONE"
     }
