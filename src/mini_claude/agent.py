@@ -279,6 +279,34 @@ class Agent:
             return "adaptive"
         return "enabled"
 
+    # ─── 事件发射器 ─────────────────────────────────────────
+
+    def on(self, event: str, callback) -> None:
+        """订阅事件。callback 接收 payload dict 参数。"""
+        self._event_hooks.setdefault(event, []).append(callback)
+
+    def off(self, event: str, callback) -> None:
+        """取消订阅。"""
+        hooks = self._event_hooks.get(event)
+        if hooks and callback in hooks:
+            hooks.remove(callback)
+
+    async def _emit(self, event: str, payload: Any = None) -> None:
+        """发射事件。同步和异步回调均支持。"""
+        import asyncio as _asyncio
+        for cb in self._event_hooks.get(event, []):
+            try:
+                res = cb(payload)
+                if _asyncio.iscoroutine(res):
+                    await res
+            except Exception:
+                pass  # 观测错误不影响主流程
+
+    def _msg_char_count(self) -> int:
+        """计算当前消息列表的字符总数（用于压缩前后对比）。"""
+        msgs = self._openai_messages if self.use_openai else self._anthropic_messages
+        return sum(len(str(m)) for m in msgs)
+
     @property
     def is_processing(self) -> bool:
         return self._current_task is not None and not self._current_task.done()
