@@ -21,6 +21,27 @@ RUNS_DIR = PROJECT_ROOT / "benchmark_runs"
 DEFAULT_TIMEOUT = 300  # 每个 task 默认 5 分钟超时
 
 
+def _load_env() -> dict[str, str]:
+    """从项目根 .env 文件加载环境变量，不覆盖已有系统环境变量。"""
+    env_file = PROJECT_ROOT / ".env"
+    if not env_file.exists():
+        return {}
+    env = {}
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            env[key] = value
+    return env
+
+
+# 模块加载时预加载 .env 中的 API key
+_env_cache = _load_env()
+
+
 def load_tasks() -> list[dict[str, Any]]:
     """从 coding_tasks.json 加载 task 列表。"""
     with open(TASKS_FILE, encoding="utf-8") as f:
@@ -50,9 +71,9 @@ def run_task(task: dict[str, Any], workspace: Path, run_id: str) -> dict[str, An
             agent_cmd,
             cwd=str(workspace),
             capture_output=True,
-            text=True,
+            encoding="utf-8",
             timeout=timeout,
-            env={**os.environ, "PYTHONPATH": str(PROJECT_ROOT / "src")},
+            env={**os.environ, **_env_cache, "PYTHONPATH": str(PROJECT_ROOT / "src"), "PYTHONIOENCODING": "utf-8"},
         )
     except subprocess.TimeoutExpired:
         result["error"] = f"Task timed out after {timeout}s"
@@ -70,7 +91,7 @@ def run_task(task: dict[str, Any], workspace: Path, run_id: str) -> dict[str, An
                 cwd=str(workspace),
                 shell=True,
                 capture_output=True,
-                text=True,
+                encoding="utf-8",
                 timeout=60,
             )
             result["passed"] = vproc.returncode == 0
