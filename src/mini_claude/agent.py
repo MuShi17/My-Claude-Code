@@ -50,6 +50,7 @@ from .session import save_session
 from .prompt import build_system_prompt
 from .subagent import get_sub_agent_config
 from .mcp_client import McpManager
+from .logger import AgentLogger
 
 # ─── 指数退避重试 ──────────────────────────────────────────
 # 对 429（限流）、503/529（过载）、网络错误进行最多 3 次重试，
@@ -186,12 +187,14 @@ class Agent:
         custom_system_prompt: str | None = None,
         custom_tools: list[ToolDef] | None = None,
         is_sub_agent: bool = False,
+        logger: AgentLogger | None = None,
     ):
         self.permission_mode = permission_mode
         self.thinking = thinking
         self.model = model
         self.use_openai = bool(api_base)
         self.is_sub_agent = is_sub_agent
+        self._logger = logger
         self.tools = custom_tools or tool_definitions
         self.max_cost_usd = max_cost_usd
         self.max_turns = max_turns
@@ -403,7 +406,6 @@ class Agent:
         tracer: Any = None
         if not self.is_sub_agent:
             from .tracer import SessionTracer
-            from .logger import AgentLogger
             self._logger = AgentLogger(self.session_id, agent_id="main")
             self._logger.new_ask(self._ask_count)
             tracer = SessionTracer(self._ask_count, user_message, self._logger)
@@ -797,7 +799,13 @@ class Agent:
                 if result.get("allowed_tools")
                 else [t for t in self.tools if t["name"] != "agent"]
             )
-            print_sub_agent_start("skill-fork", inp.get("skill_name", ""))
+            skill_name = inp.get("skill_name", "")
+            if self._logger:
+                self._logger.log_sub_agent(
+                    getattr(self, "_current_request_id", ""), skill_name,
+                    "skill-fork", (inp.get("args") or "")[:200],
+                )
+            print_sub_agent_start("skill-fork", skill_name)
             sub_agent = Agent(
                 model=self.model,
                 api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
@@ -805,6 +813,7 @@ class Agent:
                 custom_tools=tools,
                 is_sub_agent=True,
                 permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
+                logger=AgentLogger(self.session_id, agent_id=f"main.skill_{skill_name}", parent_logger=self._logger) if self._logger else None,
             )
             try:
                 sub_result = await sub_agent.run_once(inp.get("args") or "Execute this skill task.")
@@ -947,6 +956,12 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
         print_sub_agent_start(agent_type, description)
 
+        if self._logger:
+            self._logger.log_sub_agent(
+                getattr(self, "_current_request_id", ""), description,
+                agent_type, prompt[:200],
+            )
+
         config = get_sub_agent_config(agent_type)
         sub_agent = Agent(
             model=self.model,
@@ -955,6 +970,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             custom_tools=config["tools"],
             is_sub_agent=True,
             permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
+            logger=AgentLogger(self.session_id, agent_id=f"main.{agent_type}_1", parent_logger=self._logger) if self._logger else None,
         )
 
         try:
@@ -1039,6 +1055,11 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         task = asyncio.create_task(self._execute_tool_call(block["name"], block["input"]))
                         early_executions[block["id"]] = task
 
+            request_id = AgentLogger.generate_request_id()
+            self._current_request_id = request_id
+            api_start = time.time()
+            if self._logger:
+                self._logger.log_api_request(request_id, self.model)
             response = await self._call_anthropic_stream(on_tool_block_complete=_on_tool_block)
 
             if not self.is_sub_agent:
@@ -1063,6 +1084,17 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 "cache_create_tokens": cache_create,
                 "finish_reason": finish,
             })
+
+            if self._logger:
+                latency_ms = int((time.time() - api_start) * 1000)
+                self._logger.log_api_response(
+                    request_id, latency_ms,
+                    response.usage.input_tokens, response.usage.output_tokens,
+                    cache_read, finish,
+                )
+                response_dict = {"content": [self._block_to_dict(b) for b in response.content]}
+                usage_dict = {"input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens}
+                self._logger.save_llm_content(request_id, self.model, self._anthropic_messages, response_dict, usage_dict)
 
             message = {
                 "role": "assistant",
@@ -1108,6 +1140,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         "result_length": len(raw.encode()) if raw else 0,
                         "success": success,
                     })
+                    if self._logger:
+                        self._logger.log_tool_call(request_id, tu.name, inp, tool_duration, success)
                     print_tool_result(tu.name, res)
                     tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
                     continue
@@ -1140,6 +1174,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     "result_length": len(raw.encode()) if raw else 0,
                     "success": success,
                 })
+                if self._logger:
+                    self._logger.log_tool_call(request_id, tu.name, inp, tool_duration, success)
                 print_tool_result(tu.name, res)
 
                 # Plan Mode 'clear-and-execute' 后：直接追加工具结果并跳出
@@ -1307,6 +1343,11 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             if not self.is_sub_agent:
                 start_spinner()
 
+            request_id = AgentLogger.generate_request_id()
+            self._current_request_id = request_id
+            api_start = time.time()
+            if self._logger:
+                self._logger.log_api_request(request_id, self.model)
             response = await self._call_openai_stream()
 
             if not self.is_sub_agent:
@@ -1341,6 +1382,17 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 "cache_create_tokens": 0,  # OpenAI 不单独报告创建
                 "finish_reason": finish,
             })
+            if self._logger:
+                latency_ms = int((time.time() - api_start) * 1000)
+                self._logger.log_api_response(
+                    request_id, latency_ms,
+                    usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0),
+                    cache_read, finish,
+                )
+                messages_for_llm = self._openai_messages.copy()
+                response_for_llm = {"choices": [{"message": message}]}
+                usage_for_llm = {"input_tokens": usage.get("prompt_tokens", 0), "output_tokens": usage.get("completion_tokens", 0)}
+                self._logger.save_llm_content(request_id, self.model, messages_for_llm, response_for_llm, usage_for_llm)
             if not tool_calls:
                 if not self.is_sub_agent:
                     print_cost(self.total_input_tokens, self.total_output_tokens)
@@ -1417,6 +1469,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                             "result_length": len(res.encode()) if res else 0,
                             "success": success,
                         })
+                        if self._logger:
+                            self._logger.log_tool_call(request_id, ct_item["fn"], ct_item["inp"], tool_duration, success)
                         print_tool_result(ct_item["fn"], res)
                         self._openai_messages.append({"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
                 else:
@@ -1438,6 +1492,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                             "result_length": len(raw.encode()) if raw else 0,
                             "success": success,
                         })
+                        if self._logger:
+                            self._logger.log_tool_call(request_id, ct["fn"], ct["inp"], tool_duration, success)
 
                         if self._context_cleared:
                             self._context_cleared = False
