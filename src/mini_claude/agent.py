@@ -403,7 +403,10 @@ class Agent:
         tracer: Any = None
         if not self.is_sub_agent:
             from .tracer import SessionTracer
-            tracer = SessionTracer(self._ask_count, user_message)
+            from .logger import AgentLogger
+            self._logger = AgentLogger(self.session_id, agent_id="main")
+            self._logger.new_ask(self._ask_count)
+            tracer = SessionTracer(self._ask_count, user_message, self._logger)
             self.on("turn_start", tracer.on_turn_start)
             self.on("first_token", tracer.on_first_token)
             self.on("turn_end", tracer.on_turn_end)
@@ -440,8 +443,7 @@ class Agent:
                 ]:
                     self.off(evt, cb)
                 try:
-                    from .session import save_trace
-                    save_trace(self.session_id, self._ask_count, tracer.finalize())
+                    tracer.write_ask_summary()
                 except Exception:
                     pass
 

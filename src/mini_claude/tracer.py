@@ -1,15 +1,19 @@
-"""观测追踪模块 — 收集每次 ask 的性能指标并写入 JSONL trace 文件。"""
+"""观测追踪模块 — 收集每次 ask 的性能指标并实时写入 JSONL trace 文件。"""
 
 from __future__ import annotations
 
 import time
 import json
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .logger import AgentLogger
 
 
 class SessionTracer:
-    """订阅 Agent 事件，累积单次 ask 的指标，结束时写出 JSONL。"""
+    """订阅 Agent 事件，累积单次 ask 的指标，每 turn 结束时实时写出 JSONL。"""
 
-    def __init__(self, ask_index: int, user_message: str):
+    def __init__(self, ask_index: int, user_message: str, logger: AgentLogger):
         self.ask_index = ask_index
         self.user_message = user_message
         self._chat_start = time.time()
@@ -17,6 +21,8 @@ class SessionTracer:
         self._current_turn: dict = {}
         self._turn_start: float = 0.0
         self._denied_count: int = 0  # 越权请求计数
+        self._logger = logger
+        self._trace_file = None
 
     # ── 事件处理方法 ───────────────────────────────────
 
@@ -34,6 +40,12 @@ class SessionTracer:
                 (time.time() - self._turn_start) * 1000
             )
 
+    def _ensure_trace_file(self):
+        if self._trace_file is None:
+            traces_dir = self._logger._session_dir / "traces"
+            traces_dir.mkdir(parents=True, exist_ok=True)
+            self._trace_file = open(traces_dir / f"{self.ask_index:03d}.jsonl", "a", encoding="utf-8")
+
     def on_turn_end(self, payload: dict) -> None:
         self._current_turn["input_tokens"] = payload.get("input_tokens", 0)
         self._current_turn["output_tokens"] = payload.get("output_tokens", 0)
@@ -44,6 +56,12 @@ class SessionTracer:
             (time.time() - self._turn_start) * 1000
         )
         self._turns.append(self._current_turn)
+
+        # 实时写 turn 行
+        self._ensure_trace_file()
+        self._trace_file.write(json.dumps({"type": "turn", **self._current_turn}, ensure_ascii=False) + "\n")
+        self._trace_file.flush()
+
         self._current_turn = {}
 
     def on_tool_start(self, payload: dict) -> None:
@@ -73,8 +91,8 @@ class SessionTracer:
 
     # ── 序列化 ────────────────────────────────────────
 
-    def finalize(self) -> list[str]:
-        """返回完整 JSONL 行列表（ask 概览行 + 所有 turn 行）。"""
+    def write_ask_summary(self) -> None:
+        """在 ask 结束时写 ask 概览行（在所有 turn 之后追加），然后关闭 trace 文件。"""
         total_duration_ms = int((time.time() - self._chat_start) * 1000)
         total_turns = len(self._turns)
         total_input = sum(t.get("input_tokens", 0) for t in self._turns)
@@ -103,8 +121,9 @@ class SessionTracer:
             "denied_tools": self._denied_count,
         }, ensure_ascii=False)
 
-        turn_lines = []
-        for t in self._turns:
-            turn_lines.append(json.dumps({"type": "turn", **t}, ensure_ascii=False))
-
-        return [ask_line] + turn_lines
+        self._ensure_trace_file()
+        self._trace_file.write(ask_line + "\n")
+        self._trace_file.flush()
+        if self._trace_file:
+            self._trace_file.close()
+            self._trace_file = None
