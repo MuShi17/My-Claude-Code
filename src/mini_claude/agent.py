@@ -409,6 +409,7 @@ class Agent:
             self.on("turn_end", tracer.on_turn_end)
             self.on("tool_start", tracer.on_tool_start)
             self.on("tool_end", tracer.on_tool_end)
+            self.on("tool_deny", tracer.on_tool_deny)
             self.on("compaction", tracer.on_compaction)
             self.on("permission", tracer.on_permission)
 
@@ -433,6 +434,7 @@ class Agent:
                     ("turn_end", tracer.on_turn_end),
                     ("tool_start", tracer.on_tool_start),
                     ("tool_end", tracer.on_tool_end),
+                    ("tool_deny", tracer.on_tool_deny),
                     ("compaction", tracer.on_compaction),
                     ("permission", tracer.on_permission),
                 ]:
@@ -1096,11 +1098,13 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     raw = await early_task
                     tool_duration = int((time.time() - t0) * 1000)
                     res = self._persist_large_result(tu.name, raw)
+                    success = not (isinstance(raw, str) and raw.startswith("Error:"))
                     await self._emit("tool_end", {
                         "tool_name": tu.name,
                         "tool_input": inp,
                         "duration_ms": tool_duration,
                         "result_length": len(raw.encode()) if raw else 0,
+                        "success": success,
                     })
                     print_tool_result(tu.name, res)
                     tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
@@ -1110,6 +1114,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 perm = check_permission(tu.name, inp, self.permission_mode, self._plan_file_path)
                 if perm["action"] == "deny":
                     print_info(f"Denied: {perm.get('message', '')}")
+                    await self._emit("tool_deny", {"tool_name": tu.name, "reason": perm.get("message", "")})
                     tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": f"Action denied: {perm.get('message', '')}"})
                     continue
                 if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self._confirmed_paths:
@@ -1125,11 +1130,13 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 raw = await self._execute_tool_call(tu.name, inp)
                 tool_duration = int((time.time() - t0) * 1000)
                 res = self._persist_large_result(tu.name, raw)
+                success = not (isinstance(raw, str) and raw.startswith("Error:"))
                 await self._emit("tool_end", {
                     "tool_name": tu.name,
                     "tool_input": inp,
                     "duration_ms": tool_duration,
                     "result_length": len(raw.encode()) if raw else 0,
+                    "success": success,
                 })
                 print_tool_result(tu.name, res)
 
@@ -1361,6 +1368,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 perm = check_permission(fn_name, inp, self.permission_mode, self._plan_file_path)
                 if perm["action"] == "deny":
                     print_info(f"Denied: {perm.get('message', '')}")
+                    await self._emit("tool_deny", {"tool_name": fn_name, "reason": perm.get("message", "")})
                     oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": f"Action denied: {perm.get('message', '')}"})
                     continue
                 if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self._confirmed_paths:
@@ -1390,20 +1398,22 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     for ct in batch["items"]:
                         await self._emit("tool_start", {"tool_name": ct["fn"], "tool_input": ct["inp"]})
 
-                    async def _run_oai_safe(ct_item: dict) -> tuple[dict, str]:
+                    async def _run_oai_safe(ct_item: dict) -> tuple[dict, str, bool]:
                         raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
                         res = self._persist_large_result(ct_item["fn"], raw)
-                        return ct_item, res
+                        success = not (isinstance(raw, str) and raw.startswith("Error:"))
+                        return ct_item, res, success
 
                     t0_batch = time.time()
                     results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
-                    for ct_item, res in results:
+                    for ct_item, res, success in results:
                         tool_duration = int((time.time() - t0_batch) * 1000)
                         await self._emit("tool_end", {
                             "tool_name": ct_item["fn"],
                             "tool_input": ct_item["inp"],
                             "duration_ms": tool_duration,
                             "result_length": len(res.encode()) if res else 0,
+                            "success": success,
                         })
                         print_tool_result(ct_item["fn"], res)
                         self._openai_messages.append({"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
@@ -1418,11 +1428,13 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         tool_duration = int((time.time() - t0) * 1000)
                         res = self._persist_large_result(ct["fn"], raw)
                         print_tool_result(ct["fn"], res)
+                        success = not (isinstance(raw, str) and raw.startswith("Error:"))
                         await self._emit("tool_end", {
                             "tool_name": ct["fn"],
                             "tool_input": ct["inp"],
                             "duration_ms": tool_duration,
                             "result_length": len(raw.encode()) if raw else 0,
+                            "success": success,
                         })
 
                         if self._context_cleared:

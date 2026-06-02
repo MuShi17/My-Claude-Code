@@ -39,6 +39,9 @@ def load_trace_data(trace_path: Path) -> dict[str, Any]:
     total_output = ask.get("total_output_tokens", 0)
     total_tool_calls = ask.get("total_tool_calls", 0)
     total_duration_ms = ask.get("total_duration_ms", 0)
+    total_tool_duration_ms = ask.get("total_tool_duration_ms", 0)
+    tool_success_rate = ask.get("tool_success_rate", 1.0)
+    denied_tools = ask.get("denied_tools", 0)
 
     # 从 turn 行提取
     first_token_ms = 0
@@ -67,6 +70,9 @@ def load_trace_data(trace_path: Path) -> dict[str, Any]:
         "output_tokens": total_output,
         "cache_read_tokens": total_cache_read,
         "tool_calls": total_tool_calls,
+        "tool_success_rate": round(tool_success_rate, 4),
+        "total_tool_duration_ms": total_tool_duration_ms,
+        "denied_tools": denied_tools,
         "compactions": compactions,
         "cache_hit_rate": round(cache_hit_rate, 4),
     }
@@ -77,7 +83,8 @@ def _empty_trace_result() -> dict[str, Any]:
         "turns": 0, "duration_ms": 0, "first_token_ms": 0,
         "input_tokens": 0, "output_tokens": 0,
         "cache_read_tokens": 0,
-        "tool_calls": 0, "compactions": 0, "cache_hit_rate": 0.0,
+        "tool_calls": 0, "tool_success_rate": 1.0, "total_tool_duration_ms": 0,
+        "denied_tools": 0, "compactions": 0, "cache_hit_rate": 0.0,
     }
 
 
@@ -183,7 +190,8 @@ def aggregate_reports(run_id: str, reports: list[dict[str, Any]]) -> dict[str, A
         numeric_fields = [
             "turns", "duration_ms", "first_token_ms",
             "input_tokens", "output_tokens", "cache_read_tokens",
-            "tool_calls", "compactions", "cache_hit_rate",
+            "tool_calls", "tool_success_rate", "total_tool_duration_ms",
+            "denied_tools", "compactions", "cache_hit_rate",
         ]
 
         agg_task: dict = {

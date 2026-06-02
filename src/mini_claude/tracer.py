@@ -16,6 +16,7 @@ class SessionTracer:
         self._turns: list[dict] = []
         self._current_turn: dict = {}
         self._turn_start: float = 0.0
+        self._denied_count: int = 0  # 越权请求计数
 
     # ── 事件处理方法 ───────────────────────────────────
 
@@ -57,7 +58,12 @@ class SessionTracer:
             "input": payload.get("tool_input", {}),
             "duration_ms": payload.get("duration_ms", 0),
             "result_length": payload.get("result_length", 0),
+            "success": payload.get("success", True),
         })
+
+    def on_tool_deny(self, payload: dict) -> None:
+        """越权请求 — 权限系统拒绝了工具调用。"""
+        self._denied_count += 1
 
     def on_compaction(self, payload: dict) -> None:
         self._current_turn["compaction_triggered"] = True
@@ -75,6 +81,12 @@ class SessionTracer:
         total_output = sum(t.get("output_tokens", 0) for t in self._turns)
         total_tool_calls = sum(len(t.get("tool_calls", [])) for t in self._turns)
 
+        # 工具总耗时 & 成功率
+        all_tools = [tc for t in self._turns for tc in t.get("tool_calls", [])]
+        total_tool_duration_ms = sum(tc.get("duration_ms", 0) for tc in all_tools)
+        successful_tools = sum(1 for tc in all_tools if tc.get("success", True))
+        tool_success_rate = successful_tools / total_tool_calls if total_tool_calls > 0 else 1.0
+
         ask_line = json.dumps({
             "type": "ask",
             "ask_index": self.ask_index,
@@ -85,6 +97,10 @@ class SessionTracer:
             "total_input_tokens": total_input,
             "total_output_tokens": total_output,
             "total_tool_calls": total_tool_calls,
+            "total_tool_duration_ms": total_tool_duration_ms,
+            "successful_tools": successful_tools,
+            "tool_success_rate": round(tool_success_rate, 4),
+            "denied_tools": self._denied_count,
         }, ensure_ascii=False)
 
         turn_lines = []
