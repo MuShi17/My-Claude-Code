@@ -1,5 +1,5 @@
-"""Skills system — discover, parse, and execute .claude/skills/*/SKILL.md
-Mirrors Claude Code's skill architecture: frontmatter metadata + prompt templates."""
+"""Skills 系统 — 发现、解析和执行 .claude/skills/*/SKILL.md
+镜像 Claude Code 的技能架构： frontmatter 元数据 + 提示词模板。"""
 
 from __future__ import annotations
 
@@ -40,6 +40,10 @@ def discover_skills() -> list[SkillDefinition]:
     # User-level skills (lower priority)
     user_dir = Path.home() / ".claude" / "skills"
     _load_skills_from_dir(user_dir, "user", skills)
+    
+    # 加载CC插件目录下的技能文件
+    # plugins_dir = Path.home() / ".claude" / "plugins"
+    # _load_skills_from_dir(plugins_dir, "user", skills)
 
     # Project-level skills (higher priority, overwrites)
     project_dir = Path.cwd() / ".claude" / "skills"
@@ -54,13 +58,11 @@ def _load_skills_from_dir(
 ) -> None:
     if not base_dir.is_dir():
         return
-    for entry in base_dir.iterdir():
-        if not entry.is_dir():
-            continue
-        skill_file = entry / "SKILL.md"
-        if not skill_file.exists():
-            continue
-        skill = _parse_skill_file(skill_file, source, str(entry))
+    # rglob 递归匹配所有 SKILL.md 文件
+    for skill_file in base_dir.rglob("SKILL.md"):
+        # 获取 SKILL.md 所在的目录
+        skill_dir = skill_file.parent
+        skill = _parse_skill_file(skill_file, source, str(skill_dir))
         if skill:
             skills[skill.name] = skill
 

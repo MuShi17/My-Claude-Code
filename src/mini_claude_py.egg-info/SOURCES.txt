@@ -1,3 +1,4 @@
+README.md
 pyproject.toml
 mini_claude/__init__.py
 mini_claude/__main__.py
@@ -11,8 +12,13 @@ mini_claude/skills.py
 mini_claude/subagent.py
 mini_claude/tools.py
 mini_claude/ui.py
+mini_claude/tests/test_skills.py
+mini_claude/web/__init__.py
+mini_claude/web/api.py
+mini_claude/web/models.py
 mini_claude_py.egg-info/PKG-INFO
 mini_claude_py.egg-info/SOURCES.txt
 mini_claude_py.egg-info/dependency_links.txt
 mini_claude_py.egg-info/entry_points.txt
+mini_claude_py.egg-info/requires.txt
 mini_claude_py.egg-info/top_level.txt

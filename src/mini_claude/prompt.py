@@ -1,4 +1,4 @@
-"""System prompt construction — template embedded, variable interpolation, context gathering."""
+"""系统提示词构建 — 嵌入模板、变量替换、上下文收集。"""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from .skills import build_skill_descriptions
 from .subagent import build_agent_descriptions
 from .tools import get_deferred_tool_names
 
-# ─── System prompt template (embedded) ──────────────────────
+# ─── 系统提示词模板（内嵌） ──────────────────────
 
 SYSTEM_PROMPT_TEMPLATE = """\
 You are Mini Claude Code, a lightweight coding assistant CLI.
@@ -101,8 +101,8 @@ Shell: {{shell}}
 
 import re as _re
 
-# ─── @include resolution ─────────────────────────────────────
-# Resolves @./path, @~/path, @/path references in CLAUDE.md files.
+# ─── @include 解析 ─────────────────────────────────────
+# 解析 CLAUDE.md 文件中的 @./path、@~/path、@/path 引用。
 
 _INCLUDE_RE = _re.compile(r"^@(\./[^\s]+|~/[^\s]+|/[^\s]+)$", _re.MULTILINE)
 _MAX_INCLUDE_DEPTH = 5
@@ -144,7 +144,7 @@ def _resolve_includes(
 
 
 def _load_rules_dir(directory: Path) -> str:
-    """Load all .md files from .claude/rules/ directory."""
+    """加载 .claude/rules/ 目录下的所有 .md 文件。"""
     rules_dir = directory / ".claude" / "rules"
     if not rules_dir.is_dir():
         return ""
@@ -166,7 +166,7 @@ def _load_rules_dir(directory: Path) -> str:
 
 
 def load_claude_md() -> str:
-    """Walk up from cwd collecting all CLAUDE.md files, resolving @includes."""
+    """从当前工作目录向上遍历，收集所有 CLAUDE.md 文件，并解析 @include 引用。"""
     parts: list[str] = []
     d = Path.cwd().resolve()
     while True:
@@ -182,7 +182,7 @@ def load_claude_md() -> str:
         if parent == d:
             break
         d = parent
-    # Load .claude/rules/*.md from cwd
+    # 从当前目录加载 .claude/rules/*.md
     rules = _load_rules_dir(Path.cwd())
     claude_md = ""
     if parts:
@@ -191,7 +191,7 @@ def load_claude_md() -> str:
 
 
 def get_git_context() -> str:
-    """Get git branch, recent commits, and status."""
+    """获取 Git 分支、最近提交和状态信息。"""
     try:
         opts = {"encoding": "utf-8", "timeout": 3, "capture_output": True}
         branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], **opts).stdout.strip()
@@ -208,7 +208,7 @@ def get_git_context() -> str:
 
 
 def build_system_prompt() -> str:
-    """Build the full system prompt from embedded template + dynamic context."""
+    """从嵌入模板 + 动态上下文构建完整的系统提示词。"""
     from datetime import date
     today = date.today().isoformat()
     plat = f"{platform.system()} {platform.machine()}"

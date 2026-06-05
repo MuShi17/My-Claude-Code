@@ -1,5 +1,5 @@
-"""Shared YAML frontmatter parser for memory and skills files.
-Handles simple `key: value` pairs between `---` delimiters."""
+"""用于 memory 和 skills 文件的 YAML frontmatter 解析器。
+处理 `---` 分隔符之间的简单 `key: value` 键值对。"""
 
 from dataclasses import dataclass, field
 

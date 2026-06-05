@@ -1,6 +1,6 @@
-"""Sub-agent system — fork-return pattern with built-in + custom agent types.
-Mirrors Claude Code's AgentTool: explore (read-only), plan (structured), general (full tools),
-plus user-defined agents via .claude/agents/*.md."""
+"""Sub-agent 系统 — 自带 + 自定义智能体类型，实现 AgentTool：
+explore（只读）、plan（结构化）、general（完整工具），
+以及通过 .claude/agents/*.md 定义的用户自定义智能体。"""
 
 from __future__ import annotations
 

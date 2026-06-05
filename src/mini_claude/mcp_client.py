@@ -1,11 +1,11 @@
 """
-MCP Client — connects to stdio-based MCP servers, discovers and forwards tool calls.
-Uses raw JSON-RPC over stdio (no SDK dependency for simplicity).
+MCP 客户端 — 连接基于 stdio 的 MCP 服务器，发现并转发工具调用。
+使用原生 JSON-RPC over stdio（为简化不依赖 SDK）。
 
-Config is read from .claude/settings.json and ~/.claude/settings.json:
+配置从 .claude/settings.json 和 ~/.claude/settings.json 读取：
   { "mcpServers": { "name": { "command": "...", "args": [...], "env": {...} } } }
 
-Each MCP tool is exposed with a "mcp__serverName__toolName" prefix to avoid conflicts.
+每个 MCP 工具会添加 "mcp__serverName__toolName" 前缀以避免冲突。
 """
 
 from __future__ import annotations
@@ -18,11 +18,11 @@ from pathlib import Path
 from typing import Any
 
 
-# ─── Single MCP connection (one per server) ──────────────────
+# ─── 单个 MCP 连接（一个服务器一个连接） ──────────────────
 
 
 class McpConnection:
-    """Manages a single MCP server process and JSON-RPC communication."""
+    """管理单个 MCP 服务器进程和 JSON-RPC 通信。"""
 
     def __init__(self, server_name: str, command: str, args: list[str] | None = None,
                  env: dict[str, str] | None = None):
@@ -36,7 +36,7 @@ class McpConnection:
         self._reader_task: asyncio.Task | None = None
 
     async def connect(self) -> None:
-        """Spawn the server process."""
+        """启动服务器进程。"""
         merged_env = {**os.environ, **self.env}
         self._process = await asyncio.create_subprocess_exec(
             self.command, *self.args,
@@ -45,11 +45,11 @@ class McpConnection:
             stderr=subprocess.PIPE,
             env=merged_env,
         )
-        # Start reading stdout lines in background
+        # 在后台启动读取 stdout 的任务
         self._reader_task = asyncio.create_task(self._read_loop())
 
     async def _read_loop(self) -> None:
-        """Read newline-delimited JSON-RPC responses from stdout."""
+        """从 stdout 读取换行符分隔的 JSON-RPC 响应。"""
         assert self._process and self._process.stdout
         while True:
             line = await self._process.stdout.readline()
@@ -71,7 +71,7 @@ class McpConnection:
                     fut.set_result(msg.get("result"))
 
     async def _send_request(self, method: str, params: dict | None = None) -> Any:
-        """Send a JSON-RPC request and wait for response."""
+        """发送 JSON-RPC 请求并等待响应。"""
         assert self._process and self._process.stdin
         req_id = self._next_id
         self._next_id += 1
@@ -84,14 +84,14 @@ class McpConnection:
         return await fut
 
     def _send_notification(self, method: str, params: dict | None = None) -> None:
-        """Send a JSON-RPC notification (no response expected)."""
+        """发送 JSON-RPC 通知（不期待响应）。"""
         if not self._process or not self._process.stdin:
             return
         msg = json.dumps({"jsonrpc": "2.0", "method": method, "params": params or {}})
         self._process.stdin.write((msg + "\n").encode())
 
     async def initialize(self) -> None:
-        """Perform MCP initialize handshake."""
+        """执行 MCP initialize 握手。"""
         await self._send_request("initialize", {
             "protocolVersion": "2024-11-05",
             "capabilities": {},
@@ -100,7 +100,7 @@ class McpConnection:
         self._send_notification("notifications/initialized")
 
     async def list_tools(self) -> list[dict]:
-        """Discover available tools from this server."""
+        """发现此服务器上的可用工具。"""
         result = await self._send_request("tools/list")
         if not result or not isinstance(result.get("tools"), list):
             return []
@@ -115,7 +115,7 @@ class McpConnection:
         ]
 
     async def call_tool(self, name: str, args: dict) -> str:
-        """Call a tool and return the text result."""
+        """调用工具并返回文本结果。"""
         result = await self._send_request("tools/call", {"name": name, "arguments": args})
         if isinstance(result, dict) and isinstance(result.get("content"), list):
             return "\n".join(
@@ -124,7 +124,7 @@ class McpConnection:
         return json.dumps(result)
 
     def close(self) -> None:
-        """Kill the server process."""
+        """终止服务器进程。"""
         if self._reader_task:
             self._reader_task.cancel()
             self._reader_task = None
@@ -134,19 +134,19 @@ class McpConnection:
             except ProcessLookupError:
                 pass
             self._process = None
-        # Reject pending requests
+        # 拒绝所有待处理的请求
         for fut in self._pending.values():
             if not fut.done():
                 fut.set_exception(RuntimeError(f"MCP server '{self.server_name}' closed"))
         self._pending.clear()
 
 
-# ─── MCP Manager ─────────────────────────────────────────────
+# ─── MCP 管理器 ─────────────────────────────────────────────
 
 
 class McpManager:
-    """Manages all MCP server connections. Call load_and_connect() once, then
-    use get_tool_definitions() and call_tool() to integrate with the agent."""
+    """管理所有 MCP 服务器连接。调用 load_and_connect() 一次，
+    然后使用 get_tool_definitions() 和 call_tool() 与 agent 集成。"""
 
     def __init__(self):
         self._connections: dict[str, McpConnection] = {}
@@ -154,7 +154,7 @@ class McpManager:
         self._connected = False
 
     async def load_and_connect(self) -> None:
-        """Read settings, connect to all configured MCP servers, discover tools."""
+        """读取配置，连接所有配置的 MCP 服务器，发现工具。"""
         if self._connected:
             return
         self._connected = True
@@ -184,7 +184,7 @@ class McpManager:
                 conn.close()
 
     def get_tool_definitions(self) -> list[dict]:
-        """Return tool definitions in Anthropic API format with mcp__ prefix."""
+        """返回 Anthropic API 格式的工具定义，添加 mcp__ 前缀。"""
         return [
             {
                 "name": f"mcp__{t['serverName']}__{t['name']}",
@@ -195,43 +195,43 @@ class McpManager:
         ]
 
     def is_mcp_tool(self, name: str) -> bool:
-        """Check if a tool name is an MCP-prefixed tool."""
+        """检查工具名称是否为 MCP 前缀工具。"""
         return name.startswith("mcp__")
 
     async def call_tool(self, prefixed_name: str, args: dict) -> str:
-        """Route a prefixed tool call to the correct server."""
+        """将带前缀的工具调用路由到正确的服务器。"""
         parts = prefixed_name.split("__")
         if len(parts) < 3:
             raise ValueError(f"Invalid MCP tool name: {prefixed_name}")
         server_name = parts[1]
-        tool_name = "__".join(parts[2:])  # tool name might contain __
+        tool_name = "__".join(parts[2:])  # 工具名称本身可能包含 __
         conn = self._connections.get(server_name)
         if not conn:
             raise RuntimeError(f"MCP server '{server_name}' not connected")
         return await conn.call_tool(tool_name, args)
 
     async def disconnect_all(self) -> None:
-        """Disconnect all servers."""
+        """断开所有服务器连接。"""
         for conn in self._connections.values():
             conn.close()
         self._connections.clear()
         self._tools.clear()
         self._connected = False
 
-    # ─── Config loading ──────────────────────────────────────
+    # ─── 配置加载 ──────────────────────────────────────
 
     def _load_configs(self) -> dict[str, dict]:
         merged: dict[str, dict] = {}
 
-        # 1. Global: ~/.claude/settings.json
+        # 1. 全局配置：~/.claude/settings.json
         global_path = Path.home() / ".claude" / "settings.json"
         self._merge_config_file(global_path, merged)
 
-        # 2. Project: .claude/settings.json (cwd)
+        # 2. 项目配置：.claude/settings.json（当前工作目录）
         project_path = Path.cwd() / ".claude" / "settings.json"
         self._merge_config_file(project_path, merged)
 
-        # 3. Also check .mcp.json (Claude Code convention)
+        # 3. 同时检查 .mcp.json（Claude Code 约定）
         mcp_json_path = Path.cwd() / ".mcp.json"
         self._merge_config_file(mcp_json_path, merged)
 
@@ -247,4 +247,4 @@ class McpManager:
                 if isinstance(config, dict) and "command" in config:
                     target[name] = config
         except Exception:
-            pass  # skip malformed config
+            pass  # 跳过格式错误的配置

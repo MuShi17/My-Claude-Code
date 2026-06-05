@@ -1,5 +1,5 @@
-"""Memory system — 4-type file-based memory with MEMORY.md index.
-Mirrors Claude Code's memory architecture: semantic recall via sideQuery."""
+"""Memory 系统 — 4 种类型的文件化内存，附带 MEMORY.md 索引。
+模仿 Claude Code 的内存架构：通过 sideQuery 进行语义召回。"""
 
 from __future__ import annotations
 
@@ -14,12 +14,12 @@ from typing import Any
 
 from .frontmatter import parse_frontmatter, format_frontmatter
 
-# A callable that sends a prompt and returns model text response.
-# Signature: async (system: str, user_message: str) -> str
+# 可调用对象：发送提示词并返回模型文本响应。
+# 签名：async (system: str, user_message: str) -> str
 from typing import Callable
-SideQueryFn = Callable[[str, str], Any]  # actually Awaitable[str]
+SideQueryFn = Callable[[str, str], Any]  # 实际上是 Awaitable[str]
 
-# ─── Types ──────────────────────────────────────────────────
+# ─── 类型 ──────────────────────────────────────────────────
 
 VALID_TYPES = {"user", "feedback", "project", "reference"}
 MAX_INDEX_LINES = 200
@@ -38,7 +38,7 @@ class MemoryEntry:
         self.content = content
 
 
-# ─── Paths ──────────────────────────────────────────────────
+# ─── 路径 ──────────────────────────────────────────────────
 
 
 def _project_hash() -> str:
@@ -93,7 +93,7 @@ def list_memories() -> list[MemoryEntry]:
             ))
         except Exception:
             pass
-    # Sort by mtime desc
+    # 按修改时间倒序排列
     entries.sort(key=lambda e: (d / e.filename).stat().st_mtime, reverse=True)
     return entries
 
@@ -118,7 +118,7 @@ def delete_memory(filename: str) -> bool:
     return True
 
 
-# ─── Index ──────────────────────────────────────────────────
+# ─── 索引 ──────────────────────────────────────────────────
 
 
 def _update_memory_index() -> None:
@@ -144,7 +144,7 @@ def load_memory_index() -> str:
     return content
 
 
-# ─── Memory Header (lightweight scan) ──────────────────────
+# ─── 内存头部（轻量扫描） ──────────────────────
 
 class MemoryHeader:
     """内存条目的轻量级头部信息（用于快速扫描，不加载完整内容）。"""
@@ -161,11 +161,11 @@ class MemoryHeader:
 
 MAX_MEMORY_FILES = 200
 MAX_MEMORY_BYTES_PER_FILE = 4096
-MAX_SESSION_MEMORY_BYTES = 60 * 1024  # 60KB cumulative per session
+MAX_SESSION_MEMORY_BYTES = 60 * 1024  # 每个会话累积最多 60KB
 
 
 def scan_memory_headers() -> list[MemoryHeader]:
-    """Scan memory directory — read only frontmatter (first 30 lines) for speed."""
+    """扫描内存目录 — 只读取 frontmatter（前 30 行）以提高速度。"""
     d = get_memory_dir()
     headers: list[MemoryHeader] = []
     for f in d.glob("*.md"):
@@ -192,7 +192,7 @@ def scan_memory_headers() -> list[MemoryHeader]:
 
 
 def format_memory_manifest(headers: list[MemoryHeader]) -> str:
-    """Format manifest for semantic selector: one line per memory."""
+    """为语义选择器格式化清单：每行一个内存。"""
     lines = []
     for h in headers:
         tag = f"[{h.type}] " if h.type else ""
@@ -204,7 +204,7 @@ def format_memory_manifest(headers: list[MemoryHeader]) -> str:
     return "\n".join(lines)
 
 
-# ─── Memory Age / Freshness ────────────────────────────────
+# ─── 内存年龄 / 新鲜度 ────────────────────────────────
 
 def memory_age(mtime_ms: float) -> str:
     """计算内存文件的年龄（今天/昨天/X天前）。"""
@@ -226,7 +226,7 @@ def memory_freshness_warning(mtime_ms: float) -> str:
             "Verify against current code before asserting as fact.")
 
 
-# ─── Semantic Recall (sideQuery) ────────────────────────────
+# ─── 语义召回（sideQuery） ────────────────────────────
 
 SELECT_MEMORIES_PROMPT = """You are selecting memories that will be useful to an AI coding assistant as it processes a user's query. You will be given the user's query and a list of available memory files with their filenames and descriptions.
 
@@ -251,7 +251,7 @@ async def select_relevant_memories(
     side_query: SideQueryFn,
     already_surfaced: set[str],
 ) -> list[RelevantMemory]:
-    """Call the model to semantically select relevant memories."""
+    """调用模型进行语义选择相关记忆。"""
     headers = scan_memory_headers()
     if not headers:
         return []
@@ -268,7 +268,7 @@ async def select_relevant_memories(
             f"Query: {query}\n\nAvailable memories:\n{manifest}",
         )
 
-        # Extract JSON from response
+        # 从响应中提取 JSON
         match = re.search(r"\{[\s\S]*\}", text)
         if not match:
             return []
@@ -300,7 +300,7 @@ async def select_relevant_memories(
         return []
 
 
-# ─── Prefetch Handle ────────────────────────────────────────
+# ─── 预取句柄 ────────────────────────────────────────
 
 class MemoryPrefetch:
     """内存预取任务的包装类，用于轮询任务是否完成。"""
@@ -320,16 +320,16 @@ def start_memory_prefetch(
     already_surfaced: set[str],
     session_memory_bytes: int,
 ) -> MemoryPrefetch | None:
-    """Start async memory prefetch. Returns handle to poll for results."""
-    # Gate: multi-word input only
+    """启动异步内存预取。返回用于轮询结果的句柄。"""
+    # 门槛：仅限多词输入
     if not re.search(r"\s", query.strip()):
         return None
 
-    # Gate: session budget
+    # 门槛：会话预算
     if session_memory_bytes >= MAX_SESSION_MEMORY_BYTES:
         return None
 
-    # Gate: memories must exist
+    # 门槛：记忆文件必须存在
     d = get_memory_dir()
     has_memories = any(f.suffix == ".md" and f.name != "MEMORY.md" for f in d.iterdir())
     if not has_memories:
@@ -342,14 +342,14 @@ def start_memory_prefetch(
 
 
 def format_memories_for_injection(memories: list[RelevantMemory]) -> str:
-    """Format recalled memories for injection as user message content."""
+    """将召回的記憶格式化以注入到用户消息内容中。"""
     parts = []
     for m in memories:
         parts.append(f"<system-reminder>\n{m.header}\n\n{m.content}\n</system-reminder>")
     return "\n\n".join(parts)
 
 
-# ─── System prompt section ──────────────────────────────────
+# ─── 系统提示词部分 ──────────────────────────────────
 
 
 def build_memory_prompt_section() -> str:

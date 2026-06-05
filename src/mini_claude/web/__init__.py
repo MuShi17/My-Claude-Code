@@ -1,4 +1,4 @@
-"""Web frontend for Mini Claude Code — FastAPI app factory."""
+"""Web 前端 — Mini Claude Code 的 FastAPI 应用工厂。"""
 
 from __future__ import annotations
 

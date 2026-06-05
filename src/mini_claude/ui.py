@@ -1,4 +1,4 @@
-"""Terminal UI rendering — colored output, spinner, tool display."""
+"""Terminal UI 渲染 — 颜色输出、旋转器、工具显示。"""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""CLI entry point and interactive REPL — mirrors cli.ts."""
+"""CLI 入口点和交互式 REPL — 镜像 cli.ts。"""
 
 from __future__ import annotations
 
