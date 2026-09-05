@@ -33,10 +33,6 @@ mini-claude-py --api-base <URL>          # OpenAI 兼容 API 端点
 mini-claude-py --max-cost 0.50           # 费用上限（美元）
 mini-claude-py --max-turns 20            # 轮次上限
 
-# Web 模式
-mini-claude-py --web              # 启动浏览器界面（localhost:8000）
-mini-claude-py --web --port 3000  # 自定义端口
-
 # TypeScript 版（独立使用）
 npm install && npm run build
 npm start [-- --yolo --plan ...]
@@ -45,18 +41,6 @@ npm start [-- --yolo --plan ...]
 API 配置：设置 `ANTHROPIC_API_KEY`（Anthropic 格式，推荐）或 `OPENAI_API_KEY` + `OPENAI_BASE_URL`（OpenAI 兼容格式）。两者均支持自定义 base URL。
 
 REPL 命令：`/clear`、`/plan`、`/cost`、`/compact`、`/memory`、`/skills`、`/<skill名称>`。
-
-## Web 界面
-
-通过 `--web` 启动 FastAPI 驱动的 Web 前端：
-
-- **聊天页面** (`/`)：双栏布局（侧边栏会话列表 + 聊天区），SSE 流式输出，工具调用卡片（可折叠），文件 diff 高亮
-- **思考内容**：可折叠的"思考过程"区域，与正式回答分层显示（支持 Anthropic thinking 和 DeepSeek reasoning_content）
-- **管理面板** (`/admin`)：会话管理（恢复/删除）、记忆管理（查看/创建/删除）、技能列表、配置查看
-- **会话恢复**：侧边栏点击历史会话即可恢复对话，继续发送消息自动写回同一会话文件
-- **控制按钮**：输入区 ■ 按钮终止当前 Agent 处理，顶栏 关闭 按钮终止整个服务进程
-- **主题**：CSS 变量驱动，`prefers-color-scheme` 自动跟随系统亮/暗模式
-- **响应式**：≤768px 侧边栏自动隐藏，汉堡菜单唤出
 
 ## 架构
 
@@ -76,10 +60,6 @@ subagent.py  →  3 种内置类型（explore/plan/general）+ 自定义类型�
                 fork-return 模式
 mcp_client.py→  JSON-RPC over stdio、动态工具发现、带命名空间的工具（mcp__服务端__工具名）
 ui.py        →  基于 rich 的终端输出、彩色 diff、spinner 动画
-web/__init__.py →  FastAPI app 工厂、静态文件 serve、路由注册
-web/api.py      →  14 个 API 端点：聊天 SSE 流、会话/记忆/技能 CRUD、配置
-web/models.py   →  Pydantic 请求/响应模型
-web/templates/  →  index.html（聊天页面）、admin.html（管理面板）、style.css、app.js
 frontmatter.py→ 共享 YAML frontmatter 解析器，供 memory 和 skills 使用
 ```
 
