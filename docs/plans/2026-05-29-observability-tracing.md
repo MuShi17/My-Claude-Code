@@ -518,7 +518,7 @@ git commit -m "feat: add event emitter (on/off/_emit) to Agent"
                         elif hasattr(delta, 'thinking'):
                             if first_thinking:
                                 stop_spinner()
-                                self._emit_text("[thinking]\n ")
+                                self._emit_text("\n")
                                 first_thinking = False
                                 # ★ 发射 first_token 事件
                                 asyncio.create_task(

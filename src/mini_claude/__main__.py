@@ -9,7 +9,7 @@ import signal
 import sys
 from dotenv import load_dotenv
 load_dotenv()
-from .agent import Agent
+from .agent import Agent, DEFAULT_THINKING_EFFORT
 from .ui import print_welcome, print_user_prompt, print_error, print_info, print_plan_for_approval, print_plan_approval_options
 from .session import load_session, get_latest_session_id
 from .memory import list_memories
@@ -27,7 +27,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--plan", action="store_true", help="Plan mode: read-only")
     parser.add_argument("--accept-edits", action="store_true", help="Auto-approve file edits")
     parser.add_argument("--dont-ask", action="store_true", help="Auto-deny confirmations (for CI)")
-    parser.add_argument("--thinking", action="store_true", help="Enable extended thinking")
+    parser.add_argument(
+        "--thinking",
+        dest="thinking",
+        action="store_true",
+        default=None,
+        help="Enable extended thinking (legacy compatibility flag)",
+    )
+    parser.add_argument(
+        "--no-thinking",
+        dest="thinking",
+        action="store_false",
+        help="Disable extended thinking",
+    )
+    parser.add_argument(
+        "--thinking-effort",
+        choices=("none", "low", "high", "max"),
+        default=None,
+        help="Thinking effort: none, low, high, or max (default: max)",
+    )
     parser.add_argument("--model", "-m", default=None, help="Model to use")
     parser.add_argument("--api-base", default=None, help="OpenAI-compatible API base URL")
     parser.add_argument("--resume", action="store_true", help="Resume last session")
@@ -201,7 +219,10 @@ Options:
   --plan              Plan mode: read-only, describe changes without executing
   --accept-edits      Auto-approve file edits, still confirm dangerous shell
   --dont-ask          Auto-deny anything needing confirmation (for CI)
-  --thinking          Enable extended thinking (Anthropic only)
+  --thinking          Enable extended thinking (legacy compatibility flag)
+  --no-thinking       Disable extended thinking
+  --thinking-effort   Thinking effort: none, low, high, or max (default: max,
+                      or MINI_CLAUDE_THINKING_EFFORT)
   --model, -m         Model to use (default: claude-opus-4-6, or MINI_CLAUDE_MODEL env)
   --api-base URL      Use OpenAI-compatible API endpoint (key via env var)
   --resume            Resume the last session
@@ -232,6 +253,14 @@ Examples:
     permission_mode = _resolve_permission_mode(args)
     model = args.model or os.getenv("MINI_CLAUDE_MODEL", "claude-opus-4-6")
     api_base = args.api_base
+    thinking_effort = args.thinking_effort or os.getenv(
+        "MINI_CLAUDE_THINKING_EFFORT", DEFAULT_THINKING_EFFORT
+    )
+    if args.thinking is False:
+        thinking_effort = "none"
+    elif args.thinking is True and args.thinking_effort is None:
+        # 旧 --thinking 开关显式启用默认强度，但不覆盖显式 --thinking-effort。
+        thinking_effort = DEFAULT_THINKING_EFFORT
 
     # Resolve API config
     resolved_api_base = api_base
@@ -267,6 +296,7 @@ Examples:
         permission_mode=permission_mode,
         model=model,
         thinking=args.thinking,
+        thinking_effort=thinking_effort,
         max_cost_usd=args.max_cost,
         max_turns=args.max_turns,
         api_base=resolved_api_base if resolved_use_openai else None,

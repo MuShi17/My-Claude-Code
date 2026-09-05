@@ -105,13 +105,32 @@ def _get_context_window(model: str) -> int:
 # Claude Opus/Sonnet/Haiku 4.x 支持 extended thinking，
 # Claude 3.x 系列不支持；Opus 4.6 / Sonnet 4.6 额外支持 adaptive 模式。
 
+THINKING_EFFORTS = ("none", "low", "high", "max")
+DEFAULT_THINKING_EFFORT = "max"
+
+
+def _normalize_thinking_effort(effort: str | None) -> str:
+    """规范化思考强度；none 用于显式关闭思考模式。"""
+    value = (effort or DEFAULT_THINKING_EFFORT).strip().lower()
+    value = {"off": "none", "disabled": "none"}.get(value, value)
+    if value not in THINKING_EFFORTS:
+        allowed = ", ".join(THINKING_EFFORTS)
+        raise ValueError(
+            f"Invalid thinking effort {effort!r}; expected one of: {allowed}"
+        )
+    return value
+
 
 def _model_supports_thinking(model: str) -> bool:
     """判断模型是否支持扩展思考功能。"""
     m = model.lower()
+    if "deepseek" in m or "reasoner" in m:
+        return True
     if "claude-3-" in m or "3-5-" in m or "3-7-" in m:
         return False
     if "claude" in m and any(x in m for x in ("opus", "sonnet", "haiku")):
+        return True
+    if "reasoner" in m or any(name in m for name in ("gpt-5", "o1", "o3", "o4")):
         return True
     return False
 
@@ -122,16 +141,78 @@ def _model_supports_adaptive_thinking(model: str) -> bool:
     return "opus-4-6" in m or "sonnet-4-6" in m
 
 
-def _get_max_output_tokens(model: str) -> int:
-    """获取模型最大输出 token 数，用于设置 API 的 max_tokens 参数。"""
+def _get_anthropic_request_max_tokens(model: str) -> int:
+    """返回 Anthropic 请求所需的 token envelope，而非模型输出上限。
+
+    Anthropic Messages API 要求请求携带 max_tokens；这里使用模型上下文窗口
+    作为协议层预算，不再根据模型名称把可见输出硬编码为 16K/32K/64K。
+    模型和服务端仍会执行其自身的上下文及输出能力限制。
+    """
+    return max(_get_context_window(model), 1)
+
+
+def _model_supports_openai_reasoning_effort(model: str) -> bool:
+    """判断 OpenAI Chat Completions 后端是否应发送 reasoning_effort。"""
     m = model.lower()
-    if "opus-4-6" in m:
-        return 64000
-    if "sonnet-4-6" in m:
-        return 32000
-    if any(x in m for x in ("opus-4", "sonnet-4", "haiku-4")):
-        return 32000
-    return 16384
+    return (
+        "deepseek" in m
+        or "reasoner" in m
+        or any(name in m for name in ("gpt-5", "o1", "o3", "o4"))
+    )
+
+
+def _is_deepseek_model(model: str) -> bool:
+    return "deepseek" in model.lower()
+
+
+def _get_thinking_budget_tokens(effort: str) -> int:
+    """为旧版 Anthropic thinking 参数将 effort 映射成 token 预算。
+
+    该预算只控制旧版 thinking 块，不限制最终可见输出长度；新式 adaptive
+    和 DeepSeek output_config 模式不使用此映射。
+    """
+    return {"low": 8192, "high": 16384, "max": 32768}[effort]
+
+
+def _thinking_request_params(
+    model: str,
+    effort: str,
+    *,
+    use_openai: bool,
+) -> dict[str, Any]:
+    """构造后端对应的思考参数，不为 none 或不支持的模型发送参数。"""
+    normalized = _normalize_thinking_effort(effort)
+    if normalized == "none":
+        if _is_deepseek_model(model):
+            return {"thinking": {"type": "disabled"}}
+        return {}
+
+    if use_openai:
+        if not _model_supports_openai_reasoning_effort(model):
+            return {}
+        params = {"reasoning_effort": normalized}
+        if _is_deepseek_model(model):
+            params["thinking"] = {"type": "enabled"}
+        return params
+
+    if _model_supports_adaptive_thinking(model):
+        return {
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": normalized},
+        }
+    if _is_deepseek_model(model):
+        return {
+            "thinking": {"type": "enabled"},
+            "output_config": {"effort": normalized},
+        }
+    if _model_supports_thinking(model):
+        return {
+            "thinking": {
+                "type": "enabled",
+                "budget_tokens": _get_thinking_budget_tokens(normalized),
+            }
+        }
+    return {}
 
 
 # ─── 工具转换为 OpenAI 格式 ────────────────────────────────
@@ -180,7 +261,8 @@ class Agent:
         api_base: str | None = None,
         anthropic_base_url: str | None = None,
         api_key: str | None = None,
-        thinking: bool = False,
+        thinking: bool | None = None,
+        thinking_effort: str = DEFAULT_THINKING_EFFORT,
         max_cost_usd: float | None = None,
         max_turns: int | None = None,
         confirm_fn: Callable[[str], Awaitable[bool]] | None = None,
@@ -190,7 +272,12 @@ class Agent:
         logger: AgentLogger | None = None,
     ):
         self.permission_mode = permission_mode
-        self.thinking = thinking
+        self.thinking_effort = _normalize_thinking_effort(thinking_effort)
+        # 保留旧版 thinking bool 参数：False 显式关闭；新的调用方应优先使用
+        # thinking_effort，因此不让旧参数覆盖显式的 effort=none。
+        if thinking is False:
+            self.thinking_effort = "none"
+        self.thinking = self.thinking_effort != "none"
         self.model = model
         self.use_openai = bool(api_base)
         self.is_sub_agent = is_sub_agent
@@ -274,7 +361,7 @@ class Agent:
             self._openai_client = None
 
     def _resolve_thinking_mode(self) -> str:
-        if not self.thinking:
+        if self.thinking_effort == "none":
             return "disabled"
         if not _model_supports_thinking(self.model):
             return "disabled"
@@ -809,6 +896,7 @@ class Agent:
             sub_agent = Agent(
                 model=self.model,
                 api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
+                thinking_effort=self.thinking_effort,
                 custom_system_prompt=result["prompt"],
                 custom_tools=tools,
                 is_sub_agent=True,
@@ -966,6 +1054,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         sub_agent = Agent(
             model=self.model,
             api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
+            thinking_effort=self.thinking_effort,
             custom_system_prompt=config["system_prompt"],
             custom_tools=config["tools"],
             is_sub_agent=True,
@@ -1210,17 +1299,21 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         允许在完整响应到达之前提前执行工具（对应 Claude Code content_block_stop 策略）。
         同时处理 thinking 块的过滤和文本/partial_json 的流式输出。"""
         async def _do():
-            max_output = _get_max_output_tokens(self.model)
             create_params: dict[str, Any] = {
                 "model": self.model,
-                "max_tokens": max_output if self._thinking_mode != "disabled" else 16384,
+                "max_tokens": _get_anthropic_request_max_tokens(self.model),
                 "system": self._system_prompt,
                 "tools": get_active_tool_definitions(self.tools),
                 "messages": self._anthropic_messages,
             }
 
-            if self._thinking_mode in ("adaptive", "enabled"):
-                create_params["thinking"] = {"type": "enabled", "budget_tokens": max_output - 1}
+            create_params.update(
+                _thinking_request_params(
+                    self.model,
+                    self.thinking_effort,
+                    use_openai=False,
+                )
+            )
 
             first_text = True
             first_thinking = True
@@ -1516,6 +1609,13 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 "stream": True,
                 "stream_options": {"include_usage": True},
             }
+            create_params.update(
+                _thinking_request_params(
+                    self.model,
+                    self.thinking_effort,
+                    use_openai=True,
+                )
+            )
 
             stream = await self._openai_client.chat.completions.create(**create_params)
 

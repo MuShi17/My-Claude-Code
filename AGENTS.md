@@ -27,7 +27,8 @@ mini-claude-py --dont-ask "提示词"        # 自动拒绝确认（适用于 CI
 
 # 其他参数
 mini-claude-py --resume                  # 恢复上次会话
-mini-claude-py --thinking                # 启用扩展思考（仅 Anthropic）
+mini-claude-py --thinking-effort max     # 设置模型思考强度（默认 max）
+mini-claude-py --no-thinking             # 关闭模型思考
 mini-claude-py --model <名称>            # 覆盖模型（环境变量：MINI_CLAUDE_MODEL）
 mini-claude-py --api-base <URL>          # OpenAI 兼容 API 端点
 mini-claude-py --max-cost 0.50           # 费用上限（美元）
@@ -38,7 +39,7 @@ npm install && npm run build
 npm start [-- --yolo --plan ...]
 ```
 
-API 配置：设置 `ANTHROPIC_API_KEY`（Anthropic 格式，推荐）或 `OPENAI_API_KEY` + `OPENAI_BASE_URL`（OpenAI 兼容格式）。两者均支持自定义 base URL。
+API 配置：设置 `ANTHROPIC_API_KEY`（Anthropic 格式，推荐）或 `OPENAI_API_KEY` + `OPENAI_BASE_URL`（OpenAI 兼容格式）。两者均支持自定义 base URL。思考强度可通过 `MINI_CLAUDE_THINKING_EFFORT` 配置，默认值为 `max`，可选 `none`、`low`、`high`、`max`。
 
 REPL 命令：`/clear`、`/plan`、`/cost`、`/compact`、`/memory`、`/skills`、`/<skill名称>`。
 

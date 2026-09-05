@@ -117,5 +117,4 @@ session.json 新增 `metadata.askCount` 用于追踪 ask 编号。
 ## 7. 兼容性
 
 - `load_session()` 和 `list_sessions()` 向后兼容旧的扁平 `.json` 格式
-- Web 模式（web/api.py）无需额外改动：monkey-patch 叠加在 Agent 事件系统之上
 - 首次使用新格式时，手动迁移无需脚本（load → save 自动升级）
