@@ -1254,7 +1254,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         elif hasattr(delta, 'thinking'):
                             if first_thinking:
                                 stop_spinner()
-                                self._emit_text("[thinking]\n ")
+                                self._emit_text("\n")
                                 first_thinking = False
                                 # ★ 发射 first_token 事件
                                 asyncio.create_task(
@@ -1543,14 +1543,12 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     rc = delta.reasoning_content
 
                 if rc:
-                    # First reasoning chunk gets a marker so the web frontend can
-                    # detect and route it to the collapsible thinking section
                     if not reasoning_content:
+                        self._emit_text("\n")
                         asyncio.create_task(
                             self._emit("first_token", {"is_thinking": True})
                         )
-                    prefix = "[thinking]\n" if not reasoning_content else ""
-                    self._emit_text(f"{prefix}{rc}")
+                    self._emit_text(rc)
                     reasoning_content += rc
 
                 if delta and delta.content:
