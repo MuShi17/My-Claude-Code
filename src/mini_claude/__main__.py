@@ -7,11 +7,22 @@ import asyncio
 import os
 import signal
 import sys
+from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
 from .agent import Agent, DEFAULT_THINKING_EFFORT
 from .ui import print_welcome, print_user_prompt, print_error, print_info, print_plan_for_approval, print_plan_approval_options
-from .session import load_session, get_latest_session_id
+from .session import (
+    CanonicalRecoveryError,
+    get_latest_session_id,
+    list_canonical_runtime_sessions,
+    list_sessions,
+    list_runtime_store_paths,
+    load_session,
+)
+from .runtime_store import SQLiteRuntimeStore
+from .recovery import RecoveryProjection
+from .artifact_archive import ArtifactArchive
 from .memory import list_memories
 from .skills import discover_skills, resolve_skill_prompt, get_skill_by_name, execute_skill
 
@@ -49,6 +60,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", "-m", default=None, help="Model to use")
     parser.add_argument("--api-base", default=None, help="OpenAI-compatible API base URL")
     parser.add_argument("--resume", action="store_true", help="Resume last session")
+    parser.add_argument("--list", dest="list_sessions", action="store_true", help="List local sessions")
+    parser.add_argument("--latest", action="store_true", help="Show the latest local session")
+    parser.add_argument(
+        "--log-authority",
+        choices=("legacy", "shadow", "canonical"),
+        default=os.getenv("MINI_CLAUDE_LOG_AUTHORITY", "shadow"),
+        help="Runtime log route: legacy, shadow, or gated canonical",
+    )
+    parser.add_argument(
+        "--log-rollback",
+        action="store_true",
+        help="Route logging back to legacy without deleting canonical data",
+    )
+    parser.add_argument(
+        "--approve-canonical",
+        action="store_true",
+        help="Explicitly approve Canonical authority for this invocation",
+    )
     parser.add_argument("--max-cost", type=float, default=None, help="Max USD spend")
     parser.add_argument("--max-turns", type=int, default=None, help="Max agentic turns")
     parser.add_argument("--help", "-h", action="store_true", help="Show help")
@@ -65,6 +94,44 @@ def _resolve_permission_mode(args: argparse.Namespace) -> str:
     if args.dont_ask:
         return "dontAsk"
     return "default"
+
+
+def _open_latest_canonical_store() -> tuple[SQLiteRuntimeStore | None, str | None]:
+    """Open the newest session store, conservatively rejecting corruption."""
+
+    candidates: list[tuple[Path, SQLiteRuntimeStore, str]] = []
+    failures: list[tuple[Path, Exception]] = []
+    for database in list_runtime_store_paths():
+        store: SQLiteRuntimeStore | None = None
+        try:
+            store = SQLiteRuntimeStore(database)
+            session_id = get_latest_session_id(runtime_store=store)
+            if session_id:
+                candidates.append((database, store, session_id))
+            else:
+                store.close()
+        except Exception as error:
+            if store is not None:
+                store.close()
+            failures.append((database, error))
+
+    if failures:
+        for _, store, _ in candidates:
+            store.close()
+        path, error = failures[0]
+        raise CanonicalRecoveryError(
+            f"canonical runtime store classified as corrupt: {error}", path=path
+        ) from error
+    if not candidates:
+        return None, None
+
+    # list_runtime_store_paths is newest-first, so the first canonical
+    # candidate is the resume target.  Other stores remain untouched and are
+    # closed without being rewritten.
+    _, selected, session_id = candidates[0]
+    for _, store, _ in candidates[1:]:
+        store.close()
+    return selected, session_id
 
 
 async def run_repl(agent: Agent) -> None:
@@ -226,6 +293,11 @@ Options:
   --model, -m         Model to use (default: claude-opus-4-6, or MINI_CLAUDE_MODEL env)
   --api-base URL      Use OpenAI-compatible API endpoint (key via env var)
   --resume            Resume the last session
+  --list              List local sessions without contacting a provider
+  --latest            Show the latest local session without contacting a provider
+  --log-authority     Log route: legacy, shadow, or gated canonical
+  --log-rollback      Route logging back to legacy; retain canonical data
+  --approve-canonical Explicitly approve Canonical authority for this invocation
   --max-cost USD      Stop when estimated cost exceeds this amount
   --max-turns N       Stop after N agentic turns
   --help, -h          Show this help
@@ -284,7 +356,77 @@ Examples:
         resolved_api_key = os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
         resolved_use_openai = True
 
+    resume_store = None
+    resume_session_id: str | None = None
+    if args.resume:
+        try:
+            resume_store, resume_session_id = _open_latest_canonical_store()
+            if resume_store is not None:
+                recovery = RecoveryProjection(
+                    artifact_archive=ArtifactArchive(Path.home() / ".mini-claude" / "artifacts")
+                )
+                recovered = recovery.recover_startup(resume_store)
+                for item in recovered:
+                    if item.status in {"corrupt", "uncertain", "unmatched"}:
+                        print(f"Recovery {item.status}: {item.run_id} - {item.recommended_action}")
+        except CanonicalRecoveryError as error:
+            print_error(f"Canonical recovery blocked ({error.classification}): {error}")
+            if resume_store is not None:
+                resume_store.close()
+            sys.exit(2)
+
+    if args.list_sessions or args.latest:
+        try:
+            canonical_sessions = list_canonical_runtime_sessions()
+        except CanonicalRecoveryError as error:
+            print_error(f"Canonical listing blocked ({error.classification}): {error}")
+            sys.exit(2)
+        legacy_sessions = [
+            item for item in list_sessions()
+            if item.get("source") == "legacy-readonly"
+        ]
+        sessions = canonical_sessions + legacy_sessions
+        if args.latest:
+            if sessions:
+                latest = sorted(
+                    sessions,
+                    key=lambda item: (
+                        int(item.get("highWater", 0) or 0),
+                        item.get("startTime", ""),
+                        item.get("id", ""),
+                    ),
+                    reverse=True,
+                )[0]
+                print(f"Latest session: {latest.get('id')} ({latest.get('source', 'canonical')})")
+            else:
+                print("No previous sessions found.")
+        elif sessions:
+            for item in sorted(sessions, key=lambda value: str(value.get("id", ""))):
+                print(f"{item.get('id')} ({item.get('source', 'canonical')})")
+        else:
+            print("No previous sessions found.")
+        return
+
     if not resolved_api_key:
+        # A resume-only invocation is also a useful offline inspection command.
+        # Do not require provider credentials merely to classify/load local
+        # canonical or legacy state.  Continuing with a new turn still needs a
+        # key and will be rejected on the next invocation.
+        if args.resume and not args.prompt:
+            canonical_id = resume_session_id or (
+                get_latest_session_id(runtime_store=resume_store) if resume_store else None
+            )
+            if canonical_id:
+                print(f"Canonical session available: {canonical_id}")
+            else:
+                legacy_id = get_latest_session_id()
+                if legacy_id:
+                    print(f"Legacy readonly session available: {legacy_id}")
+                else:
+                    print("No previous sessions found.")
+            if resume_store is not None:
+                resume_store.close()
+            return
         print_error(
             "API key is required.\n"
             "  Set ANTHROPIC_API_KEY (+ optional ANTHROPIC_BASE_URL) for Anthropic format,\n"
@@ -302,22 +444,36 @@ Examples:
         api_base=resolved_api_base if resolved_use_openai else None,
         anthropic_base_url=resolved_api_base if not resolved_use_openai else None,
         api_key=resolved_api_key,
+        runtime_store=resume_store,
+        runtime_authority=args.log_authority,
+        runtime_authority_approved=args.approve_canonical,
+        runtime_rollback=args.log_rollback,
     )
 
     # Resume session
     if args.resume:
-        session_id = get_latest_session_id()
+        canonical_ids = resume_store.list_session_ids() if resume_store is not None else []
+        session_id = (
+            resume_session_id
+            if canonical_ids
+            else get_latest_session_id()
+        )
         if session_id:
-            session = load_session(session_id)
+            session = load_session(
+                session_id,
+                runtime_store=resume_store,
+                canonical_first=bool(canonical_ids),
+            )
             if session:
                 agent.restore_session({
+                    **session,
                     "anthropicMessages": session.get("anthropicMessages"),
                     "openaiMessages": session.get("openaiMessages"),
                 })
             else:
-                print_info("No session found to resume.")
+                print_info("Canonical session is unavailable; inspect recovery diagnostics before continuing.")
         else:
-            print_info("No previous sessions found.")
+            print("No previous sessions found.")
 
     prompt = " ".join(args.prompt) if args.prompt else None
 

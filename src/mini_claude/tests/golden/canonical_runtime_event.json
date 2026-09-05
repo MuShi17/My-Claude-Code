@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "events": [
+    {
+      "kind": "invocation_opened",
+      "session_id": "<SESSION_ID.1>",
+      "turn_id": "<TURN_ID.2>",
+      "run_id": "<RUN_ID.3>",
+      "invocation_id": "<INVOCATION_ID.4>",
+      "partial": false
+    },
+    {
+      "kind": "function_call",
+      "call_id": "<CALL_ID.5>",
+      "name": "read_file",
+      "arguments": {"file_path": "<WORKSPACE>/sample.txt"},
+      "partial": false
+    },
+    {
+      "kind": "permission",
+      "call_id": "<CALL_ID.5>",
+      "decision": "allow",
+      "partial": false
+    },
+    {
+      "kind": "tool_dispatch",
+      "call_id": "<CALL_ID.5>",
+      "name": "read_file",
+      "arguments_digest": "fixture-digest",
+      "partial": false
+    },
+    {
+      "kind": "tool_outcome",
+      "call_id": "<CALL_ID.5>",
+      "success": true,
+      "result": "alpha\nbeta\n",
+      "partial": false
+    },
+    {
+      "kind": "function_response",
+      "call_id": "<CALL_ID.5>",
+      "result": "alpha\nbeta\n",
+      "partial": false
+    }
+  ],
+  "messages": [
+    {"role": "user", "content": "Read sample.txt"},
+    {"role": "assistant", "content": "I will read the file."},
+    {"role": "tool", "tool_call_id": "<CALL_ID.5>", "content": "alpha\nbeta\n"}
+  ],
+  "trace": {
+    "run_id": "<RUN_ID.3>",
+    "phases": ["model", "permission", "dispatch", "tool", "response"],
+    "terminal": "completed"
+  },
+  "compaction": {
+    "source_high_water": 8,
+    "source_digest": "fixture-source-digest",
+    "coverage": {"from_ordinal": 1, "to_ordinal": 8},
+    "summary": "Read sample.txt and returned its bounded result.",
+    "recent_tail": ["<CALL_ID.5>"]
+  }
+}

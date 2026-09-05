@@ -46,11 +46,23 @@ from .ui import (
     start_spinner,
     stop_spinner,
 )
-from .session import save_session
+from .session import runtime_store_path, save_session, save_session_v2
 from .prompt import build_system_prompt
 from .subagent import get_sub_agent_config
 from .mcp_client import McpManager
 from .logger import AgentLogger
+from .event_ids import RunContext
+from .event_sink import CompositeEventSink, EventSink, LegacyShadowSink, RuntimeEventEmitter
+from .runtime_event import RuntimeEvent
+from .runtime_lifecycle import DurableToolBoundary, ModelCallRecorder
+from .runtime_store import SQLiteRuntimeStore
+from .run_lifecycle import RunStateGuard
+from .compaction import CompactionCheckpoint, CompactionCheckpointBuilder, CompactionError
+from .projections.model_replay_projection import ModelReplayProjection
+from .projections.provider_context import CanonicalModelContextAdapter
+from .artifact_archive import ArtifactArchive
+from .llm_capture import LLMCaptureManager, LLMCapturePolicy
+from .cutover import AuthorityConfig, select_event_sink
 
 # ─── 指数退避重试 ──────────────────────────────────────────
 # 对 429（限流）、503/529（过载）、网络错误进行最多 3 次重试，
@@ -68,7 +80,7 @@ def _is_retryable(error: Exception) -> bool:
     return False
 
 
-async def _with_retry(fn, max_retries: int = 3):
+async def _with_retry(fn, max_retries: int = 3, on_retry: Callable[[int, Exception], Any] | None = None):
     """对异步函数 fn 执行指数退避重试。"""
     for attempt in range(max_retries + 1):
         try:
@@ -79,6 +91,8 @@ async def _with_retry(fn, max_retries: int = 3):
             delay = min(1000 * (2 ** attempt), 30000) / 1000 + (hash(str(time.time())) % 1000) / 1000
             status = getattr(error, "status_code", None) or getattr(error, "status", None)
             reason = f"HTTP {status}" if status else (getattr(error, "code", None) or "network error")
+            if on_retry:
+                on_retry(attempt + 2, error)
             print_retry(attempt + 1, max_retries, reason)
             await asyncio.sleep(delay)
 
@@ -133,6 +147,12 @@ def _model_supports_thinking(model: str) -> bool:
     if "reasoner" in m or any(name in m for name in ("gpt-5", "o1", "o3", "o4")):
         return True
     return False
+
+
+class CanonicalFinalizationError(RuntimeError):
+    """The run could not durably publish its canonical terminal state."""
+
+    code = "canonical_finalization_failed"
 
 
 def _model_supports_adaptive_thinking(model: str) -> bool:
@@ -270,6 +290,16 @@ class Agent:
         custom_tools: list[ToolDef] | None = None,
         is_sub_agent: bool = False,
         logger: AgentLogger | None = None,
+        runtime_store: SQLiteRuntimeStore | None = None,
+        runtime_sink: EventSink | None = None,
+        enable_legacy_shadow: bool = True,
+        runtime_parent_run_id: str | None = None,
+        runtime_run_id: str | None = None,
+        artifact_archive: ArtifactArchive | None = None,
+        llm_capture_policy: LLMCapturePolicy | None = None,
+        runtime_authority: str = "shadow",
+        runtime_authority_approved: bool = False,
+        runtime_rollback: bool = False,
     ):
         self.permission_mode = permission_mode
         self.thinking_effort = _normalize_thinking_effort(thinking_effort)
@@ -282,6 +312,25 @@ class Agent:
         self.use_openai = bool(api_base)
         self.is_sub_agent = is_sub_agent
         self._logger = logger
+        self._runtime_store = runtime_store
+        self._runtime_sink = runtime_sink
+        self._runtime_emitter: RuntimeEventEmitter | None = None
+        self._runtime_context: RunContext | None = None
+        self._runtime_recorder: ModelCallRecorder | None = None
+        self._runtime_boundary: DurableToolBoundary | None = None
+        self._runtime_store_owned = False
+        self._enable_legacy_shadow = enable_legacy_shadow
+        self._runtime_parent_run_id = runtime_parent_run_id
+        self._runtime_run_id = runtime_run_id
+        self._runtime_guard: RunStateGuard | None = None
+        self._runtime_exit_status: str | None = None
+        self._runtime_exit_reason: str | None = None
+        self._artifact_archive = artifact_archive
+        self._llm_capture_policy = llm_capture_policy or LLMCapturePolicy()
+        self._llm_capture_manager: LLMCaptureManager | None = None
+        self._runtime_authority = runtime_authority
+        self._runtime_authority_approved = runtime_authority_approved
+        self._runtime_rollback = runtime_rollback
         self.tools = custom_tools or tool_definitions
         self.max_cost_usd = max_cost_usd
         self.max_turns = max_turns
@@ -384,6 +433,7 @@ class Agent:
     async def _emit(self, event: str, payload: Any = None) -> None:
         """发射事件。同步和异步回调均支持。"""
         import asyncio as _asyncio
+        self._emit_runtime_observation(event, payload)
         for cb in self._event_hooks.get(event, []):
             try:
                 res = cb(payload)
@@ -391,6 +441,279 @@ class Agent:
                     await res
             except Exception:
                 pass  # 观测错误不影响主流程
+
+    def _setup_runtime_facade(self) -> None:
+        """Create the canonical facade for one ask after the legacy ask opens."""
+
+        if self._runtime_emitter is not None and not self._runtime_store_owned:
+            # A caller-owned sink/store remains available across asks.
+            pass
+        else:
+            if self._runtime_store is None and self._runtime_sink is None:
+                self._runtime_store = SQLiteRuntimeStore(
+                    runtime_store_path(self.session_id)
+                )
+                self._runtime_store_owned = True
+            canonical: EventSink = self._runtime_sink or self._runtime_store  # type: ignore[assignment]
+            if canonical is None:
+                raise RuntimeError("runtime facade requires a canonical sink")
+            if self._artifact_archive is None:
+                self._artifact_archive = ArtifactArchive(
+                    Path.home() / ".mini-claude" / "artifacts",
+                    metadata_store=self._runtime_store,
+                )
+            self._llm_capture_manager = LLMCaptureManager(
+                policy=self._llm_capture_policy,
+                archive=self._artifact_archive,
+                runtime_store=self._runtime_store,
+            )
+            legacy = LegacyShadowSink(self._logger) if self._enable_legacy_shadow and self._logger else None
+            sink: EventSink = select_event_sink(
+                canonical,
+                legacy,
+                AuthorityConfig(
+                    mode=self._runtime_authority,
+                    rollback=self._runtime_rollback,
+                    shadow_enabled=self._enable_legacy_shadow,
+                ),
+                approved=self._runtime_authority_approved,
+            )
+            self._runtime_emitter = RuntimeEventEmitter(sink)
+
+        self._runtime_context = RunContext(
+            session_id=self.session_id,
+            turn_id=f"turn-{self._ask_count:04d}",
+            run_id=self._runtime_run_id or f"run-{self.session_id}-{self._ask_count:04d}",
+            invocation_id=f"invocation-{self.session_id}-{self._ask_count:04d}",
+            parent_run_id=self._runtime_parent_run_id,
+        )
+        self._runtime_guard = RunStateGuard(self._runtime_context, self._runtime_emitter)
+        self._runtime_guard.start()
+        self._runtime_recorder = None
+        self._runtime_boundary = None
+        self._runtime_exit_status = None
+        self._runtime_exit_reason = None
+
+    def _start_runtime_model_call(self, request_id: str, provider: str, request: Any) -> None:
+        if self._runtime_emitter is None or self._runtime_context is None:
+            return
+        context = RunContext(
+            session_id=self._runtime_context.session_id,
+            turn_id=self._runtime_context.turn_id,
+            run_id=self._runtime_context.run_id,
+            invocation_id=request_id,
+            parent_run_id=self._runtime_context.parent_run_id,
+            branch=self._runtime_context.branch,
+        )
+        self._runtime_recorder = ModelCallRecorder(
+            self._runtime_emitter,
+            context,
+            provider=provider,
+            model=self.model,
+        )
+        self._runtime_recorder.start(request_id, request=request if isinstance(request, dict) else None)
+        self._runtime_boundary = DurableToolBoundary(
+            self._runtime_emitter,
+            context,
+            artifact_archive=self._artifact_archive,
+        )
+
+    def _record_budget_exceeded(self, reason: str) -> None:
+        """Finalize the run budget without re-finishing the model call.
+
+        A provider response can finish its model recorder before the agent
+        notices that the resulting tool turn exhausted the run budget.  The
+        budget decision is therefore a run-level concern and must use the
+        ``RunStateGuard`` rather than ``ModelCallRecorder.budget_exceeded``.
+        """
+
+        terminal = None
+        if self._runtime_guard is not None:
+            terminal = self._runtime_guard.budget_exceeded(reason)
+        elif self._runtime_recorder is not None and not getattr(self._runtime_recorder, "_finished", False):
+            # Compatibility for an embedding that supplies a recorder but no
+            # run guard.  Normal Agent chats always take the guard branch.
+            terminal = self._runtime_recorder.budget_exceeded(reason)
+        if terminal is not None:
+            self._runtime_exit_status = "budget_exceeded"
+            self._runtime_exit_reason = reason
+
+    async def _run_durable_tool(
+        self,
+        *,
+        request_id: str,
+        call_id: str,
+        name: str,
+        inp: Any,
+        permission: dict[str, Any] | str,
+        arguments: Any | None = None,
+    ) -> tuple[Any, bool, bool]:
+        """Run one tool only after the canonical dispatch barrier succeeds."""
+
+        del request_id
+        if self._runtime_boundary is None:
+            # Compatibility fallback is used only when an embedding explicitly
+            # disables canonical logging; normal Agent chats always set it up.
+            raw = await self._execute_tool_call(name, inp)
+            return raw, not (isinstance(raw, str) and raw.startswith("Error:")), True
+        result = await self._runtime_boundary.execute(
+            call_id=call_id,
+            name=name,
+            arguments=inp if arguments is None else arguments,
+            permission=permission,
+            executor=lambda: self._execute_tool_call(name, inp),
+            on_started=lambda: self._emit(
+                "tool_start", {"tool_name": name, "tool_input": inp, "tool_call_id": call_id}
+            ),
+        )
+        return result.result, result.success, result.executed
+
+    def _emit_runtime_observation(self, event: str, payload: Any) -> None:
+        """Persist non-provider lifecycle observations without using logger APIs."""
+
+        if self._runtime_emitter is None or self._runtime_context is None:
+            return
+        if event not in {"compaction"}:
+            return
+        details = dict(payload or {})
+        runtime_event = RuntimeEvent.create(
+            self._runtime_context,
+            role="system",
+            author="system",
+            content={"kind": "invocation_opened"},
+            actions={event: details},
+            ts=int(time.time() * 1000),
+            metadata={"lifecycle": event},
+        )
+        self._runtime_emitter.emit(runtime_event)
+
+    def _emit_canonical_user_event(self, user_message: str) -> None:
+        """Record the original user input before provider context mutation."""
+
+        if self._runtime_emitter is None or self._runtime_context is None:
+            return
+        event = RuntimeEvent.create(
+            self._runtime_context,
+            role="user",
+            author="user",
+            content={"kind": "text", "text": user_message},
+            ts=int(time.time() * 1000),
+            metadata={
+                "lifecycle": "user_input",
+                "source": "user",
+                "injected": False,
+            },
+        )
+        self._runtime_emitter.emit(event)
+
+    def _record_sub_agent_event(self, *, name: str, agent_type: str, prompt: str) -> None:
+        if self._runtime_emitter is None or self._runtime_context is None:
+            return
+        event = RuntimeEvent.create(
+            self._runtime_context,
+            role="system",
+            author="agent",
+            actions={"sub_agent": {"name": name, "agent_type": agent_type, "prompt_summary": prompt[:200]}},
+            ts=int(time.time() * 1000),
+            metadata={"legacy_kind": "sub_agent", "lifecycle": "child_run_opened"},
+        )
+        self._runtime_emitter.emit(event)
+
+    def _capture_legacy_llm(
+        self,
+        *,
+        request_id: str,
+        messages: list[dict],
+        response: dict,
+        usage: dict,
+        latency_ms: int,
+        input_tokens: int | None,
+        output_tokens: int | None,
+        cache_read_tokens: int | None,
+        finish_reason: str,
+    ) -> None:
+        """Capture according to policy, then shadow only bounded metadata.
+
+        ``AgentLogger.save_llm_content`` is a raw request/response writer.  It
+        predates ``LLMCaptureManager`` and therefore cannot be called after a
+        policy decision: doing so would bypass ``off`` and ``metadata-only``
+        and would also make ``redacted`` capture unsafe.  The legacy shadow
+        record below is deliberately metadata-only; redacted body storage is
+        owned by ``LLMCaptureManager`` and its artifact archive.
+        """
+
+        capture = None
+        if self._llm_capture_manager is not None and self._runtime_context is not None:
+            capture = self._llm_capture_manager.capture(
+                request_id=request_id,
+                session_id=self._runtime_context.session_id,
+                run_id=self._runtime_context.run_id,
+                invocation_id=request_id,
+                attempt=self._runtime_recorder.attempt if self._runtime_recorder else 1,
+                attempt_id=self._runtime_recorder.attempt_id if self._runtime_recorder else None,
+                provider="openai" if self.use_openai else "anthropic",
+                model=self.model,
+                request=messages,
+                response=response,
+                usage=usage,
+                latency_ms=latency_ms,
+            )
+            self._emit_llm_capture_observation(request_id, capture)
+
+        if not self._logger or not self._enable_legacy_shadow:
+            return
+
+        capture_status = capture.capture_status if capture is not None else self._llm_capture_policy.mode
+        llm_ref = (
+            capture.llm_ref
+            if capture is not None and capture.capture_status == "saved"
+            else None
+        )
+        record: dict[str, Any] = {
+            "type": "api_response",
+            "request_id": request_id,
+            "latency_ms": latency_ms,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cache_read_tokens": cache_read_tokens,
+            "finish_reason": finish_reason,
+            "llm_capture_status": capture_status,
+        }
+        if llm_ref is not None:
+            record["llm_ref"] = llm_ref
+        if capture is not None and capture.error:
+            record["llm_capture_error"] = str(capture.error)[:512]
+        try:
+            self._logger.log_runtime_event(record)
+        except Exception:
+            pass
+
+    def _emit_llm_capture_observation(self, request_id: str, capture: Any) -> None:
+        if self._runtime_emitter is None or self._runtime_context is None:
+            return
+        refs = {"llm_ref": capture.llm_ref} if capture.llm_ref else None
+        event = RuntimeEvent.create(
+            self._runtime_context,
+            role="system",
+            author="agent",
+            content={"kind": "invocation_opened"},
+            actions={
+                "llm_capture": {
+                    "request_id": request_id,
+                    "capture_status": capture.capture_status,
+                    "error": capture.error,
+                }
+            },
+            refs=refs,
+            ts=int(time.time() * 1000),
+            metadata={"lifecycle": "llm_capture", "capture_mode": self._llm_capture_policy.mode},
+        )
+        try:
+            self._runtime_emitter.emit(event)
+        except Exception:
+            # Capture is auxiliary; a provider response must not be turned into
+            # a different model result because a diagnostic row failed.
+            pass
 
     def _msg_char_count(self) -> int:
         """计算当前消息列表的字符总数（用于压缩前后对比）。"""
@@ -491,8 +814,15 @@ class Agent:
 
         # 创建观测器（仅主 Agent）
         tracer: Any = None
-        if not self.is_sub_agent:
+        if self.is_sub_agent:
+            # Child loggers share the parent's open legacy file but still need
+            # an explicit ask boundary; otherwise their events are dropped.
+            if self._logger:
+                self._logger.new_ask()
+        else:
             from .tracer import SessionTracer
+            if self._logger:
+                self._logger.close()
             self._logger = AgentLogger(self.session_id, agent_id="main")
             self._logger.new_ask(self._ask_count)
             tracer = SessionTracer(self._ask_count, user_message, self._logger)
@@ -505,19 +835,46 @@ class Agent:
             self.on("compaction", tracer.on_compaction)
             self.on("permission", tracer.on_permission)
 
+        self._setup_runtime_facade()
+
+        self._emit_canonical_user_event(user_message)
         await self._emit("chat_start", {"message": user_message, "timestamp": time.time()})
 
         coro = self._chat_openai(user_message) if self.use_openai else self._chat_anthropic(user_message)
         self._current_task = asyncio.current_task()
+        primary_error: BaseException | None = None
+        canonical_failure: Exception | None = None
         try:
             await coro
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
+            primary_error = error
             self._aborted = True
-        except Exception as e:
-            await self._emit("chat_error", {"error": str(e)})
-            raise
+            self._runtime_exit_status = "cancelled"
+            self._runtime_exit_reason = "asyncio cancellation"
+        except Exception as error:
+            primary_error = error
+            try:
+                await self._emit("chat_error", {"error": str(error)})
+            except Exception as diagnostic_error:
+                canonical_failure = diagnostic_error
+            self._runtime_exit_status = "failed"
+            self._runtime_exit_reason = str(error)
         finally:
             self._current_task = None
+            if self._runtime_guard and not self._runtime_guard.is_terminal:
+                final_status = self._runtime_exit_status or (
+                    "aborted" if self._aborted else "completed"
+                )
+                try:
+                    self._runtime_guard.finalize(
+                        final_status,
+                        reason=self._runtime_exit_reason,
+                    )
+                except Exception as error:
+                    canonical_failure = canonical_failure or error
+                    self._runtime_exit_status = "failed"
+                    self._runtime_exit_reason = f"canonical terminal finalize failed: {error}"
+                    print(f"[runtime] terminal finalize failed: {error}", flush=True)
             # 取消观测订阅 + 写 trace
             if tracer:
                 for evt, cb in [
@@ -533,8 +890,48 @@ class Agent:
                     self.off(evt, cb)
                 try:
                     tracer.write_ask_summary()
-                except Exception:
-                    pass
+                except Exception as error:
+                    print(f"[tracer] flush failed: {error}", flush=True)
+            if self._logger:
+                try:
+                    self._logger.flush()
+                except Exception as error:
+                    # Never replace the original model/tool exception with a
+                    # diagnostic sink failure.
+                    print(f"[logger] flush failed: {error}", flush=True)
+                finally:
+                    self._logger.close()
+            if self._runtime_emitter:
+                try:
+                    self._runtime_emitter.flush()
+                except Exception as error:
+                    canonical_failure = canonical_failure or error
+                    self._runtime_exit_status = "failed"
+                    self._runtime_exit_reason = f"canonical flush failed: {error}"
+                    print(f"[runtime] flush failed: {error}", flush=True)
+                finally:
+                    if self._runtime_store_owned:
+                        try:
+                            self._runtime_emitter.close()
+                        except Exception as error:
+                            canonical_failure = canonical_failure or error
+                            self._runtime_exit_status = "failed"
+                            self._runtime_exit_reason = f"canonical close failed: {error}"
+                            print(f"[runtime] close failed: {error}", flush=True)
+                        self._runtime_emitter = None
+                        self._runtime_store = None
+                        self._runtime_store_owned = False
+
+        if canonical_failure is not None:
+            diagnostic = CanonicalFinalizationError(
+                f"canonical finalization failed: {canonical_failure}"
+            )
+            if primary_error is not None:
+                primary_error.add_note(str(diagnostic))
+            else:
+                raise diagnostic from canonical_failure
+        if primary_error is not None and not isinstance(primary_error, asyncio.CancelledError):
+            raise primary_error
 
         if not self.is_sub_agent:
             print_divider()
@@ -604,22 +1001,133 @@ class Agent:
     # --resume 启动时恢复消息历史。
 
     def restore_session(self, data: dict) -> None:
+        meta = data.get("metadata")
+        if meta and meta.get("id"):
+            # Canonical and legacy restores must continue writing events into
+            # the same session namespace on the next ask.
+            self.session_id = meta["id"]
+            restored_ask_count = meta.get("askCount")
+            if restored_ask_count is None:
+                # Canonical v2 snapshots use coverage.turnIds instead of the
+                # legacy askCount field.  Recover the largest completed turn
+                # so the next chat gets a fresh run identity.
+                turn_numbers = []
+                coverage = data.get("coverage") or {}
+                for turn_id in coverage.get("turnIds") or []:
+                    try:
+                        turn_numbers.append(int(str(turn_id).rsplit("-", 1)[-1]))
+                    except (TypeError, ValueError):
+                        continue
+                restored_ask_count = max(turn_numbers, default=len(data.get("runs") or []))
+            self._ask_count = int(restored_ask_count or 0)
+            # A restored session may contain a sealed terminal run.  Resume
+            # the session namespace, but always allocate a fresh run for the
+            # next turn instead of reusing that sealed run identity.
+            self._runtime_run_id = None
+        if data.get("source") == "canonical" or data.get("metadata", {}).get("source") == "canonical":
+            self.restore_canonical_context(data.get("canonicalMessages", []))
+            return
         if data.get("anthropicMessages"):
             self._anthropic_messages = data["anthropicMessages"]
         if data.get("openaiMessages"):
             self._openai_messages = data["openaiMessages"]
-        # Update session_id so _auto_save writes back to the same session file
-        meta = data.get("metadata")
-        if meta and meta.get("id"):
-            self.session_id = meta["id"]
-            self._ask_count = meta.get("askCount", 0)
         print_info(f"Session restored ({self._get_message_count()} messages).")
+
+    def restore_canonical_context(self, messages: list[dict[str, Any]]) -> None:
+        """Restore provider context from a canonical model projection only."""
+
+        if self.use_openai:
+            self._openai_messages = [{"role": "system", "content": self._system_prompt}]
+            for message in messages:
+                item = dict(message)
+                item.pop("runtime_event_id", None)
+                self._openai_messages.append(item)
+        else:
+            self._anthropic_messages = []
+            for message in messages:
+                role = message.get("role")
+                if role == "assistant" and message.get("tool_calls"):
+                    blocks = [
+                        {
+                            "type": "tool_use",
+                            "id": call.get("id"),
+                            "name": call.get("name"),
+                            "input": call.get("arguments", {}),
+                        }
+                        for call in message["tool_calls"]
+                    ]
+                    self._anthropic_messages.append({"role": "assistant", "content": blocks})
+                elif role in {"user", "assistant"}:
+                    self._anthropic_messages.append(
+                        {"role": role, "content": message.get("content", "")}
+                    )
+                elif role == "tool":
+                    self._anthropic_messages.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": message.get("tool_call_id"),
+                                    "content": message.get("content", ""),
+                                }
+                            ],
+                        }
+                    )
+        print_info(f"Canonical context restored ({self._get_message_count()} messages).")
+
+    def project_canonical_model_context(self, *, high_water: int | None = None):
+        """Build a read-only replay from the active canonical store."""
+
+        if self._runtime_store is None:
+            return None
+        result = ModelReplayProjection().build(self._runtime_store, high_water=high_water)
+        return result
+
+    def _refresh_provider_context_from_canonical(self):
+        """Rebuild the provider message array from the canonical event log.
+
+        A caller-owned event sink without a readable store is still supported
+        for lightweight observers and tests; in that case the provider array
+        remains the compatibility context assembled by the loop.  Once a
+        readable canonical store exists, stale provider arrays are never used
+        as the source of the next request.
+        """
+
+        if self._runtime_store is None or not hasattr(self._runtime_store, "read_event_records"):
+            return None
+        context = CanonicalModelContextAdapter().build(
+            self._runtime_store,
+            provider="openai" if self.use_openai else "anthropic",
+            system_prompt=self._system_prompt if self.use_openai else None,
+        )
+        messages = [dict(message) for message in context.messages]
+        if self.use_openai:
+            self._openai_messages = messages
+        else:
+            self._anthropic_messages = messages
+        return context
 
     def _get_message_count(self) -> int:
         return len(self._openai_messages) if self.use_openai else len(self._anthropic_messages)
 
     def _auto_save(self) -> None:
         try:
+            canonical_store = self._runtime_store
+            temporary_store = None
+            if canonical_store is None and self._runtime_emitter is None:
+                database = runtime_store_path(self.session_id)
+                if database.exists():
+                    temporary_store = SQLiteRuntimeStore(database)
+                    canonical_store = temporary_store
+            if canonical_store is not None:
+                snapshot = save_session_v2(self.session_id, canonical_store)
+                if snapshot is not None:
+                    if temporary_store is not None:
+                        temporary_store.close()
+                    return
+            if temporary_store is not None:
+                temporary_store.close()
             save_session(self.session_id, {
                 "metadata": {
                     "id": self.session_id,
@@ -646,15 +1154,131 @@ class Agent:
             await self._compact_conversation()
 
     async def _compact_conversation(self) -> None:
-        if self.use_openai:
-            await self._compact_openai()
+        summary_text = await (
+            self._compact_openai() if self.use_openai else self._compact_anthropic()
+        )
+        if summary_text is not None:
+            self._write_compaction_checkpoint(summary_text)
         else:
-            await self._compact_anthropic()
+            return
         print_info("Conversation compacted.")
 
-    async def _compact_anthropic(self) -> None:
+    def _compaction_context_messages(self) -> list[dict[str, Any]]:
+        """Convert the bounded post-compaction tail to provider-neutral data."""
+
+        source = self._openai_messages if self.use_openai else self._anthropic_messages
+        result: list[dict[str, Any]] = []
+        for message in source:
+            role = message.get("role")
+            if role == "system":
+                continue
+            if self.use_openai:
+                item = dict(message)
+                if role == "assistant" and item.get("tool_calls"):
+                    calls = []
+                    for call in item["tool_calls"]:
+                        function = call.get("function", call)
+                        arguments = function.get("arguments", {})
+                        if isinstance(arguments, str):
+                            try:
+                                arguments = json.loads(arguments)
+                            except json.JSONDecodeError:
+                                pass
+                        calls.append({
+                            "id": call.get("id"),
+                            "name": function.get("name"),
+                            "arguments": arguments,
+                        })
+                    item = {"role": "assistant", "tool_calls": calls}
+                elif role in {"user", "assistant", "tool"}:
+                    item = {key: value for key, value in item.items() if key in {
+                        "role", "content", "tool_call_id"
+                    }}
+                else:
+                    continue
+                result.append(item)
+                continue
+
+            content = message.get("content", "")
+            if role == "user" and isinstance(content, list):
+                text_blocks = [
+                    block.get("text", "")
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                ]
+                tool_blocks = [
+                    block
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "tool_result"
+                ]
+                if tool_blocks:
+                    for block in tool_blocks:
+                        result.append({
+                            "role": "tool",
+                            "tool_call_id": block.get("tool_use_id"),
+                            "content": block.get("content", ""),
+                        })
+                elif text_blocks:
+                    result.append({"role": "user", "content": "\n".join(text_blocks)})
+            elif role in {"user", "assistant"}:
+                result.append({"role": role, "content": content})
+        return result[-8:]
+
+    def _write_compaction_checkpoint(self, summary_text: str) -> CompactionCheckpoint | None:
+        """Persist a checkpoint and a reset marker after summarization succeeds."""
+
+        if self._runtime_store is None or self._runtime_context is None:
+            return None
+        bounded_summary = str(summary_text)[:8192]
+        context_messages = self._compaction_context_messages()
+        try:
+            high_water = self._runtime_store.current_high_water
+            checkpoint = CompactionCheckpointBuilder().build(
+                self._runtime_store,
+                high_water=high_water,
+                summary={
+                    "text": bounded_summary,
+                    "provider": "openai" if self.use_openai else "anthropic",
+                    "context_message_count": len(context_messages),
+                },
+            )
+            self._runtime_store.write_compaction_checkpoint(checkpoint)
+            if self._runtime_emitter is not None:
+                self._runtime_emitter.emit(
+                    RuntimeEvent.create(
+                        self._runtime_context,
+                        role="system",
+                        author="system",
+                        content={"kind": "invocation_opened"},
+                        actions={
+                            "compaction": {
+                                "checkpoint_id": checkpoint.checkpoint_id,
+                                "source_high_water": checkpoint.source_high_water,
+                                "source_digest": checkpoint.source_digest,
+                                "reset_model_context": True,
+                                "summary": bounded_summary,
+                                "context_messages": context_messages,
+                            }
+                        },
+                        refs={"checkpoint_id": checkpoint.checkpoint_id},
+                        ts=int(time.time() * 1000),
+                        metadata={
+                            "lifecycle": "compaction_checkpoint",
+                            "checkpoint_id": checkpoint.checkpoint_id,
+                        },
+                    )
+                )
+            return checkpoint
+        except Exception as error:
+            self._runtime_exit_status = "failed"
+            self._runtime_exit_reason = f"compaction checkpoint failed: {error}"
+            if isinstance(error, CompactionError):
+                raise
+            raise CompactionError(f"compaction checkpoint failed: {error}") from error
+
+    async def _compact_anthropic(self) -> str | None:
         if len(self._anthropic_messages) < 4:
-            return
+            return None
         last_user_msg = self._anthropic_messages[-1]
         summary_resp = await self._anthropic_client.messages.create(
             model=self.model,
@@ -673,10 +1297,11 @@ class Agent:
         if last_user_msg.get("role") == "user":
             self._anthropic_messages.append(last_user_msg)
         self.last_input_token_count = 0
+        return summary_text
 
-    async def _compact_openai(self) -> None:
+    async def _compact_openai(self) -> str | None:
         if len(self._openai_messages) < 5:
-            return
+            return None
         system_msg = self._openai_messages[0]
         last_user_msg = self._openai_messages[-1]
         summary_resp = await self._openai_client.chat.completions.create(
@@ -693,9 +1318,10 @@ class Agent:
             {"role": "user", "content": f"[Previous conversation summary]\n{summary_text}"},
             {"role": "assistant", "content": "Understood. I have the context from our previous conversation. How can I continue helping?"},
         ]
-        if last_user_msg.get("role") == "user":
+        if last_user_msg.get("role") in {"user", "tool"}:
             self._openai_messages.append(last_user_msg)
         self.last_input_token_count = 0
+        return summary_text
 
     # ─── 多层压缩管线 ────────────────────────────────────────
     # 每轮 API 调用前执行以下 3 层（Tier 1-3）：
@@ -837,22 +1463,31 @@ class Agent:
         THRESHOLD = 30 * 1024  # 30 KB
         if len(result.encode()) <= THRESHOLD:
             return result
-        d = Path.home() / ".mini-claude" / "tool-results"
-        d.mkdir(parents=True, exist_ok=True)
-        filename = f"{int(time.time() * 1000)}-{tool_name}.txt"
-        filepath = d / filename
-        filepath.write_text(result, encoding="utf-8")
-
-        lines = result.split("\n")
-        preview = "\n".join(lines[:200])
-        size_kb = len(result.encode()) / 1024
-
-        return (
-            f"[Result too large ({size_kb:.1f} KB, {len(lines)} lines). "
-            f"Full output saved to {filepath}. "
-            f"You can use read_file to see the full result.]\n\n"
-            f"Preview (first 200 lines):\n{preview}"
-        )
+        if self._artifact_archive is None:
+            return json.dumps({
+                "kind": "archive_error",
+                "error_type": "ArtifactArchiveUnavailable",
+                "message": "large tool result was not persisted",
+                "size_bytes": len(result.encode()),
+                "tool_name": tool_name,
+            }, ensure_ascii=False)
+        try:
+            archived = self._artifact_archive.archive(
+                result,
+                mime_type="text/plain",
+                encoding="utf-8",
+                scope="tool-result",
+                metadata={"tool_name": tool_name, "legacy_path": False},
+            )
+            return json.dumps(archived.placeholder(), ensure_ascii=False, sort_keys=True)
+        except Exception as error:
+            return json.dumps({
+                "kind": "archive_error",
+                "error_type": type(error).__name__,
+                "message": str(error),
+                "size_bytes": len(result.encode()),
+                "tool_name": tool_name,
+            }, ensure_ascii=False)
 
     # ─── 工具执行路由 ──────────────────────────────────────
     # 统一分发：plan_mode / agent / skill / MCP / 标准工具。
@@ -887,11 +1522,11 @@ class Agent:
                 else [t for t in self.tools if t["name"] != "agent"]
             )
             skill_name = inp.get("skill_name", "")
-            if self._logger:
-                self._logger.log_sub_agent(
-                    getattr(self, "_current_request_id", ""), skill_name,
-                    "skill-fork", (inp.get("args") or "")[:200],
-                )
+            self._record_sub_agent_event(
+                name=skill_name,
+                agent_type="skill-fork",
+                prompt=(inp.get("args") or ""),
+            )
             print_sub_agent_start("skill-fork", skill_name)
             sub_agent = Agent(
                 model=self.model,
@@ -902,6 +1537,16 @@ class Agent:
                 is_sub_agent=True,
                 permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
                 logger=AgentLogger(self.session_id, agent_id=f"main.skill_{skill_name}", parent_logger=self._logger) if self._logger else None,
+                runtime_store=self._runtime_store,
+                runtime_sink=self._runtime_sink,
+                runtime_parent_run_id=self._runtime_context.run_id if self._runtime_context else None,
+                runtime_run_id=f"run-{self.session_id}-skill-{skill_name}-{uuid.uuid4().hex[:8]}",
+                enable_legacy_shadow=self._enable_legacy_shadow,
+                artifact_archive=self._artifact_archive,
+                llm_capture_policy=self._llm_capture_policy,
+                runtime_authority=self._runtime_authority,
+                runtime_authority_approved=self._runtime_authority_approved,
+                runtime_rollback=self._runtime_rollback,
             )
             try:
                 sub_result = await sub_agent.run_once(inp.get("args") or "Execute this skill task.")
@@ -1044,11 +1689,11 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
         print_sub_agent_start(agent_type, description)
 
-        if self._logger:
-            self._logger.log_sub_agent(
-                getattr(self, "_current_request_id", ""), description,
-                agent_type, prompt[:200],
-            )
+        self._record_sub_agent_event(
+            name=description,
+            agent_type=agent_type,
+            prompt=prompt,
+        )
 
         config = get_sub_agent_config(agent_type)
         sub_agent = Agent(
@@ -1060,6 +1705,16 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             is_sub_agent=True,
             permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
             logger=AgentLogger(self.session_id, agent_id=f"main.{agent_type}_1", parent_logger=self._logger) if self._logger else None,
+            runtime_store=self._runtime_store,
+            runtime_sink=self._runtime_sink,
+            runtime_parent_run_id=self._runtime_context.run_id if self._runtime_context else None,
+            runtime_run_id=f"run-{self.session_id}-{agent_type}-{uuid.uuid4().hex[:8]}",
+            enable_legacy_shadow=self._enable_legacy_shadow,
+            artifact_archive=self._artifact_archive,
+            llm_capture_policy=self._llm_capture_policy,
+            runtime_authority=self._runtime_authority,
+            runtime_authority_approved=self._runtime_authority_approved,
+            runtime_rollback=self._runtime_rollback,
         )
 
         try:
@@ -1073,8 +1728,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             return f"Sub-agent error: {e}"
 
     # ─── Anthropic 后端 ─────────────────────────────────────
-    # 流式调用 Anthropic API + 并行工具执行（streaming tool execution）。
-    # 只读工具在 content_block_stop 事件时立即启动（streaming 早期执行）。
+    # 流式调用 Anthropic API；工具统一在完整 final boundary 后执行。
 
     async def _chat_anthropic(self, user_message: str) -> None:
         self._anthropic_messages.append({"role": "user", "content": user_message})
@@ -1092,6 +1746,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         while True:
             if self._aborted:
                 break
+
+            self._refresh_provider_context_from_canonical()
 
             _pre_size = self._msg_char_count()
             self._run_compression_pipeline()
@@ -1131,25 +1787,18 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             if not self.is_sub_agent:
                 start_spinner()
 
-            # ── 流式工具早期执行 ──────────────────────────────
-            # 流式输出的每个 tool_use 块完成时，如果是并发安全的只读工具
-            # 且权限检查自动通过，立即启动执行 — 模型仍在继续生成。
-            # 对应 Claude Code 的 content_block_stop 策略。
-            early_executions: dict[str, asyncio.Task] = {}
-
-            def _on_tool_block(block: dict):
-                if block["name"] in CONCURRENCY_SAFE_TOOLS:
-                    perm = check_permission(block["name"], block["input"], self.permission_mode, self._plan_file_path)
-                    if perm["action"] == "allow":
-                        task = asyncio.create_task(self._execute_tool_call(block["name"], block["input"]))
-                        early_executions[block["id"]] = task
-
             request_id = AgentLogger.generate_request_id()
             self._current_request_id = request_id
             api_start = time.time()
-            if self._logger:
-                self._logger.log_api_request(request_id, self.model)
-            response = await self._call_anthropic_stream(on_tool_block_complete=_on_tool_block)
+            self._start_runtime_model_call(request_id, "anthropic", {"messages": self._anthropic_messages})
+            try:
+                response = await self._call_anthropic_stream()
+            except Exception as error:
+                if self._runtime_recorder:
+                    self._runtime_recorder.error(error)
+                    if self._runtime_guard and self._runtime_recorder.events:
+                        self._runtime_guard.adopt_terminal_event(self._runtime_recorder.events[-1])
+                raise
 
             if not self.is_sub_agent:
                 stop_spinner()
@@ -1161,10 +1810,30 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
             tool_uses = [b for b in response.content if b.type == "tool_use"]
 
+            if self._runtime_recorder:
+                for block in response.content:
+                    if block.type == "text":
+                        self._runtime_recorder.final_text(block.text)
+                    elif block.type == "tool_use":
+                        self._runtime_recorder.final_tool_call(
+                            block.id, block.name, dict(block.input)
+                        )
+
             # ★ 发射 turn_end 事件
             cache_read = getattr(response.usage, "cache_read_input_tokens", 0) or 0
             cache_create = getattr(response.usage, "cache_creation_input_tokens", 0) or 0
             finish = "end_turn" if tool_uses else "stop"
+            if self._runtime_recorder:
+                self._runtime_recorder.finish(
+                    finish,
+                    usage={
+                        "input_tokens": response.usage.input_tokens,
+                        "output_tokens": response.usage.output_tokens,
+                        "cache_read_tokens": cache_read,
+                        "cache_create_tokens": cache_create,
+                    },
+                    latency_ms=int((time.time() - api_start) * 1000),
+                )
             await self._emit("turn_end", {
                 "turn_index": turn_index,
                 "input_tokens": response.usage.input_tokens,
@@ -1174,16 +1843,21 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 "finish_reason": finish,
             })
 
-            if self._logger:
+            if self._logger or self._llm_capture_manager:
                 latency_ms = int((time.time() - api_start) * 1000)
-                self._logger.log_api_response(
-                    request_id, latency_ms,
-                    response.usage.input_tokens, response.usage.output_tokens,
-                    cache_read, finish,
-                )
                 response_dict = {"content": [self._block_to_dict(b) for b in response.content]}
                 usage_dict = {"input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens}
-                self._logger.save_llm_content(request_id, self.model, self._anthropic_messages, response_dict, usage_dict)
+                self._capture_legacy_llm(
+                    request_id=request_id,
+                    messages=self._anthropic_messages,
+                    response=response_dict,
+                    usage=usage_dict,
+                    latency_ms=latency_ms,
+                    input_tokens=response.usage.input_tokens,
+                    output_tokens=response.usage.output_tokens,
+                    cache_read_tokens=cache_read,
+                    finish_reason=finish,
+                )
 
             message = {
                 "role": "assistant",
@@ -1201,10 +1875,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             budget = self._check_budget()
             if budget["exceeded"]:
                 print_info(f"Budget exceeded: {budget['reason']}")
+                self._record_budget_exceeded(budget["reason"])
                 break
 
-            # Process tools: early-started ones (from streaming) just await
-            # their result; others go through permission check + execution.
+            # Process complete tool calls only after the model final boundary.
             tool_results: list[dict] = []
             context_break = False
             for tu in tool_uses:
@@ -1213,49 +1887,36 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 inp = dict(tu.input) if hasattr(tu.input, 'items') else tu.input
                 print_tool_call(tu.name, inp)
 
-                # 该工具是否已在流式阶段提前启动？
-                early_task = early_executions.get(tu.id)
-                if early_task:
-                    t0 = time.time()
-                    await self._emit("tool_start", {"tool_name": tu.name, "tool_input": inp})
-                    raw = await early_task
-                    tool_duration = int((time.time() - t0) * 1000)
-                    res = self._persist_large_result(tu.name, raw)
-                    success = not (isinstance(raw, str) and raw.startswith("Error:"))
-                    await self._emit("tool_end", {
-                        "tool_name": tu.name,
-                        "tool_input": inp,
-                        "duration_ms": tool_duration,
-                        "result_length": len(raw.encode()) if raw else 0,
-                        "success": success,
-                    })
-                    if self._logger:
-                        self._logger.log_tool_call(request_id, tu.name, inp, tool_duration, success)
-                    print_tool_result(tu.name, res)
-                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
-                    continue
-
                 # 非提前启动工具的权限检查
                 perm = check_permission(tu.name, inp, self.permission_mode, self._plan_file_path)
                 if perm["action"] == "deny":
                     print_info(f"Denied: {perm.get('message', '')}")
-                    await self._emit("tool_deny", {"tool_name": tu.name, "reason": perm.get("message", "")})
-                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": f"Action denied: {perm.get('message', '')}"})
+                    raw, success, executed = await self._run_durable_tool(
+                        request_id=request_id, call_id=tu.id, name=tu.name, inp=inp,
+                        permission={"decision": "deny", "reason": perm.get("message", "")},
+                    )
+                    res = self._persist_large_result(tu.name, raw) if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+                    tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
                     continue
                 if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self._confirmed_paths:
                     confirmed = await self._confirm_dangerous(perm["message"])
-                    await self._emit("permission", {"message": perm["message"], "allowed": confirmed})
                     if not confirmed:
-                        tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": "User denied this action."})
+                        raw, success, executed = await self._run_durable_tool(
+                            request_id=request_id, call_id=tu.id, name=tu.name, inp=inp,
+                            permission={"decision": "deny", "reason": perm["message"]},
+                        )
+                        res = self._persist_large_result(tu.name, raw) if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+                        tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
                         continue
                     self._confirmed_paths.add(perm["message"])
 
                 t0 = time.time()
-                await self._emit("tool_start", {"tool_name": tu.name, "tool_input": inp})
-                raw = await self._execute_tool_call(tu.name, inp)
+                raw, success, executed = await self._run_durable_tool(
+                    request_id=request_id, call_id=tu.id, name=tu.name, inp=inp,
+                    permission={"decision": "allow", "reason": "permission granted"},
+                )
                 tool_duration = int((time.time() - t0) * 1000)
-                res = self._persist_large_result(tu.name, raw)
-                success = not (isinstance(raw, str) and raw.startswith("Error:"))
+                res = self._persist_large_result(tu.name, raw) if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
                 await self._emit("tool_end", {
                     "tool_name": tu.name,
                     "tool_input": inp,
@@ -1263,8 +1924,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     "result_length": len(raw.encode()) if raw else 0,
                     "success": success,
                 })
-                if self._logger:
-                    self._logger.log_tool_call(request_id, tu.name, inp, tool_duration, success)
                 print_tool_result(tu.name, res)
 
                 # Plan Mode 'clear-and-execute' 后：直接追加工具结果并跳出
@@ -1295,9 +1954,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         return {"type": block.type}
 
     async def _call_anthropic_stream(self, on_tool_block_complete=None):
-        """流式调用 Anthropic API。每个 tool_use 块完成时立即触发回调，
-        允许在完整响应到达之前提前执行工具（对应 Claude Code content_block_stop 策略）。
-        同时处理 thinking 块的过滤和文本/partial_json 的流式输出。"""
+        """流式解析 Anthropic 响应；只记录 partial，不提前执行工具。"""
         async def _do():
             create_params: dict[str, Any] = {
                 "model": self.model,
@@ -1344,6 +2001,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                                     self._emit("first_token", {"is_thinking": False})
                                 )
                             self._emit_text(delta.text)
+                            if self._runtime_recorder:
+                                self._runtime_recorder.partial_text(delta.text)
                         elif hasattr(delta, 'thinking'):
                             if first_thinking:
                                 stop_spinner()
@@ -1354,23 +2013,23 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                                     self._emit("first_token", {"is_thinking": True})
                                 )
                             self._emit_text(delta.thinking)
+                            if self._runtime_recorder:
+                                self._runtime_recorder.partial_text(delta.thinking)
                         elif hasattr(delta, 'partial_json'):
                             tb = tool_blocks_by_index.get(event.index)
                             if tb:
                                 tb["input_json"] += delta.partial_json
+                                if self._runtime_recorder:
+                                    self._runtime_recorder.partial_tool_arguments(
+                                        tb["id"], tb["name"], delta.partial_json
+                                    )
 
                     elif event.type == "content_block_stop":
-                        tb = tool_blocks_by_index.pop(event.index, None)
-                        if tb and on_tool_block_complete:
-                            import json as _json
-                            try:
-                                parsed = _json.loads(tb["input_json"] or "{}")
-                            except Exception:
-                                parsed = {}
-                            on_tool_block_complete({
-                                "type": "tool_use", "id": tb["id"],
-                                "name": tb["name"], "input": parsed,
-                            })
+                        # The final response is the only executable boundary.
+                        # Do not invoke a tool from content_block_stop: the
+                        # caller still needs to validate and durably dispatch
+                        # the complete function call below.
+                        tool_blocks_by_index.pop(event.index, None)
 
                 final_message = await stream.get_final_message()
 
@@ -1380,7 +2039,11 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 final_message.content = [b for b in final_message.content if b.type != "thinking"]
             return final_message
 
-        return await _with_retry(_do)
+        def _record_retry(attempt: int, error: Exception) -> None:
+            if self._runtime_recorder:
+                self._runtime_recorder.retry(attempt=attempt, reason=str(error))
+
+        return await _with_retry(_do, on_retry=_record_retry)
 
     # ─── OpenAI 兼容后端 ────────────────────────────────────
     # 流式调用 OpenAI API，与 Anthropic 后端功能等价。
@@ -1402,6 +2065,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         while True:
             if self._aborted:
                 break
+
+            self._refresh_provider_context_from_canonical()
 
             _pre_size = self._msg_char_count()
             self._run_compression_pipeline()
@@ -1439,16 +2104,22 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             request_id = AgentLogger.generate_request_id()
             self._current_request_id = request_id
             api_start = time.time()
-            if self._logger:
-                self._logger.log_api_request(request_id, self.model)
-            response = await self._call_openai_stream()
+            self._start_runtime_model_call(request_id, "openai", {"messages": self._openai_messages})
+            try:
+                response = await self._call_openai_stream()
+            except Exception as error:
+                if self._runtime_recorder:
+                    self._runtime_recorder.error(error)
+                    if self._runtime_guard and self._runtime_recorder.events:
+                        self._runtime_guard.adopt_terminal_event(self._runtime_recorder.events[-1])
+                raise
 
             if not self.is_sub_agent:
                 stop_spinner()
 
             self.last_api_call_time = time.time()
 
-            usage = response.get("usage", {})
+            usage = response.get("usage") or {}
             if usage:
                 self.total_input_tokens += usage["prompt_tokens"]
                 self.total_output_tokens += usage["completion_tokens"]
@@ -1461,12 +2132,33 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
             tool_calls = message.get("tool_calls")
 
+            if self._runtime_recorder:
+                if message.get("content"):
+                    self._runtime_recorder.final_text(message["content"])
+                for tool_call in tool_calls or []:
+                    function = tool_call.get("function", {})
+                    self._runtime_recorder.final_tool_call(
+                        tool_call.get("id", "unknown-call"),
+                        function.get("name", "unknown"),
+                        function.get("arguments", "{}"),
+                    )
+
             # ★ 发射 turn_end
             cache_read = 0
             pt_details = usage.get("prompt_tokens_details")
             if isinstance(pt_details, dict):
                 cache_read = pt_details.get("cached_tokens", 0)
             finish = "end_turn" if tool_calls else "stop"
+            if self._runtime_recorder:
+                self._runtime_recorder.finish(
+                    finish,
+                    usage={
+                        "input_tokens": usage.get("prompt_tokens"),
+                        "output_tokens": usage.get("completion_tokens"),
+                        "cache_read_tokens": cache_read,
+                    },
+                    latency_ms=int((time.time() - api_start) * 1000),
+                )
             await self._emit("turn_end", {
                 "turn_index": turn_index,
                 "input_tokens": usage.get("prompt_tokens", 0),
@@ -1475,17 +2167,21 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 "cache_create_tokens": 0,  # OpenAI 不单独报告创建
                 "finish_reason": finish,
             })
-            if self._logger:
-                latency_ms = int((time.time() - api_start) * 1000)
-                self._logger.log_api_response(
-                    request_id, latency_ms,
-                    usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0),
-                    cache_read, finish,
+            if self._logger or self._llm_capture_manager:
+                self._capture_legacy_llm(
+                    request_id=request_id,
+                    messages=self._openai_messages.copy(),
+                    response={"choices": [{"message": message}]},
+                    usage={
+                        "input_tokens": usage.get("prompt_tokens"),
+                        "output_tokens": usage.get("completion_tokens"),
+                    },
+                    latency_ms=int((time.time() - api_start) * 1000),
+                    input_tokens=usage.get("prompt_tokens"),
+                    output_tokens=usage.get("completion_tokens"),
+                    cache_read_tokens=cache_read,
+                    finish_reason=finish,
                 )
-                messages_for_llm = self._openai_messages.copy()
-                response_for_llm = {"choices": [{"message": message}]}
-                usage_for_llm = {"input_tokens": usage.get("prompt_tokens", 0), "output_tokens": usage.get("completion_tokens", 0)}
-                self._logger.save_llm_content(request_id, self.model, messages_for_llm, response_for_llm, usage_for_llm)
             if not tool_calls:
                 if not self.is_sub_agent:
                     print_cost(self.total_input_tokens, self.total_output_tokens)
@@ -1495,6 +2191,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             budget = self._check_budget()
             if budget["exceeded"]:
                 print_info(f"Budget exceeded: {budget['reason']}")
+                self._record_budget_exceeded(budget["reason"])
                 break
 
             # Phase 1: 解析 & 权限检查（串行 — 因为权限确认需要用户交互）
@@ -1505,8 +2202,9 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 if tc.get("type") != "function":
                     continue
                 fn_name = tc["function"]["name"]
+                raw_arguments = tc["function"].get("arguments", "")
                 try:
-                    inp = json.loads(tc["function"]["arguments"])
+                    inp = json.loads(raw_arguments)
                 except Exception:
                     inp = {}
 
@@ -1515,17 +2213,24 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 perm = check_permission(fn_name, inp, self.permission_mode, self._plan_file_path)
                 if perm["action"] == "deny":
                     print_info(f"Denied: {perm.get('message', '')}")
-                    await self._emit("tool_deny", {"tool_name": fn_name, "reason": perm.get("message", "")})
-                    oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": f"Action denied: {perm.get('message', '')}"})
+                    oai_checked.append({
+                        "tc": tc, "fn": fn_name, "inp": inp, "allowed": False,
+                        "arguments_raw": raw_arguments, "decision": "deny", "reason": perm.get("message", ""),
+                    })
                     continue
                 if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self._confirmed_paths:
                     confirmed = await self._confirm_dangerous(perm["message"])
-                    await self._emit("permission", {"message": perm["message"], "allowed": confirmed})
                     if not confirmed:
-                        oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": False, "result": "User denied this action."})
+                        oai_checked.append({
+                            "tc": tc, "fn": fn_name, "inp": inp, "allowed": False,
+                            "arguments_raw": raw_arguments, "decision": "deny", "reason": perm["message"],
+                        })
                         continue
                     self._confirmed_paths.add(perm["message"])
-                oai_checked.append({"tc": tc, "fn": fn_name, "inp": inp, "allowed": True})
+                oai_checked.append({
+                    "tc": tc, "fn": fn_name, "inp": inp, "allowed": True,
+                    "arguments_raw": raw_arguments, "decision": "allow", "reason": "permission granted",
+                })
 
             # Phase 2: 分组 & 执行（连续的并发安全工具分组后 asyncio.gather 并行执行）
             oai_batches: list[dict] = []
@@ -1542,13 +2247,16 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     break
 
                 if batch["concurrent"]:
-                    for ct in batch["items"]:
-                        await self._emit("tool_start", {"tool_name": ct["fn"], "tool_input": ct["inp"]})
-
                     async def _run_oai_safe(ct_item: dict) -> tuple[dict, str, bool]:
-                        raw = await self._execute_tool_call(ct_item["fn"], ct_item["inp"])
-                        res = self._persist_large_result(ct_item["fn"], raw)
-                        success = not (isinstance(raw, str) and raw.startswith("Error:"))
+                        raw, success, executed = await self._run_durable_tool(
+                            request_id=request_id,
+                            call_id=ct_item["tc"].get("id", f"tool-{ct_item['fn']}"),
+                            name=ct_item["fn"],
+                            inp=ct_item["inp"],
+                            arguments=ct_item.get("arguments_raw"),
+                            permission={"decision": "allow", "reason": ct_item.get("reason", "")},
+                        )
+                        res = self._persist_large_result(ct_item["fn"], raw) if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
                         return ct_item, res, success
 
                     t0_batch = time.time()
@@ -1562,22 +2270,34 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                             "result_length": len(res.encode()) if res else 0,
                             "success": success,
                         })
-                        if self._logger:
-                            self._logger.log_tool_call(request_id, ct_item["fn"], ct_item["inp"], tool_duration, success)
                         print_tool_result(ct_item["fn"], res)
                         self._openai_messages.append({"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
                 else:
                     for ct in batch["items"]:
                         if not ct["allowed"]:
-                            self._openai_messages.append({"role": "tool", "tool_call_id": ct["tc"]["id"], "content": ct["result"]})
+                            raw, success, executed = await self._run_durable_tool(
+                                request_id=request_id,
+                                call_id=ct["tc"].get("id", f"tool-{ct['fn']}"),
+                                name=ct["fn"],
+                                inp=ct["inp"],
+                                arguments=ct.get("arguments_raw"),
+                                permission={"decision": ct.get("decision", "deny"), "reason": ct.get("reason", "")},
+                            )
+                            res = self._persist_large_result(ct["fn"], raw) if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+                            self._openai_messages.append({"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res})
                             continue
                         t0 = time.time()
-                        await self._emit("tool_start", {"tool_name": ct["fn"], "tool_input": ct["inp"]})
-                        raw = await self._execute_tool_call(ct["fn"], ct["inp"])
+                        raw, success, executed = await self._run_durable_tool(
+                            request_id=request_id,
+                            call_id=ct["tc"].get("id", f"tool-{ct['fn']}"),
+                            name=ct["fn"],
+                            inp=ct["inp"],
+                            arguments=ct.get("arguments_raw"),
+                            permission={"decision": "allow", "reason": ct.get("reason", "")},
+                        )
                         tool_duration = int((time.time() - t0) * 1000)
-                        res = self._persist_large_result(ct["fn"], raw)
+                        res = self._persist_large_result(ct["fn"], raw) if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
                         print_tool_result(ct["fn"], res)
-                        success = not (isinstance(raw, str) and raw.startswith("Error:"))
                         await self._emit("tool_end", {
                             "tool_name": ct["fn"],
                             "tool_input": ct["inp"],
@@ -1585,9 +2305,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                             "result_length": len(raw.encode()) if raw else 0,
                             "success": success,
                         })
-                        if self._logger:
-                            self._logger.log_tool_call(request_id, ct["fn"], ct["inp"], tool_duration, success)
-
                         if self._context_cleared:
                             self._context_cleared = False
                             self._openai_messages.append({"role": "user", "content": res})
@@ -1649,6 +2366,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                             self._emit("first_token", {"is_thinking": True})
                         )
                     self._emit_text(rc)
+                    if self._runtime_recorder:
+                        self._runtime_recorder.partial_text(rc)
                     reasoning_content += rc
 
                 if delta and delta.content:
@@ -1660,6 +2379,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                             self._emit("first_token", {"is_thinking": False})
                         )
                     self._emit_text(delta.content)
+                    if self._runtime_recorder:
+                        self._runtime_recorder.partial_text(delta.content)
                     content += delta.content
 
                 if delta and delta.tool_calls:
@@ -1668,12 +2389,24 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         if existing:
                             if tc.function and tc.function.arguments:
                                 existing["arguments"] += tc.function.arguments
+                                if self._runtime_recorder:
+                                    self._runtime_recorder.partial_tool_arguments(
+                                        existing["id"] or "unknown-call",
+                                        existing["name"] or "unknown",
+                                        tc.function.arguments,
+                                    )
                         else:
                             tool_calls[tc.index] = {
                                 "id": tc.id or "",
                                 "name": (tc.function.name if tc.function else "") or "",
                                 "arguments": (tc.function.arguments if tc.function else "") or "",
                             }
+                            if self._runtime_recorder and tc.function and tc.function.arguments:
+                                self._runtime_recorder.partial_tool_arguments(
+                                    tc.id or "unknown-call",
+                                    (tc.function.name or "unknown"),
+                                    tc.function.arguments,
+                                )
 
                 if chunk.choices[0].finish_reason:
                     finish_reason = chunk.choices[0].finish_reason
@@ -1706,10 +2439,14 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     "message": message,
                     "finish_reason": finish_reason or "stop",
                 }],
-                "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0},
+                "usage": usage,
             }
 
-        return await _with_retry(_do)
+        def _record_retry(attempt: int, error: Exception) -> None:
+            if self._runtime_recorder:
+                self._runtime_recorder.retry(attempt=attempt, reason=str(error))
+
+        return await _with_retry(_do, on_retry=_record_retry)
 
     # ─── 共享方法 ────────────────────────────────────────────
 
