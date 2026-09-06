@@ -42,11 +42,32 @@ class ProjectionDiagnostic:
         return result
 
 
-def iter_event_records(source: Any, *, high_water: int | None = None) -> list[EventRecord]:
+def effective_context_id(event: RuntimeEvent) -> str:
+    """Map pre-context-schema events into the session root context."""
+
+    return event.context_id or f"context:{event.session_id}"
+
+
+def iter_event_records(
+    source: Any,
+    *,
+    high_water: int | None = None,
+    context_id: str | None = None,
+) -> list[EventRecord]:
     """Normalize a store, prefix, or iterable into an ordinal-aware snapshot."""
 
     if hasattr(source, "read_event_records"):
-        pairs = source.read_event_records(high_water=high_water)
+        try:
+            pairs = source.read_event_records(
+                high_water=high_water, context_id=context_id
+            )
+        except TypeError:
+            if context_id is not None:
+                raise
+            # Caller-owned test/replay stores may still expose the original
+            # read signature.  The absence of a context filter is safe to
+            # preserve across that boundary.
+            pairs = source.read_event_records(high_water=high_water)
         return [EventRecord(ordinal, event) for ordinal, event in pairs]
     if hasattr(source, "events") and not isinstance(source, (list, tuple)):
         inherited = getattr(source, "high_water", None)
@@ -62,7 +83,10 @@ def iter_event_records(source: Any, *, high_water: int | None = None) -> list[Ev
             record = EventRecord(index, item)
         if not isinstance(record.event, RuntimeEvent):
             record = EventRecord(record.ordinal, RuntimeEvent.from_dict(record.event))
-        if high_water is None or record.ordinal <= high_water:
+        if (
+            (high_water is None or record.ordinal <= high_water)
+            and (context_id is None or effective_context_id(record.event) == context_id)
+        ):
             records.append(record)
     return records
 

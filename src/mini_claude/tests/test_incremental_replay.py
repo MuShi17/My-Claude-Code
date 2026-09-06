@@ -220,6 +220,81 @@ def test_warm_cursor_restarts_effective_prefix_at_full_compaction():
     assert cursor.result().context_epoch == "context:checkpoint-1"
 
 
+def test_full_compaction_preserves_retained_source_ids_for_later_replacement():
+    events = _events()
+    before = ModelReplayProjection().build(events)
+    retained = [dict(message) for message in before.messages[-2:]]
+    retained_response_id = retained[-1]["runtime_event_id"]
+    context_messages = [
+        {"role": "user", "content": "summary"},
+        {"role": "assistant", "content": "continue"},
+        *retained,
+    ]
+    compaction_transition = build_context_transition(
+        source_high_water=len(events),
+        source_digest=before.source_digest,
+        projection_version=before.projection_version,
+        policy_version="compression-policy-v1",
+        context_epoch="context:checkpoint-source-preserving",
+        reason="full_compaction",
+        replacements=[],
+        effective_context=context_messages,
+    )
+    compaction_event = RuntimeEvent.create(
+        RunContext(
+            session_id=events[0].session_id,
+            turn_id=events[0].turn_id,
+            run_id=events[0].run_id,
+            invocation_id="compaction-source-preserving",
+        ),
+        role="system",
+        author="system",
+        actions={
+            "context_transition": compaction_transition.to_dict(),
+            "compaction": {
+                "reset_model_context": True,
+                "context_messages": context_messages,
+                "context_epoch": "context:checkpoint-source-preserving",
+            },
+        },
+        metadata={"lifecycle": "compaction_checkpoint"},
+    )
+    after_compaction = [*events, compaction_event]
+    compacted = ModelReplayProjection().build(after_compaction)
+    assert compacted.messages[-1]["runtime_event_id"] == retained_response_id
+
+    replacement = ContextReplacement(
+        target_event_id=retained_response_id,
+        target_call_id=retained[-1]["tool_call_id"],
+        replacement="later bounded result",
+        reason="microcompact",
+    )
+    lightweight = build_context_transition(
+        source_high_water=len(after_compaction),
+        source_digest=ModelReplayProjection().build(after_compaction).source_digest,
+        projection_version=compacted.projection_version,
+        policy_version="compression-policy-v1",
+        context_epoch=compacted.context_epoch,
+        reason="lightweight_compression",
+        replacements=[replacement],
+        effective_context={"replacements": [replacement.to_dict()]},
+    )
+    lightweight_event = RuntimeEvent.create(
+        RunContext(
+            session_id=events[0].session_id,
+            turn_id=events[0].turn_id,
+            run_id=events[0].run_id,
+            invocation_id="lightweight-source-preserving",
+        ),
+        role="system",
+        author="system",
+        actions={"context_transition": lightweight.to_dict()},
+        metadata={"lifecycle": "context_transition"},
+    )
+    final = ModelReplayProjection().build([*after_compaction, lightweight_event])
+    assert final.messages[-1]["content"] == "later bounded result"
+
+
 class _CountingStore(SQLiteRuntimeStore):
     def __init__(self, path: Path):
         super().__init__(path)
@@ -265,10 +340,11 @@ def test_agent_warm_refresh_reads_only_the_new_suffix(tmp_path: Path):
         assert agent.replay_diagnostics()["events_read_last_refresh"] == 0
 
         suffix_context = RunContext(
-            session_id="suffix-session",
+            session_id=agent.session_id,
             turn_id="suffix-turn",
             run_id="suffix-run",
             invocation_id="suffix-invocation",
+            context_id=agent._runtime_context.context_id,
         )
         opening = RuntimeEvent.create(
             suffix_context,

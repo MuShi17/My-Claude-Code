@@ -189,6 +189,8 @@ class RuntimeEvent:
     schema_version: int = SCHEMA_VERSION
     branch: str | None = None
     parent_run_id: str | None = None
+    context_id: str | None = None
+    parent_context_id: str | None = None
     origin: str | None = None
     model_visibility: str | None = None
     status: str | None = None
@@ -200,6 +202,14 @@ class RuntimeEvent:
     def __post_init__(self) -> None:
         for field in ("id", "invocation_id", "run_id", "session_id", "turn_id"):
             object.__setattr__(self, field, _identifier(getattr(self, field), field))
+        for field in ("context_id", "parent_context_id"):
+            value = getattr(self, field)
+            if value is not None:
+                object.__setattr__(self, field, _identifier(value, field))
+        if self.parent_context_id == self.context_id and self.context_id is not None:
+            raise RuntimeEventValidationError(
+                "parent_context_id cannot equal context_id", field="parent_context_id"
+            )
         object.__setattr__(self, "ts", _timestamp_ms(self.ts))
         for name in ("content", "actions", "refs", "metadata"):
             value = getattr(self, name)
@@ -218,7 +228,7 @@ class RuntimeEvent:
             "turn_id", "ts", "partial", "role", "author",
         }
         optional = {
-            "branch", "parent_run_id", "origin", "model_visibility", "status",
+            "branch", "context_id", "parent_context_id", "parent_run_id", "origin", "model_visibility", "status",
             "content", "actions", "refs", "metadata",
         }
         missing = sorted(key for key in required if key not in value)
@@ -261,6 +271,8 @@ class RuntimeEvent:
             author=author,
             branch=context.branch,
             parent_run_id=context.parent_run_id,
+            context_id=context.context_id,
+            parent_context_id=context.parent_context_id,
             **payload,
         )
 
@@ -315,7 +327,7 @@ class RuntimeEvent:
             "role": self.role,
             "author": self.author,
         }
-        for name in ("branch", "parent_run_id", "origin", "model_visibility", "status"):
+        for name in ("branch", "context_id", "parent_context_id", "parent_run_id", "origin", "model_visibility", "status"):
             value = getattr(self, name)
             if value is not None:
                 result[name] = value

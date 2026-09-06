@@ -29,6 +29,7 @@ class ModelReplayResult:
     partial_count: int
     diagnostics: tuple[ProjectionDiagnostic, ...]
     context_epoch: str = "context:initial"
+    context_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -41,6 +42,7 @@ class ModelReplayResult:
             "partial_count": self.partial_count,
             "diagnostics": [item.to_dict() for item in self.diagnostics],
             "context_epoch": self.context_epoch,
+            "context_id": self.context_id,
         }
 
     def __getitem__(self, key: str) -> Any:
@@ -50,8 +52,16 @@ class ModelReplayResult:
 class ModelReplayProjection:
     projection_version = PROJECTION_VERSION
 
-    def project(self, source: Any, *, high_water: int | None = None) -> ModelReplayResult:
-        records = iter_event_records(source, high_water=high_water)
+    def project(
+        self,
+        source: Any,
+        *,
+        high_water: int | None = None,
+        context_id: str | None = None,
+    ) -> ModelReplayResult:
+        records = iter_event_records(
+            source, high_water=high_water, context_id=context_id
+        )
         reducer = RuntimeEventReducer(records)
         messages: list[dict[str, Any]] = []
         call_records = sorted(reducer.calls.items(), key=lambda item: item[1].ordinal)
@@ -76,8 +86,25 @@ class ModelReplayProjection:
                 continue
             transition_value = (event.actions or {}).get("context_transition")
             if isinstance(transition_value, Mapping):
+                transition_valid = True
                 try:
                     transition = ContextTransition.from_value(transition_value)
+                    if context_id is not None and transition.context_id not in {
+                        None, context_id
+                    }:
+                        raise ContextTransitionError(
+                            "transition context identity does not match projection"
+                        )
+                    is_reset = bool(
+                        isinstance((event.actions or {}).get("compaction"), Mapping)
+                        and (event.actions or {}).get("compaction", {}).get(
+                            "reset_model_context"
+                        )
+                    )
+                    if not is_reset and transition.context_epoch != context_epoch:
+                        raise ContextTransitionError(
+                            "non-reset transition cannot change context epoch"
+                        )
                     if transition.projection_version != self.projection_version:
                         raise ContextTransitionError(
                             "transition projection version is unsupported"
@@ -89,18 +116,21 @@ class ModelReplayProjection:
                         raise ContextTransitionError("transition source digest mismatch")
                     applied = 0
                     for replacement in transition.replacements:
-                        target = next(
-                            (
-                                message
-                                for message in messages
-                                if message.get("runtime_event_id") == replacement.target_event_id
-                            ),
-                            None,
-                        )
-                        if target is None:
+                        targets = [
+                            message
+                            for message in messages
+                            if message.get("runtime_event_id")
+                            == replacement.target_event_id
+                        ]
+                        if not targets:
                             raise ContextTransitionError(
                                 f"transition target not found: {replacement.target_event_id}"
                             )
+                        if len(targets) != 1:
+                            raise ContextTransitionError(
+                                f"transition target is ambiguous: {replacement.target_event_id}"
+                            )
+                        target = targets[0]
                         if (
                             replacement.target_call_id is not None
                             and target.get("tool_call_id") != replacement.target_call_id
@@ -121,6 +151,7 @@ class ModelReplayProjection:
                         raise ContextTransitionError("transition did not apply any replacement")
                     context_epoch = transition.context_epoch
                 except ContextTransitionError as error:
+                    transition_valid = False
                     reducer.diagnostics.append(
                         ProjectionDiagnostic(
                             "invalid_context_transition",
@@ -130,6 +161,10 @@ class ModelReplayProjection:
                             event.run_id,
                         )
                     )
+            if isinstance(transition_value, Mapping) and not transition_valid:
+                # A corrupt activation event must not clear the currently
+                # effective context before the caller can fail closed.
+                continue
             compaction = (event.actions or {}).get("compaction")
             if isinstance(compaction, Mapping) and compaction.get("reset_model_context"):
                 messages.clear()
@@ -141,7 +176,7 @@ class ModelReplayProjection:
                         "user", "assistant", "tool"
                     }:
                         item = dict(message)
-                        item["runtime_event_id"] = event.id
+                        item.setdefault("runtime_event_id", event.id)
                         messages.append(item)
                 continue
             content = event.content or {}
@@ -267,6 +302,7 @@ class ModelReplayProjection:
             partial_count=len(reducer.partial),
             diagnostics=tuple(reducer.diagnostics),
             context_epoch=context_epoch,
+            context_id=context_id,
         )
 
     build = project

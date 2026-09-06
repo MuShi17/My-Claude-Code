@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from .event_sink import EventSink, EventSinkError
+from .context_transition import ContextTransition, ContextTransitionError
 from .redaction import RedactionPolicy, bound_payload, redact_event_dict
 from .runtime_event import (
     SCHEMA_VERSION as RUNTIME_EVENT_SCHEMA_VERSION,
@@ -19,7 +20,7 @@ from .runtime_event import (
     canonical_json_bytes,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class RuntimeStoreError(RuntimeError):
@@ -248,6 +249,8 @@ class SQLiteRuntimeStore:
                     turn_id TEXT NOT NULL,
                     run_id TEXT NOT NULL,
                     invocation_id TEXT NOT NULL,
+                    context_id TEXT,
+                    parent_context_id TEXT,
                     parent_run_id TEXT,
                     ts INTEGER NOT NULL,
                     partial INTEGER NOT NULL,
@@ -264,6 +267,8 @@ class SQLiteRuntimeStore:
                     ON runtime_events(run_id, ordinal);
                 CREATE INDEX IF NOT EXISTS idx_runtime_events_invocation_ordinal
                     ON runtime_events(invocation_id, ordinal);
+                CREATE INDEX IF NOT EXISTS idx_runtime_events_context_ordinal
+                    ON runtime_events(context_id, ordinal);
 
                 CREATE TABLE IF NOT EXISTS runtime_session_event_ordinals (
                     session_id TEXT PRIMARY KEY,
@@ -389,6 +394,14 @@ class SQLiteRuntimeStore:
                         "UPDATE runtime_events SET event_seq = ? WHERE event_id = ?",
                         (counters[invocation_id], row["event_id"]),
                     )
+            if "context_id" not in columns:
+                connection.execute("ALTER TABLE runtime_events ADD COLUMN context_id TEXT")
+            if "parent_context_id" not in columns:
+                connection.execute("ALTER TABLE runtime_events ADD COLUMN parent_context_id TEXT")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_runtime_events_context_ordinal "
+                "ON runtime_events(context_id, ordinal)"
+            )
             run_columns = {
                 str(row["name"])
                 for row in connection.execute("PRAGMA table_info(runtime_run_state)").fetchall()
@@ -441,6 +454,8 @@ class SQLiteRuntimeStore:
             or event.session_id != row["session_id"]
             or event.run_id != row["run_id"]
             or event.invocation_id != row["invocation_id"]
+            or (row["context_id"] is not None and event.context_id != row["context_id"])
+            or (row["parent_context_id"] is not None and event.parent_context_id != row["parent_context_id"])
             or event.digest() != row["digest"]
         ):
             raise CorruptionError(f"digest mismatch for runtime_events event_id={row['event_id']}")
@@ -551,14 +566,15 @@ class SQLiteRuntimeStore:
             """
             INSERT INTO runtime_events(
                 event_id, ordinal, event_seq, schema_version, session_id, turn_id, run_id,
-                invocation_id, parent_run_id, ts, partial, terminal, digest,
+                invocation_id, context_id, parent_context_id, parent_run_id, ts, partial, terminal, digest,
                 event_json, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 canonical.id, ordinal, event_seq, canonical.schema_version,
                 canonical.session_id, canonical.turn_id, canonical.run_id,
-                canonical.invocation_id, canonical.parent_run_id, canonical.ts,
+                canonical.invocation_id, canonical.context_id, canonical.parent_context_id,
+                canonical.parent_run_id, canonical.ts,
                 int(canonical.partial), int(canonical.is_terminal), canonical.digest(),
                 canonical.canonical_bytes(), now,
             ),
@@ -800,6 +816,7 @@ class SQLiteRuntimeStore:
         turn_id: str | None = None,
         run_id: str | None = None,
         invocation_id: str | None = None,
+        context_id: str | None = None,
         upto_ordinal: int | None = None,
         high_water: int | None = None,
         after_ordinal: int | None = None,
@@ -810,6 +827,7 @@ class SQLiteRuntimeStore:
                 turn_id=turn_id,
                 run_id=run_id,
                 invocation_id=invocation_id,
+                context_id=context_id,
                 upto_ordinal=upto_ordinal,
                 high_water=high_water,
                 after_ordinal=after_ordinal,
@@ -926,6 +944,7 @@ class SQLiteRuntimeStore:
         turn_id: str | None = None,
         run_id: str | None = None,
         invocation_id: str | None = None,
+        context_id: str | None = None,
         upto_ordinal: int | None = None,
         high_water: int | None = None,
         after_ordinal: int | None = None,
@@ -951,6 +970,13 @@ class SQLiteRuntimeStore:
             if value is not None:
                 clauses.append(f"{field} = ?")
                 parameters.append(value)
+        if context_id is not None:
+            # Events written before context_id was introduced are assigned to
+            # their session root on read; child contexts never match NULL.
+            clauses.append(
+                "(context_id = ? OR (context_id IS NULL AND ? = 'context:' || session_id))"
+            )
+            parameters.extend((context_id, context_id))
         for bound in (upto_ordinal, high_water):
             if bound is not None:
                 clauses.append("ordinal <= ?")
@@ -1430,6 +1456,9 @@ class SQLiteRuntimeStore:
             compaction_version = str(value["compaction_version"])
             projection_version = str(value["projection_version"])
             coverage = dict(value["coverage"])
+            context_id = value.get("context_id")
+            if context_id is not None:
+                context_id = str(context_id)
             canonical = event if isinstance(event, RuntimeEvent) else RuntimeEvent.from_dict(event)
             canonical.validate()
         except (KeyError, TypeError, ValueError, RuntimeEventError) as error:
@@ -1442,9 +1471,17 @@ class SQLiteRuntimeStore:
             raise StoreValidationError("compaction coverage does not reach source high-water")
         if canonical_schema_version != RUNTIME_EVENT_SCHEMA_VERSION:
             raise StoreValidationError("compaction canonical schema version is unsupported")
+        if context_id is not None and canonical.context_id != context_id:
+            raise StoreValidationError("checkpoint and event context identities differ")
         transition = (canonical.actions or {}).get("context_transition")
         if not isinstance(transition, Mapping):
             raise StoreValidationError("activation event lacks context_transition action")
+        try:
+            parsed_transition = ContextTransition.from_value(transition)
+        except ContextTransitionError as error:
+            raise StoreValidationError(
+                f"invalid activation context_transition: {error}"
+            ) from error
         try:
             transition_high_water = int(transition.get("source_high_water", -1))
         except (TypeError, ValueError) as error:
@@ -1457,13 +1494,13 @@ class SQLiteRuntimeStore:
             or str(transition.get("projection_version", "")) != projection_version
         ):
             raise StoreValidationError("checkpoint and transition source metadata differ")
+        if context_id is not None and parsed_transition.context_id not in {
+            None, context_id
+        }:
+            raise StoreValidationError("checkpoint and transition context identities differ")
         compaction = (canonical.actions or {}).get("compaction")
         if isinstance(compaction, Mapping) and str(compaction.get("checkpoint_id")) != checkpoint_id:
             raise StoreValidationError("compaction action references a different checkpoint")
-        if source_high_water > self.current_high_water:
-            raise StoreValidationError("compaction source high-water is not readable")
-        if self.read_immutable_prefix(high_water=source_high_water).digest != source_digest:
-            raise StoreValidationError("compaction source digest does not match canonical prefix")
         encoded = canonical_json_bytes(value)
         coverage_encoded = canonical_json_bytes(coverage)
         self._ensure_open()
@@ -1473,6 +1510,27 @@ class SQLiteRuntimeStore:
         connection = self.connection
         try:
             connection.execute("BEGIN IMMEDIATE")
+            existing = self._existing_result(canonical)
+            if existing is not None:
+                connection.rollback()
+                return existing
+            current_high_water = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(ordinal), 0) FROM runtime_events"
+                ).fetchone()[0]
+            )
+            if current_high_water != source_high_water:
+                raise StoreValidationError(
+                    "compaction source changed before activation"
+                )
+            prefix = self.read_event_records(
+                high_water=source_high_water,
+                context_id=context_id,
+            )
+            if _events_digest([event for _, event in prefix]) != source_digest:
+                raise StoreValidationError(
+                    "compaction source digest does not match canonical prefix"
+                )
             connection.execute(
                 """
                 INSERT INTO runtime_compaction_checkpoints(
@@ -1517,6 +1575,96 @@ class SQLiteRuntimeStore:
             raise StoreIOError(
                 f"SQLite compaction transition failed: {error}"
             ) from error
+
+    def append_context_transition(
+        self,
+        event: RuntimeEvent | Mapping[str, Any],
+        *,
+        source_high_water: int,
+        source_digest: str,
+        context_id: str | None = None,
+    ) -> AppendResult:
+        """Compare-and-append a lightweight context transition atomically."""
+
+        try:
+            canonical = event if isinstance(event, RuntimeEvent) else RuntimeEvent.from_dict(event)
+            canonical.validate()
+        except (RuntimeEventError, TypeError, ValueError) as error:
+            raise StoreValidationError(f"invalid context transition: {error}") from error
+        if source_high_water < 0 or not isinstance(source_digest, str) or not source_digest.strip():
+            raise StoreValidationError("invalid context transition source identity")
+        transition = (canonical.actions or {}).get("context_transition")
+        if not isinstance(transition, Mapping):
+            raise StoreValidationError("context transition action is required")
+        try:
+            parsed_transition = ContextTransition.from_value(transition)
+        except ContextTransitionError as error:
+            raise StoreValidationError(f"invalid context transition: {error}") from error
+        try:
+            transition_high_water = int(transition.get("source_high_water", -1))
+        except (TypeError, ValueError) as error:
+            raise StoreValidationError("context transition source high-water is invalid") from error
+        if (
+            transition_high_water != source_high_water
+            or str(transition.get("source_digest", "")) != source_digest
+        ):
+            raise StoreValidationError("transition and source metadata differ")
+        transition_context_id = transition.get("context_id")
+        if context_id is not None and canonical.context_id != context_id:
+            raise StoreValidationError("transition event context identity differs")
+        context_id = context_id or canonical.context_id
+        if transition_context_id is not None and transition_context_id != context_id:
+            raise StoreValidationError("transition context identity differs")
+        if parsed_transition.context_id is not None and parsed_transition.context_id != context_id:
+            raise StoreValidationError("transition context identity differs")
+
+        self._ensure_open()
+        self._fault("store.append")
+        self._fault("store.corrupt_read")
+        connection = self.connection
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = self._existing_result(canonical)
+            if existing is not None:
+                connection.rollback()
+                return existing
+            current_high_water = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(ordinal), 0) FROM runtime_events"
+                ).fetchone()[0]
+            )
+            if current_high_water != source_high_water:
+                raise StoreValidationError("context transition source changed before activation")
+            prefix = self.read_event_records(
+                high_water=source_high_water,
+                context_id=context_id,
+            )
+            if _events_digest([item for _, item in prefix]) != source_digest:
+                raise StoreValidationError(
+                    "context transition source digest does not match canonical prefix"
+                )
+            result = self._append_in_transaction(canonical, connection)
+            self._fault("store.commit")
+            connection.commit()
+            return result
+        except (SealedRunError, IdempotencyConflictError, StoreFaultError, RuntimeStoreError):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise StoreIOError(f"SQLite context transition constraint failed: {error}") from error
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            if "commit" in str(error).lower():
+                raise StoreCommitError(str(error)) from error
+            self._raise_sqlite(error, operation="context transition")
+        except Exception as error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise StoreIOError(f"SQLite context transition failed: {error}") from error
 
     def read_compaction_checkpoint(self, checkpoint_id: str) -> dict[str, Any] | None:
         self._ensure_open()

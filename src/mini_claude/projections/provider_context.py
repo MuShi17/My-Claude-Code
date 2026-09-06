@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
 from .model_replay_projection import ModelReplayProjection, ModelReplayResult
 from ..provider_content import materialize_tool_result
+from ..runtime_event import canonical_json_bytes
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +49,43 @@ def _tool_result_content(value: Any) -> str | list[Any]:
     """Materialize tool results with one deterministic Anthropic boundary."""
 
     return materialize_tool_result(value, provider="anthropic")
+
+
+def _openai_arguments(value: Any) -> str:
+    """Return the strict Chat Completions function.arguments string."""
+
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            # A malformed historical argument is still represented as valid
+            # JSON rather than leaking a mapping into the provider payload.
+            return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        return canonical_json_bytes(parsed).decode("utf-8")
+    return canonical_json_bytes(value).decode("utf-8")
+
+
+def _openai_tool_call(call: Any) -> dict[str, Any]:
+    call = call if isinstance(call, dict) else {}
+    return {
+        "id": call.get("id"),
+        "type": "function",
+        "function": {
+            "name": call.get("name"),
+            "arguments": _openai_arguments(call.get("arguments", {})),
+        },
+    }
+
+
+def _openai_user_content(value: Any) -> str | list[Any]:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list) and all(
+        isinstance(item, dict) and item.get("kind") == "text" and isinstance(item.get("text"), str)
+        for item in value
+    ):
+        return "\n".join(item["text"] for item in value)
+    return materialize_tool_result(value, provider="openai")
 
 
 def _anthropic_messages(messages: tuple[dict[str, Any], ...]) -> tuple[dict[str, Any], ...]:
@@ -173,13 +212,21 @@ def _openai_messages(
         if role != "assistant":
             flush_pending_assistant()
             if role == "tool":
-                message = {
-                    **message,
-                    "content": materialize_tool_result(
-                        message.get("content", ""), provider="openai"
-                    ),
-                }
-            output.append(message)
+                output.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": message.get("tool_call_id"),
+                        "content": materialize_tool_result(
+                            message.get("content", ""), provider="openai"
+                        ),
+                    }
+                )
+            elif role == "user":
+                output.append(
+                    {"role": "user", "content": _openai_user_content(message.get("content", ""))}
+                )
+            elif role == "system":
+                output.append({"role": "system", "content": str(message.get("content", ""))})
             continue
 
         visible_text: list[str] = []
@@ -205,9 +252,11 @@ def _openai_messages(
         if tool_calls:
             combined_reasoning = [*pending_reasoning, *reasoning_text]
             combined_text = [*pending_text, *visible_text]
-            projected = {**message}
-            if combined_text or combined_reasoning:
-                projected["content"] = "\n".join(combined_text)
+            projected: dict[str, Any] = {
+                "role": "assistant",
+                "content": "\n".join(combined_text) if combined_text else None,
+                "tool_calls": [_openai_tool_call(call) for call in tool_calls],
+            }
             if combined_reasoning:
                 projected["reasoning_content"] = "".join(combined_reasoning)
             output.append(projected)

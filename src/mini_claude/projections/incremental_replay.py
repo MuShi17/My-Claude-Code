@@ -18,6 +18,7 @@ from .base import (
     PROJECTION_VERSION,
     EventRecord,
     ProjectionDiagnostic,
+    effective_context_id,
     json_value,
     stable_digest,
 )
@@ -33,7 +34,8 @@ class IncrementalModelReplayCursor:
 
     projection_version = PROJECTION_VERSION
 
-    def __init__(self) -> None:
+    def __init__(self, *, context_id: str | None = None) -> None:
+        self.context_id = context_id
         self._records: list[EventRecord] = []
         self._record_ids: set[str] = set()
         self._digest = hashlib.sha256(b"[")
@@ -117,6 +119,7 @@ class IncrementalModelReplayCursor:
         pending = sorted(f"{run_id}:{call_id}" for run_id, call_id in self._pending_call_keys)
         return {
             "projection_version": self.projection_version,
+            "context_id": self.context_id,
             "source_high_water": self.high_water,
             "source_digest": self.source_digest,
             "prior_prefix_digest": self.source_digest,
@@ -141,10 +144,15 @@ class IncrementalModelReplayCursor:
             partial_count=self._partial_count,
             diagnostics=tuple(self._diagnostics_with_unmatched()),
             context_epoch=self._context_epoch,
+            context_id=self.context_id,
         )
 
     def _append_record(self, record: EventRecord) -> None:
         event = record.event
+        if self.context_id is not None and effective_context_id(event) != self.context_id:
+            raise IncrementalReplayError(
+                f"event context {event.context_id!r} does not match cursor {self.context_id!r}"
+            )
         source_digest_before = self.source_digest
         self._record_ids.add(event.id)
         if self._records:
@@ -257,13 +265,22 @@ class IncrementalModelReplayCursor:
         transition_value = actions.get("context_transition")
         if isinstance(transition_value, Mapping):
             self.last_append_had_transition = True
-            self._apply_transition(
+            transition_valid = self._apply_transition(
                 record, transition_value, source_digest_before=source_digest_before
             )
+            if not transition_valid:
+                return
 
         compaction = actions.get("compaction")
         if isinstance(compaction, Mapping) and compaction.get("reset_model_context"):
             self._messages.clear()
+            self._calls.clear()
+            self._responses.clear()
+            self._calls_by_group.clear()
+            self._response_events.clear()
+            self._response_event_ids.clear()
+            self._pending_call_keys.clear()
+            self._closed_call_groups.clear()
             self._call_group_indexes.clear()
             self._emitted_call_ids.clear()
             self._emitted_response_ids.clear()
@@ -274,7 +291,7 @@ class IncrementalModelReplayCursor:
                     "tool",
                 }:
                     item = dict(message)
-                    item["runtime_event_id"] = event.id
+                    item.setdefault("runtime_event_id", event.id)
                     self._messages.append(item)
             return
 
@@ -325,9 +342,24 @@ class IncrementalModelReplayCursor:
         value: Mapping[str, Any],
         *,
         source_digest_before: str,
-    ) -> None:
+    ) -> bool:
         try:
             transition = ContextTransition.from_value(value)
+            if self.context_id is not None and transition.context_id not in {
+                None, self.context_id
+            }:
+                raise ContextTransitionError(
+                    "transition context identity does not match cursor"
+                )
+            compaction = (record.event.actions or {}).get("compaction")
+            is_reset = bool(
+                isinstance(compaction, Mapping)
+                and compaction.get("reset_model_context")
+            )
+            if not is_reset and transition.context_epoch != self._context_epoch:
+                raise ContextTransitionError(
+                    "non-reset transition cannot change context epoch"
+                )
             if transition.projection_version != self.projection_version:
                 raise ContextTransitionError(
                     "transition projection version is unsupported"
@@ -340,18 +372,20 @@ class IncrementalModelReplayCursor:
                 raise ContextTransitionError("transition source digest mismatch")
             applied = 0
             for replacement in transition.replacements:
-                target = next(
-                    (
-                        message
-                        for message in self._messages
-                        if message.get("runtime_event_id") == replacement.target_event_id
-                    ),
-                    None,
-                )
-                if target is None:
+                targets = [
+                    message
+                    for message in self._messages
+                    if message.get("runtime_event_id") == replacement.target_event_id
+                ]
+                if not targets:
                     raise ContextTransitionError(
                         f"transition target not found: {replacement.target_event_id}"
                     )
+                if len(targets) != 1:
+                    raise ContextTransitionError(
+                        f"transition target is ambiguous: {replacement.target_event_id}"
+                    )
+                target = targets[0]
                 if (
                     replacement.target_call_id is not None
                     and target.get("tool_call_id") != replacement.target_call_id
@@ -368,7 +402,6 @@ class IncrementalModelReplayCursor:
             )
             if transition.replacements and transition.result_digest != expected:
                 raise ContextTransitionError("transition result digest mismatch")
-            compaction = (record.event.actions or {}).get("compaction")
             if (
                 not transition.replacements
                 and isinstance(compaction, Mapping)
@@ -378,6 +411,7 @@ class IncrementalModelReplayCursor:
             ):
                 raise ContextTransitionError("compaction result digest mismatch")
             self._context_epoch = transition.context_epoch
+            return True
         except ContextTransitionError as error:
             self._diagnostics.append(
                 ProjectionDiagnostic(
@@ -388,6 +422,7 @@ class IncrementalModelReplayCursor:
                     record.event.run_id,
                 )
             )
+            return False
 
     def _response_for(self, key: tuple[str, str]) -> EventRecord | None:
         call = self._calls.get(key)

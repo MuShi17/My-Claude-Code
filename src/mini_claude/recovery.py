@@ -248,6 +248,9 @@ class RecoveryProjection:
             if state is None or state.sealed:
                 continue
             event_id = "recovery-terminal:" + hashlib.sha256(item.run_id.encode()).hexdigest()[:24]
+            first_event = next(
+                iter(store.read_events(run_id=state.run_id)), None
+            )
             event = RuntimeEvent.create(
                 RunContext(
                     session_id=state.session_id,
@@ -255,6 +258,10 @@ class RecoveryProjection:
                     run_id=state.run_id,
                     invocation_id=state.invocation_id,
                     parent_run_id=state.parent_run_id,
+                    context_id=first_event.context_id if first_event else None,
+                    parent_context_id=(
+                        first_event.parent_context_id if first_event else None
+                    ),
                 ),
                 role="system",
                 author="system",

@@ -290,7 +290,7 @@ def test_openai_reasoning_is_canonical_and_replayable_with_tool_calls(
         )
         tool_step = next(message for message in context.messages if message.get("tool_calls"))
         assert tool_step["reasoning_content"] == "inspect the file"
-        assert tool_step["content"] == ""
+        assert tool_step["content"] is None
         assert any(
             message.get("role") == "tool"
             and message.get("tool_call_id") == "call-1"
@@ -513,7 +513,7 @@ def test_provider_context_adapter_preserves_tool_protocol_for_both_providers(tmp
     assert anthropic.messages[1]["content"][0]["type"] == "tool_use"
     assert openai.messages[0] == {"role": "system", "content": "system fixture"}
     assert openai.messages[1]["role"] == "assistant"
-    assert openai.messages[2]["tool_calls"][0]["name"] == "read_file"
+    assert openai.messages[2]["tool_calls"][0]["function"]["name"] == "read_file"
     assert openai.messages[3]["role"] == "tool"
     assert all("runtime_event_id" not in message for message in anthropic.messages)
 
@@ -570,6 +570,15 @@ def test_real_agent_compaction_writes_checkpoint_and_replays_compacted_context(
         agent._ask_count = 1
         agent._setup_runtime_facade()
         agent._emit_canonical_user_event("original user")
+        context = agent._runtime_context
+        assert context is not None
+        for role, author, content in (
+            ("user", "user", {"kind": "text", "text": "old user"}),
+            ("model", "agent", {"kind": "text", "text": "old answer"}),
+            ("model", "agent", {"kind": "function_call", "id": "call-1", "name": "read_file", "args": {}}),
+            ("tool", "tool", {"kind": "function_response", "id": "call-1", "name": "read_file", "result": "old result"}),
+        ):
+            store.append(RuntimeEvent.create(context, role=role, author=author, content=content))
         agent._openai_client = SimpleNamespace(
             chat=SimpleNamespace(completions=FakeCompletions())
         )
@@ -590,7 +599,7 @@ def test_real_agent_compaction_writes_checkpoint_and_replays_compacted_context(
         checkpoints = store.list_compaction_checkpoints()
         assert len(checkpoints) == 1
         checkpoint = checkpoints[0]
-        assert checkpoint["source_high_water"] == 3
+        assert checkpoint["source_high_water"] == 7
         assert checkpoint["summary"]["text"] == "bounded summary"
         checkpoint_object = CompactionCheckpointBuilder().build(
             store, high_water=checkpoint["source_high_water"],
@@ -628,6 +637,36 @@ def test_real_agent_compaction_writes_checkpoint_and_replays_compacted_context(
         assert persisted is not None
         replay = ModelReplayProjection().build(reopened)
         assert replay.messages[-1]["content"] == "later"
+
+
+def test_compaction_candidate_keeps_tool_call_and_result_in_one_group():
+    agent = Agent(
+        api_base="https://fake-provider.invalid/v1",
+        api_key="fixture-key",
+        is_sub_agent=True,
+    )
+    agent._openai_messages = [
+        {"role": "system", "content": agent._system_prompt},
+        {"role": "user", "content": "old user"},
+        {"role": "assistant", "content": "old answer"},
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call-group",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-group", "content": "result"},
+    ]
+
+    tail = agent._compaction_context_messages()
+    assert [message["role"] for message in tail] == ["assistant", "assistant", "tool"]
+    assert tail[-2]["tool_calls"][0]["id"] == "call-group"
+    assert tail[-1]["tool_call_id"] == "call-group"
+    assert agent._compaction_summary_messages() == [{"role": "user", "content": "old user"}]
 
 
 def test_compaction_checkpoint_failure_preserves_canonical_prefix_without_ref(

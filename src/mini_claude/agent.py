@@ -12,7 +12,6 @@ import json
 import os
 import time
 import uuid
-from collections import deque
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Callable, Awaitable
@@ -53,12 +52,17 @@ from .session import runtime_data_dir, runtime_store_path, save_session_v2
 from .prompt import build_system_prompt
 from .subagent import get_sub_agent_config
 from .mcp_client import McpManager
-from .event_ids import RunContext
+from .event_ids import IdentityFactory, RunContext
 from .event_sink import EventSink, RuntimeEventEmitter
 from .runtime_event import RuntimeEvent
 from .redaction import redact_payload
 from .runtime_lifecycle import DurableToolBoundary, ModelCallRecorder
-from .context_transition import ContextReplacement, build_context_transition
+from .context_transition import (
+    ContextReplacement,
+    ContextTransition,
+    build_context_transition,
+    validate_transition_candidate,
+)
 from .provider_content import (
     display_tool_result,
     materialize_tool_result,
@@ -68,7 +72,7 @@ from .runtime_store import SQLiteRuntimeStore
 from .run_lifecycle import RunStateGuard
 from .compaction import CompactionCheckpoint, CompactionCheckpointBuilder, CompactionError
 from .projections.base import EventRecord
-from .projections.model_replay_projection import ModelReplayProjection
+from .projections.model_replay_projection import ModelReplayProjection, ModelReplayResult
 from .projections.incremental_replay import IncrementalModelReplayCursor, IncrementalReplayError
 from .projections.provider_context import CanonicalModelContextAdapter
 from .artifact_archive import ArtifactArchive
@@ -368,6 +372,8 @@ class Agent:
         runtime_parent_run_id: str | None = None,
         runtime_run_id: str | None = None,
         runtime_session_id: str | None = None,
+        runtime_context_id: str | None = None,
+        runtime_parent_context_id: str | None = None,
         artifact_archive: ArtifactArchive | None = None,
         llm_capture_policy: LLMCapturePolicy | None = None,
     ):
@@ -390,6 +396,9 @@ class Agent:
         self._runtime_store_owned = False
         self._runtime_parent_run_id = runtime_parent_run_id
         self._runtime_run_id = runtime_run_id
+        self._runtime_context_id = runtime_context_id
+        self._runtime_parent_context_id = runtime_parent_context_id
+        self._identity_factory = IdentityFactory(prefix="agent")
         self._runtime_guard: RunStateGuard | None = None
         self._runtime_exit_status: str | None = None
         self._runtime_exit_reason: str | None = None
@@ -403,6 +412,8 @@ class Agent:
         # 有效上下文窗口 = 模型窗口 - 20K 留白（给 system prompt + output）
         self.effective_window = _get_context_window(model) - 20000
         self.session_id = runtime_session_id or uuid.uuid4().hex[:8]
+        if self._runtime_context_id is None:
+            self._runtime_context_id = f"context:{self.session_id}"
         self.session_start_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
         # Token 累计统计
@@ -412,6 +423,8 @@ class Agent:
         self.current_turns = 0
         self.last_api_call_time = 0.0
         self._context_epoch = "context:initial"
+        self._pending_compaction_tail: list[dict[str, Any]] | None = None
+        self._pending_compaction_summary_source: list[dict[str, Any]] | None = None
         self._replay_cursor: IncrementalModelReplayCursor | None = None
         self._replay_events_read = 0
         self._replay_refresh_count = 0
@@ -547,9 +560,11 @@ class Agent:
         self._runtime_context = RunContext(
             session_id=self.session_id,
             turn_id=f"turn-{self._ask_count:04d}",
-            run_id=self._runtime_run_id or f"run-{self.session_id}-{self._ask_count:04d}",
-            invocation_id=f"invocation-{self.session_id}-{self._ask_count:04d}",
+            run_id=self._runtime_run_id or self._identity_factory.run_id(),
+            invocation_id=self._identity_factory.invocation_id(),
             parent_run_id=self._runtime_parent_run_id,
+            context_id=self._runtime_context_id,
+            parent_context_id=self._runtime_parent_context_id,
         )
         self._runtime_guard = RunStateGuard(self._runtime_context, self._runtime_emitter)
         self._runtime_guard.start()
@@ -568,6 +583,8 @@ class Agent:
             invocation_id=request_id,
             parent_run_id=self._runtime_context.parent_run_id,
             branch=self._runtime_context.branch,
+            context_id=self._runtime_context.context_id,
+            parent_context_id=self._runtime_context.parent_context_id,
         )
         self._runtime_recorder = ModelCallRecorder(
             self._runtime_emitter,
@@ -708,8 +725,9 @@ class Agent:
         safe_content = dict(redacted_wrapper["content"])
         safe_text = str(safe_content["text"])
         content_digest = hashlib.sha256(safe_text.encode("utf-8")).hexdigest()
+        context_id = self._runtime_context.context_id
         idempotency_key = (
-            f"memory:{self._runtime_context.turn_id}:{content_digest}"
+            f"memory:{context_id}:{self._runtime_context.turn_id}:{content_digest}"
         )
         safe_content["content_digest"] = content_digest
         safe_content["idempotency_key"] = idempotency_key
@@ -1097,6 +1115,8 @@ class Agent:
             # the session namespace, but always allocate a fresh run for the
             # next turn instead of reusing that sealed run identity.
             self._runtime_run_id = None
+            if self._runtime_parent_context_id is None:
+                self._runtime_context_id = f"context:{self.session_id}"
         if data.get("source") != "canonical" and data.get("metadata", {}).get("source") != "canonical":
             raise ValueError("session snapshot is not canonical-derived")
         self.restore_canonical_context(data.get("canonicalMessages", []))
@@ -1149,7 +1169,11 @@ class Agent:
 
         if self._runtime_store is None:
             return None
-        result = ModelReplayProjection().build(self._runtime_store, high_water=high_water)
+        result = ModelReplayProjection().build(
+            self._runtime_store,
+            high_water=high_water,
+            context_id=self._runtime_context.context_id if self._runtime_context else self._runtime_context_id,
+        )
         return result
 
     def _refresh_provider_context_from_canonical(self):
@@ -1158,11 +1182,12 @@ class Agent:
         if self._runtime_store is None or not hasattr(self._runtime_store, "read_event_records"):
             raise RuntimeError("canonical runtime store is not initialized")
         started = time.perf_counter()
+        context_id = self._runtime_context.context_id if self._runtime_context else self._runtime_context_id
         cold = self._replay_cursor is None
         reason = "cold_start" if cold else "warm_suffix"
         if cold:
-            cursor = IncrementalModelReplayCursor()
-            pairs = self._runtime_store.read_event_records()
+            cursor = IncrementalModelReplayCursor(context_id=context_id)
+            pairs = self._runtime_store.read_event_records(context_id=context_id)
             cursor.append(
                 EventRecord(ordinal, event) for ordinal, event in pairs
             )
@@ -1172,21 +1197,22 @@ class Agent:
             if current_high_water < cursor.high_water:
                 cold = True
                 reason = "source_high_water_regressed"
-                cursor = IncrementalModelReplayCursor()
-                pairs = self._runtime_store.read_event_records()
+                cursor = IncrementalModelReplayCursor(context_id=context_id)
+                pairs = self._runtime_store.read_event_records(context_id=context_id)
                 cursor.append(
                     EventRecord(ordinal, event) for ordinal, event in pairs
                 )
             elif current_high_water > cursor.high_water:
                 try:
                     pairs = self._runtime_store.read_event_records(
-                        after_ordinal=cursor.high_water
+                        after_ordinal=cursor.high_water,
+                        context_id=context_id,
                     )
                 except TypeError:
                     # Keep compatibility with caller-owned test stores that
                     # expose the pre-incremental read signature.
                     reason = "warm_suffix_fallback_full_read"
-                    all_pairs = self._runtime_store.read_event_records()
+                    all_pairs = self._runtime_store.read_event_records(context_id=context_id)
                     pairs = [
                         (ordinal, event)
                         for ordinal, event in all_pairs
@@ -1199,8 +1225,8 @@ class Agent:
                 except IncrementalReplayError:
                     reason = "cursor_invalid"
                     cold = True
-                    cursor = IncrementalModelReplayCursor()
-                    pairs = self._runtime_store.read_event_records()
+                    cursor = IncrementalModelReplayCursor(context_id=context_id)
+                    pairs = self._runtime_store.read_event_records(context_id=context_id)
                     cursor.append(
                         EventRecord(ordinal, event) for ordinal, event in pairs
                     )
@@ -1219,8 +1245,8 @@ class Agent:
         # indexes cannot resurrect pre-transition messages.
         if not cold and cursor.last_append_had_transition:
             reason = "context_transition"
-            cursor = IncrementalModelReplayCursor()
-            all_pairs = self._runtime_store.read_event_records()
+            cursor = IncrementalModelReplayCursor(context_id=context_id)
+            all_pairs = self._runtime_store.read_event_records(context_id=context_id)
             cursor.append(
                 EventRecord(ordinal, event) for ordinal, event in all_pairs
             )
@@ -1298,13 +1324,70 @@ class Agent:
             self._compact_openai() if self.use_openai else self._compact_anthropic()
         )
         if summary_text is not None:
-            self._write_compaction_checkpoint(summary_text)
+            checkpoint = self._write_compaction_checkpoint(summary_text)
+            if checkpoint is not None and self._runtime_store is not None:
+                self._refresh_provider_context_from_canonical()
         else:
             return
         print_info("Conversation compacted.")
 
     def _compaction_context_messages(self) -> list[dict[str, Any]]:
-        """Convert the bounded post-compaction tail to provider-neutral data."""
+        """Return a complete, source-preserving neutral compaction tail."""
+
+        if self._pending_compaction_tail is not None:
+            return [dict(message) for message in self._pending_compaction_tail]
+
+        projection = self.project_canonical_model_context()
+        if projection is not None and projection.messages:
+            source = [dict(message) for message in projection.messages]
+        else:
+            source = self._neutralize_working_messages_for_compaction()
+
+        groups: list[list[dict[str, Any]]] = []
+        index = 0
+        while index < len(source):
+            message = source[index]
+            role = message.get("role")
+            if role == "tool":
+                raise CompactionError("cannot compact an orphaned tool result")
+            group = [message]
+            if role == "assistant" and message.get("tool_calls"):
+                expected = {
+                    str(call.get("id"))
+                    for call in message.get("tool_calls", [])
+                    if isinstance(call, Mapping) and call.get("id")
+                }
+                index += 1
+                while index < len(source) and source[index].get("role") == "tool":
+                    result = source[index]
+                    if result.get("tool_call_id") not in expected:
+                        raise CompactionError("tool result does not belong to its call group")
+                    group.append(result)
+                    index += 1
+                actual = {
+                    str(item.get("tool_call_id"))
+                    for item in group[1:]
+                    if item.get("tool_call_id")
+                }
+                if actual != expected:
+                    raise CompactionError("cannot compact an incomplete tool-call group")
+                groups.append(group)
+                continue
+            groups.append(group)
+            index += 1
+
+        if len(groups) <= 1:
+            return [dict(message) for message in source]
+        tail_count = min(8, len(groups) - 1)
+        tail = [message for group in groups[-tail_count:] for message in group]
+        self._pending_compaction_tail = [dict(message) for message in tail]
+        self._pending_compaction_summary_source = [
+            dict(message) for group in groups[:-tail_count] for message in group
+        ]
+        return [dict(message) for message in tail]
+
+    def _neutralize_working_messages_for_compaction(self) -> list[dict[str, Any]]:
+        """Best-effort fallback for callers that have no canonical store."""
 
         source = self._openai_messages if self.use_openai else self._anthropic_messages
         result: list[dict[str, Any]] = []
@@ -1312,56 +1395,55 @@ class Agent:
             role = message.get("role")
             if role == "system":
                 continue
-            if self.use_openai:
-                item = dict(message)
-                if role == "assistant" and item.get("tool_calls"):
-                    calls = []
-                    for call in item["tool_calls"]:
-                        function = call.get("function", call)
-                        arguments = function.get("arguments", {})
-                        if isinstance(arguments, str):
-                            try:
-                                arguments = json.loads(arguments)
-                            except json.JSONDecodeError:
-                                pass
-                        calls.append({
-                            "id": call.get("id"),
-                            "name": function.get("name"),
-                            "arguments": arguments,
-                        })
-                    item = {"role": "assistant", "tool_calls": calls}
-                elif role in {"user", "assistant", "tool"}:
-                    item = {key: value for key, value in item.items() if key in {
-                        "role", "content", "tool_call_id"
-                    }}
-                else:
-                    continue
-                result.append(item)
-                continue
-
-            content = message.get("content", "")
-            if role == "user" and isinstance(content, list):
-                text_blocks = [
-                    block.get("text", "")
-                    for block in content
-                    if isinstance(block, dict) and block.get("type") == "text"
-                ]
-                tool_blocks = [
-                    block
-                    for block in content
-                    if isinstance(block, dict) and block.get("type") == "tool_result"
-                ]
-                if text_blocks:
-                    result.append({"role": "user", "content": "\n".join(text_blocks)})
-                for block in tool_blocks:
-                    result.append({
-                        "role": "tool",
-                        "tool_call_id": block.get("tool_use_id"),
-                        "content": block.get("content", ""),
+            if role == "assistant" and message.get("tool_calls"):
+                calls = []
+                for call in message["tool_calls"]:
+                    function = call.get("function", call)
+                    arguments = function.get("arguments", {})
+                    if isinstance(arguments, str):
+                        try:
+                            arguments = json.loads(arguments)
+                        except json.JSONDecodeError:
+                            pass
+                    calls.append({
+                        "id": call.get("id"),
+                        "name": function.get("name"),
+                        "arguments": arguments,
                     })
-            elif role in {"user", "assistant"}:
-                result.append({"role": role, "content": content})
-        return result[-8:]
+                result.append({"role": "assistant", "tool_calls": calls})
+            elif role in {"user", "assistant", "tool"}:
+                result.append({
+                    key: value
+                    for key, value in message.items()
+                    if key in {"role", "content", "tool_call_id", "runtime_event_id"}
+                })
+        return result
+
+    def _compaction_summary_messages(self) -> list[dict[str, Any]]:
+        if self._pending_compaction_summary_source is None:
+            self._compaction_context_messages()
+        return [dict(message) for message in (self._pending_compaction_summary_source or [])]
+
+    def _provider_messages_for_neutral(
+        self, messages: list[dict[str, Any]]
+    ) -> tuple[dict[str, Any], ...]:
+        result = ModelReplayResult(
+            projection_version="projection-v1",
+            schema_version=1,
+            high_water=0,
+            source_digest="compaction-source",
+            digest="compaction-context",
+            messages=tuple(messages),
+            partial_count=0,
+            diagnostics=(),
+            context_epoch=self._context_epoch,
+            context_id=self._runtime_context.context_id if self._runtime_context else self._runtime_context_id,
+        )
+        return CanonicalModelContextAdapter().build_result(
+            result,
+            provider="openai" if self.use_openai else "anthropic",
+            system_prompt=None,
+        ).messages
 
     def _write_compaction_checkpoint(self, summary_text: str) -> CompactionCheckpoint | None:
         """Persist a checkpoint and a reset marker after summarization succeeds."""
@@ -1369,12 +1451,27 @@ class Agent:
         if self._runtime_store is None or self._runtime_context is None:
             return None
         bounded_summary = str(summary_text)[:8192]
-        context_messages = self._compaction_context_messages()
+        retained_tail = self._compaction_context_messages()
+        context_messages = [
+            {"role": "user", "content": f"[Previous conversation summary]\n{bounded_summary}"},
+            {
+                "role": "assistant",
+                "content": "Understood. I have the context from our previous conversation. How can I continue helping?",
+            },
+            *retained_tail,
+        ]
         try:
             high_water = self._runtime_store.current_high_water
+            context_id = self._runtime_context.context_id
+            active_projection = ModelReplayProjection().build(
+                self._runtime_store,
+                high_water=high_water,
+                context_id=context_id,
+            )
             checkpoint = CompactionCheckpointBuilder().build(
                 self._runtime_store,
                 high_water=high_water,
+                context_id=context_id,
                 summary={
                     "text": bounded_summary,
                     "provider": "openai" if self.use_openai else "anthropic",
@@ -1391,6 +1488,7 @@ class Agent:
                 reason="full_compaction",
                 replacements=[],
                 effective_context=context_messages,
+                context_id=context_id,
             )
             if self._runtime_emitter is None:
                 return None
@@ -1418,15 +1516,35 @@ class Agent:
                     "context_epoch": next_epoch,
                 },
             )
+            prepared = self._runtime_emitter.prepare(transition_event)
+            prepared_actions = prepared.actions or {}
+            validate_transition_candidate(
+                active_projection.messages,
+                ContextTransition.from_value(
+                    prepared_actions["context_transition"]
+                ),
+                source_high_water=checkpoint.source_high_water,
+                source_digest=checkpoint.source_digest,
+                expected_projection_version=checkpoint.projection_version,
+                expected_policy_version="compression-policy-v1",
+                current_context_epoch=active_projection.context_epoch,
+                context_id=context_id,
+                reset_context=(prepared_actions.get("compaction") or {}).get(
+                    "context_messages", []
+                ),
+            )
             if hasattr(self._runtime_store, "append_compaction_transition"):
-                prepared = self._runtime_emitter.prepare(transition_event)
                 self._runtime_store.append_compaction_transition(checkpoint, prepared)
             else:
                 self._runtime_store.write_compaction_checkpoint(checkpoint)
-                self._runtime_emitter.emit(transition_event)
+                self._runtime_emitter.emit(prepared)
             self._context_epoch = next_epoch
+            self._pending_compaction_tail = None
+            self._pending_compaction_summary_source = None
             return checkpoint
         except Exception as error:
+            self._pending_compaction_tail = None
+            self._pending_compaction_summary_source = None
             self._runtime_exit_status = "failed"
             self._runtime_exit_reason = f"compaction checkpoint failed: {error}"
             if isinstance(error, CompactionError):
@@ -1434,49 +1552,37 @@ class Agent:
             raise CompactionError(f"compaction checkpoint failed: {error}") from error
 
     async def _compact_anthropic(self) -> str | None:
-        if len(self._anthropic_messages) < 4:
+        self._compaction_context_messages()
+        summary_source = self._compaction_summary_messages()
+        if not summary_source:
             return None
-        last_user_msg = self._anthropic_messages[-1]
         summary_resp = await self._anthropic_client.messages.create(
             model=self.model,
             max_tokens=2048,
             system="You are a conversation summarizer. Be concise but preserve important details.",
             messages=[
-                *self._anthropic_messages[:-1],
+                *self._provider_messages_for_neutral(summary_source),
                 {"role": "user", "content": "Summarize the conversation so far in a concise paragraph, preserving key decisions, file paths, and context needed to continue the work."},
             ],
         )
         summary_text = summary_resp.content[0].text if summary_resp.content and summary_resp.content[0].type == "text" else "No summary available."
-        self._anthropic_messages = [
-            {"role": "user", "content": f"[Previous conversation summary]\n{summary_text}"},
-            {"role": "assistant", "content": "Understood. I have the context from our previous conversation. How can I continue helping?"},
-        ]
-        if last_user_msg.get("role") == "user":
-            self._anthropic_messages.append(last_user_msg)
         self.last_input_token_count = 0
         return summary_text
 
     async def _compact_openai(self) -> str | None:
-        if len(self._openai_messages) < 5:
+        self._compaction_context_messages()
+        summary_source = self._compaction_summary_messages()
+        if not summary_source:
             return None
-        system_msg = self._openai_messages[0]
-        last_user_msg = self._openai_messages[-1]
         summary_resp = await self._openai_client.chat.completions.create(
             model=self.model,
             messages=[
                 {"role": "system", "content": "You are a conversation summarizer. Be concise but preserve important details."},
-                *self._openai_messages[1:-1],
+                *self._provider_messages_for_neutral(summary_source),
                 {"role": "user", "content": "Summarize the conversation so far in a concise paragraph, preserving key decisions, file paths, and context needed to continue the work."},
             ],
         )
         summary_text = summary_resp.choices[0].message.content or "No summary available."
-        self._openai_messages = [
-            system_msg,
-            {"role": "user", "content": f"[Previous conversation summary]\n{summary_text}"},
-            {"role": "assistant", "content": "Understood. I have the context from our previous conversation. How can I continue helping?"},
-        ]
-        if last_user_msg.get("role") in {"user", "tool"}:
-            self._openai_messages.append(last_user_msg)
         self.last_input_token_count = 0
         return summary_text
 
@@ -1488,72 +1594,72 @@ class Agent:
     # Tier 4 (auto-compact) 在每轮 API 调用后检查触发。
 
     def _run_compression_pipeline(self) -> None:
+        import copy
+
+        previous_messages = copy.deepcopy(
+            self._openai_messages if self.use_openai else self._anthropic_messages
+        )
         before = self._capture_compression_tool_results()
-        if self.use_openai:
-            self._budget_tool_results_openai()
-            self._snip_stale_results_openai()
-            self._microcompact_openai()
-        else:
-            self._budget_tool_results_anthropic()
-            self._snip_stale_results_anthropic()
-            self._microcompact_anthropic()
-        self._persist_compression_replacements(before)
-
-    def _canonical_tool_response_events(self) -> tuple[tuple[str, str], ...]:
-        """Return response events in canonical/provider message order.
-
-        The event id is the durable identity.  Call ids are only labels and
-        may legitimately repeat in different runs.
-        """
-
-        if self._replay_cursor is not None:
-            return self._replay_cursor.canonical_tool_response_events()
-        if self._runtime_store is None:
-            return ()
-        result: list[tuple[str, str]] = []
-        for _, event in self._runtime_store.read_event_records():
-            content = event.content or {}
-            if content.get("kind") != "function_response":
-                continue
-            if event.kind == "tool_outcome" or (event.metadata or {}).get("lifecycle") == "tool_outcome":
-                continue
-            call_id = content.get("id")
-            if isinstance(call_id, str) and call_id:
-                result.append((event.id, call_id))
-        return tuple(result)
+        try:
+            if self.use_openai:
+                self._budget_tool_results_openai()
+                self._snip_stale_results_openai()
+                self._microcompact_openai()
+            else:
+                self._budget_tool_results_anthropic()
+                self._snip_stale_results_anthropic()
+                self._microcompact_anthropic()
+            self._persist_compression_replacements(before)
+        except Exception:
+            if self.use_openai:
+                self._openai_messages = previous_messages
+            else:
+                self._anthropic_messages = previous_messages
+            raise
 
     def _compression_tool_result_entries(
         self,
     ) -> list[tuple[str, str, str | list[Any]]]:
-        """Pair working tool messages with scoped canonical response ids."""
+        """Pair current provider-visible results with neutral source IDs."""
 
-        event_queues: dict[str, deque[str]] = {}
-        for event_id, call_id in self._canonical_tool_response_events():
-            event_queues.setdefault(call_id, deque()).append(event_id)
-
-        entries: list[tuple[str, str, str | list[Any]]] = []
-
-        def add(call_id: Any, content: Any) -> None:
-            if not isinstance(call_id, str) or not call_id:
-                return
-            if not isinstance(content, (str, list)):
-                return
-            queue = event_queues.get(call_id)
-            if not queue:
-                return
-            entries.append((queue.popleft(), call_id, content))
-
+        if self._runtime_store is None and self._replay_cursor is None:
+            return []
+        replay = (
+            self._replay_cursor.result()
+            if self._replay_cursor is not None
+            else self.project_canonical_model_context()
+        )
+        if replay is None:
+            return []
+        source_keys = [
+            (message.get("runtime_event_id"), message.get("tool_call_id"))
+            for message in replay.messages
+            if message.get("role") == "tool"
+        ]
+        working: list[tuple[Any, Any]] = []
         if self.use_openai:
-            for message in self._openai_messages:
-                if message.get("role") == "tool":
-                    add(message.get("tool_call_id"), message.get("content"))
-            return entries
-        for message in self._anthropic_messages:
-            if message.get("role") != "user" or not isinstance(message.get("content"), list):
-                continue
-            for block in message["content"]:
-                if isinstance(block, dict) and block.get("type") == "tool_result":
-                    add(block.get("tool_use_id"), block.get("content"))
+            working = [
+                (message.get("tool_call_id"), message.get("content"))
+                for message in self._openai_messages
+                if message.get("role") == "tool"
+            ]
+        else:
+            for message in self._anthropic_messages:
+                if message.get("role") != "user" or not isinstance(message.get("content"), list):
+                    continue
+                for block in message["content"]:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        working.append((block.get("tool_use_id"), block.get("content")))
+        entries: list[tuple[str, str, str | list[Any]]] = []
+        for (event_id, source_call_id), (working_call_id, content) in zip(source_keys, working):
+            if (
+                isinstance(event_id, str)
+                and event_id
+                and isinstance(source_call_id, str)
+                and source_call_id == working_call_id
+                and isinstance(content, (str, list))
+            ):
+                entries.append((event_id, source_call_id, content))
         return entries
 
     def _capture_compression_tool_results(
@@ -1589,11 +1695,10 @@ class Agent:
         if not replacements:
             return
         source_high_water = self._runtime_store.current_high_water
-        replay = (
-            self._replay_cursor.result()
-            if self._replay_cursor is not None
-            and self._replay_cursor.high_water == source_high_water
-            else ModelReplayProjection().build(self._runtime_store)
+        replay = ModelReplayProjection().build(
+            self._runtime_store,
+            high_water=source_high_water,
+            context_id=self._runtime_context.context_id,
         )
         effective_context = {
             "replacements": [item.to_dict() for item in replacements]
@@ -1607,6 +1712,7 @@ class Agent:
             reason="lightweight_compression",
             replacements=replacements,
             effective_context=effective_context,
+            context_id=self._runtime_context.context_id,
         )
         event = RuntimeEvent.create(
             self._runtime_context,
@@ -1622,7 +1728,29 @@ class Agent:
             },
         )
         try:
-            self._runtime_emitter.emit(event)
+            prepared = self._runtime_emitter.prepare(event)
+            prepared_transition = ContextTransition.from_value(
+                (prepared.actions or {})["context_transition"]
+            )
+            validate_transition_candidate(
+                replay.messages,
+                prepared_transition,
+                source_high_water=source_high_water,
+                source_digest=replay.source_digest,
+                expected_projection_version=replay.projection_version,
+                expected_policy_version="compression-policy-v1",
+                current_context_epoch=self._context_epoch,
+                context_id=self._runtime_context.context_id,
+            )
+            if hasattr(self._runtime_store, "append_context_transition"):
+                self._runtime_store.append_context_transition(
+                    prepared,
+                    source_high_water=source_high_water,
+                    source_digest=replay.source_digest,
+                    context_id=self._runtime_context.context_id,
+                )
+            else:
+                self._runtime_emitter.emit(prepared)
         except Exception as error:
             self._runtime_exit_status = "failed"
             self._runtime_exit_reason = f"context transition failed: {error}"
@@ -1799,6 +1927,12 @@ class Agent:
                     if self._runtime_context is not None
                     else self.session_id
                 ),
+                runtime_context_id=self._identity_factory.new("context"),
+                runtime_parent_context_id=(
+                    self._runtime_context.context_id
+                    if self._runtime_context is not None
+                    else None
+                ),
                 artifact_archive=self._artifact_archive,
                 llm_capture_policy=self._llm_capture_policy,
             )
@@ -1966,6 +2100,12 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     self._runtime_context.session_id
                     if self._runtime_context is not None
                     else self.session_id
+                ),
+                runtime_context_id=self._identity_factory.new("context"),
+                runtime_parent_context_id=(
+                    self._runtime_context.context_id
+                    if self._runtime_context is not None
+                    else None
                 ),
                 artifact_archive=self._artifact_archive,
                 llm_capture_policy=self._llm_capture_policy,

@@ -40,9 +40,10 @@ class CompactionCheckpoint:
     recent_tail: tuple[Mapping[str, Any], ...]
     created_at: str
     schema_version: int = COMPACTION_SCHEMA_VERSION
+    context_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "schema_version": self.schema_version,
             "checkpoint_id": self.checkpoint_id,
             "source_high_water": self.source_high_water,
@@ -55,6 +56,9 @@ class CompactionCheckpoint:
             "recent_tail": [dict(item) for item in self.recent_tail],
             "created_at": self.created_at,
         }
+        if self.context_id is not None:
+            result["context_id"] = self.context_id
+        return result
 
     def canonical_bytes(self) -> bytes:
         return canonical_json_bytes(self.to_dict())
@@ -76,6 +80,11 @@ class CompactionCheckpoint:
                 summary=dict(value.get("summary") or {}),
                 recent_tail=tuple(dict(item) for item in value.get("recent_tail", [])),
                 created_at=str(value["created_at"]),
+                context_id=(
+                    str(value["context_id"])
+                    if value.get("context_id") is not None
+                    else None
+                ),
                 schema_version=int(value.get("schema_version", COMPACTION_SCHEMA_VERSION)),
             )
         except (KeyError, TypeError, ValueError) as error:
@@ -133,8 +142,11 @@ class CompactionCheckpointBuilder:
         coverage: Mapping[str, Any] | None = None,
         summary: Mapping[str, Any] | str | None = None,
         created_at: str | None = None,
+        context_id: str | None = None,
     ) -> CompactionCheckpoint:
-        records = iter_event_records(source, high_water=high_water)
+        records = iter_event_records(
+            source, high_water=high_water, context_id=context_id
+        )
         records.sort(key=lambda item: item.ordinal)
         requested = high_water
         if requested is None:
@@ -143,7 +155,7 @@ class CompactionCheckpointBuilder:
             raise CheckpointCoverageError("source high-water must not be negative")
         if records and records[-1].ordinal > requested:
             raise CheckpointCoverageError("checkpoint includes an event above source high-water")
-        if requested and (not records or records[-1].ordinal != requested):
+        if requested and context_id is None and (not records or records[-1].ordinal != requested):
             raise CheckpointCoverageError(
                 f"checkpoint source does not cover requested high-water {requested}"
             )
@@ -188,11 +200,16 @@ class CompactionCheckpointBuilder:
             summary=summary_value,
             recent_tail=tuple(tail),
             created_at=created_at or _utc_now(),
+            context_id=context_id,
         )
 
     def verify(self, checkpoint: CompactionCheckpoint | Mapping[str, Any], source: Any) -> None:
         expected = checkpoint if isinstance(checkpoint, CompactionCheckpoint) else CompactionCheckpoint.from_dict(checkpoint)
-        rebuilt = self.build(source, high_water=expected.source_high_water)
+        rebuilt = self.build(
+            source,
+            high_water=expected.source_high_water,
+            context_id=expected.context_id,
+        )
         if rebuilt.source_high_water != expected.source_high_water or rebuilt.source_digest != expected.source_digest:
             raise CheckpointSourceMismatchError(
                 f"checkpoint {expected.checkpoint_id} does not match source prefix"
@@ -209,6 +226,7 @@ class CompactionCheckpointBuilder:
             coverage=expected.coverage,
             summary=expected.summary,
             created_at=expected.created_at,
+            context_id=expected.context_id,
         )
         self.verify(expected, source)
         return rebuilt

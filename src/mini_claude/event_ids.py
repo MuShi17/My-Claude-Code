@@ -31,10 +31,20 @@ class RunContext:
     invocation_id: str
     parent_run_id: str | None = None
     branch: str | None = None
+    context_id: str | None = None
+    parent_context_id: str | None = None
 
     def __post_init__(self) -> None:
         for name in ("session_id", "turn_id", "run_id", "invocation_id"):
             _require_identifier(getattr(self, name), name)
+        if self.context_id is None:
+            object.__setattr__(self, "context_id", f"context:{self.session_id}")
+        else:
+            _require_identifier(self.context_id, "context_id")
+        if self.parent_context_id is not None:
+            _require_identifier(self.parent_context_id, "parent_context_id")
+            if self.parent_context_id == self.context_id:
+                raise IdentityError("parent_context_id cannot equal context_id")
         if self.parent_run_id is not None:
             _require_identifier(self.parent_run_id, "parent_run_id")
             if self.parent_run_id == self.run_id:
@@ -49,6 +59,7 @@ class RunContext:
         invocation_id: str | None = None,
         turn_id: str | None = None,
         branch: str | None = None,
+        context_id: str | None = None,
     ) -> "RunContext":
         """Create an addressable child run without mixing event sequences."""
 
@@ -59,6 +70,8 @@ class RunContext:
             invocation_id=invocation_id or self.invocation_id,
             parent_run_id=self.run_id,
             branch=branch,
+            context_id=context_id or f"context:{run_id}",
+            parent_context_id=self.context_id,
         )
 
 
@@ -102,6 +115,7 @@ class IdentityFactory:
             invocation_id=self.invocation_id(),
             turn_id=turn_id,
             branch=branch,
+            context_id=self.new("context"),
         )
 
 
@@ -120,6 +134,8 @@ def create_run_context(
     invocation_id: str | None = None,
     parent_run_id: str | None = None,
     branch: str | None = None,
+    context_id: str | None = None,
+    parent_context_id: str | None = None,
 ) -> RunContext:
     factory = factory or IdentityFactory()
     return RunContext(
@@ -129,6 +145,8 @@ def create_run_context(
         invocation_id=invocation_id or factory.invocation_id(),
         parent_run_id=parent_run_id,
         branch=branch,
+        context_id=context_id,
+        parent_context_id=parent_context_id,
     )
 
 
