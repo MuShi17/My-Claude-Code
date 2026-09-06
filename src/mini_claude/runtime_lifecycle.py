@@ -61,6 +61,14 @@ class ModelCallSummary:
     attempt_id: str | None = None
 
 
+class ToolOperationConflictError(RuntimeError):
+    """A provider call identity was reused with different canonical arguments."""
+
+
+class UncertainToolOperationError(RuntimeError):
+    """A dispatched operation has no durable outcome and cannot be replayed."""
+
+
 class ModelCallRecorder:
     """Turn provider-specific chunks into one canonical lifecycle."""
 
@@ -157,7 +165,22 @@ class ModelCallRecorder:
         return self._emit(
             role="system",
             author="agent",
-            content={"kind": "invocation_opened"},
+            content={
+                "kind": "invocation_opened",
+                "protocol": "invocation_opened_v1",
+                "route": {"provider": self.provider, "model": self.model},
+                "configuration": {
+                    "attempt": attempt,
+                    "request_shape_hash": metadata.get("request_shape_hash"),
+                },
+                "root": {"kind": "agent"},
+                "source": {"kind": "fresh"},
+                **(
+                    {"lineage": {"parent_run_id": self.context.parent_run_id}}
+                    if self.context.parent_run_id
+                    else {}
+                ),
+            },
             status="streaming",
             metadata=metadata,
         )
@@ -352,6 +375,7 @@ class ToolExecutionResult:
     error_type: str | None = None
     denied: bool = False
     cancelled: bool = False
+    operation_id: str | None = None
 
 
 class DurableToolBoundary:
@@ -383,6 +407,7 @@ class DurableToolBoundary:
         content: Mapping[str, Any] | None = None,
         actions: Mapping[str, Any] | None = None,
         call_id: str | None = None,
+        operation_id: str | None = None,
         status: str | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> RuntimeEvent:
@@ -394,7 +419,10 @@ class DurableToolBoundary:
             event_id=self.ids.event_id(),
             content=content,
             actions=actions,
-            refs={"tool_call_id": call_id} if call_id else None,
+            refs={
+                **({"tool_call_id": call_id} if call_id else {}),
+                **({"operation_id": operation_id} if operation_id else {}),
+            } or None,
             status=status,
             metadata=metadata,
         )
@@ -411,6 +439,7 @@ class DurableToolBoundary:
         executor: Callable[[], Any] | Callable[[], Awaitable[Any]],
         timeout: float | None = None,
         on_started: Callable[[], Any] | None = None,
+        recovery_mode: str = "manual_on_unknown",
     ) -> ToolExecutionResult:
         decoded_arguments, argument_error = decode_tool_arguments(arguments)
         safe_arguments = redact_payload(decoded_arguments, self.redaction_policy)
@@ -446,13 +475,53 @@ class DurableToolBoundary:
             return ToolExecutionResult(call_id, name, result, False, False, denied=True)
 
         args_digest = hashlib.sha256(canonical_json_bytes(safe_arguments)).hexdigest()
+        operation_id = "op-" + hashlib.sha256(
+            f"{self.context.invocation_id}\0{call_id}\0{args_digest}".encode("utf-8")
+        ).hexdigest()[:32]
+        existing = self.emitter.read_tool_operation_for_call(self.context.invocation_id, call_id)
+        if existing is not None:
+            if (
+                existing.operation_id != operation_id
+                or existing.tool_name != name
+                or existing.canonical_args_hash != f"sha256:{args_digest}"
+                or existing.recovery_mode != recovery_mode
+            ):
+                raise ToolOperationConflictError(
+                    f"provider tool call {call_id} has conflicting operation identity"
+                )
+            if existing.state == "outcome_unknown":
+                raise UncertainToolOperationError(
+                    f"operation {operation_id} has an unknown outcome; explicit new invocation required"
+                )
+            if existing.state in {"completed", "failed", "denied", "cancelled"}:
+                return ToolExecutionResult(
+                    call_id,
+                    name,
+                    existing.result,
+                    bool(existing.success),
+                    bool(existing.executed),
+                    existing.error_type,
+                    denied=existing.state == "denied",
+                    operation_id=operation_id,
+                )
         # This call is the durable barrier.  If it raises, executor is never
         # reached and the caller must classify the run as uncertain/failing.
         self._event(
             role="system",
             author="system",
-            actions={"tool_dispatch": {"name": name, "arguments_digest": f"sha256:{args_digest}"}},
+            actions={
+                "tool_dispatch": {
+                    "protocol": "tool_dispatch_v1",
+                    "operation_id": operation_id,
+                    "provider_tool_call_id": call_id,
+                    "tool_name": name,
+                    "name": name,
+                    "canonical_args_hash": f"sha256:{args_digest}",
+                    "recovery_mode": recovery_mode,
+                }
+            },
             call_id=call_id,
+            operation_id=operation_id,
             metadata={"lifecycle": "tool_dispatch", "dispatch_durable": True},
         )
         if on_started is not None:
@@ -460,6 +529,7 @@ class DurableToolBoundary:
             if inspect.isawaitable(maybe):
                 await maybe
         self.execution_count += 1
+        execution_started_at = time.monotonic()
         try:
             value = executor()
             if inspect.isawaitable(value):
@@ -475,21 +545,42 @@ class DurableToolBoundary:
                 success=success,
                 executed=True,
                 error_type=type(archive_error).__name__ if archive_error else None,
+                operation_id=operation_id,
+                duration_ms=int((time.monotonic() - execution_started_at) * 1000),
             )
             return ToolExecutionResult(
                 call_id, name, bounded, success, True,
                 type(archive_error).__name__ if archive_error else None,
+                operation_id=operation_id,
             )
         except asyncio.CancelledError:
-            self._outcome(call_id, name, "tool cancelled", success=False, executed=True, error_type="CancelledError")
+            self._outcome(
+                call_id, name, "tool cancelled", success=False, executed=True,
+                error_type="CancelledError", operation_id=operation_id,
+                duration_ms=int((time.monotonic() - execution_started_at) * 1000),
+            )
             raise
         except asyncio.TimeoutError:
-            self._outcome(call_id, name, "tool timed out", success=False, executed=True, error_type="TimeoutError")
-            return ToolExecutionResult(call_id, name, "tool timed out", False, True, "TimeoutError")
+            self._outcome(
+                call_id, name, "tool timed out", success=False, executed=True,
+                error_type="TimeoutError", operation_id=operation_id,
+                duration_ms=int((time.monotonic() - execution_started_at) * 1000),
+            )
+            return ToolExecutionResult(
+                call_id, name, "tool timed out", False, True, "TimeoutError",
+                operation_id=operation_id,
+            )
         except Exception as error:
             message = f"Error: {error}"
-            self._outcome(call_id, name, message, success=False, executed=True, error_type=type(error).__name__)
-            return ToolExecutionResult(call_id, name, message, False, True, type(error).__name__)
+            self._outcome(
+                call_id, name, message, success=False, executed=True,
+                error_type=type(error).__name__, operation_id=operation_id,
+                duration_ms=int((time.monotonic() - execution_started_at) * 1000),
+            )
+            return ToolExecutionResult(
+                call_id, name, message, False, True, type(error).__name__,
+                operation_id=operation_id,
+            )
 
     def _bound_result(
         self,
@@ -549,9 +640,21 @@ class DurableToolBoundary:
         executed: bool,
         denied: bool = False,
         error_type: str | None = None,
+        operation_id: str | None = None,
+        duration_ms: int | None = None,
     ) -> None:
         safe_result = redact_payload(result, self.redaction_policy)
         action = {"name": name, "success": success, "executed": executed}
+        if operation_id:
+            action.update(
+                {
+                    "operation_id": operation_id,
+                    "provider_tool_call_id": call_id,
+                    "tool_name": name,
+                }
+            )
+        if duration_ms is not None:
+            action["duration_ms"] = max(int(duration_ms), 0)
         if error_type:
             action["error_type"] = error_type
         self._event(
@@ -566,6 +669,7 @@ class DurableToolBoundary:
             },
             actions={"tool_outcome": action},
             call_id=call_id,
+            operation_id=operation_id,
             metadata={"lifecycle": "tool_outcome", "denied": denied},
         )
         self._event(
@@ -579,6 +683,7 @@ class DurableToolBoundary:
                 "isError": not success,
             },
             call_id=call_id,
+            operation_id=operation_id,
             metadata={"lifecycle": "function_response", "executed": executed},
         )
 
@@ -602,6 +707,8 @@ __all__ = [
     "ModelCallRecorder",
     "ModelCallSummary",
     "ToolExecutionResult",
+    "ToolOperationConflictError",
+    "UncertainToolOperationError",
     "request_shape_hash",
     "decode_tool_arguments",
 ]

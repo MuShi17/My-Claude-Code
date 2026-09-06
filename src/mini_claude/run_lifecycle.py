@@ -82,6 +82,22 @@ class RunStateGuard:
     def start(self) -> RuntimeEvent:
         if self.state.status != "open":
             raise InvalidTransitionError(f"cannot start from {self.state.status}")
+        self._emit(
+            content={
+                "kind": "invocation_opened",
+                "protocol": "invocation_opened_v1",
+                "route": {"provider": "runtime"},
+                "configuration": {"lifecycle": "run"},
+                "root": {"kind": "agent"},
+                "source": {"kind": "fresh"},
+                **(
+                    {"lineage": {"parent_run_id": self.context.parent_run_id}}
+                    if self.context.parent_run_id
+                    else {}
+                ),
+            },
+            metadata={"lifecycle": "invocation_opened"},
+        )
         return self.transition("running", reason="run_started")
 
     def awaiting_tool(self) -> RuntimeEvent:

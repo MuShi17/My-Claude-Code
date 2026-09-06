@@ -1,8 +1,7 @@
 """Shared identity primitives for canonical runtime events.
 
-The legacy logger generated request ids in several call sites.  Canonical
-events instead use one small identity factory so provider adapters, tools and
-child runs all describe the same session/turn/run/invocation coordinates.
+One small identity factory lets provider adapters, tools and child runs all
+describe the same session/turn/run/invocation coordinates.
 """
 
 from __future__ import annotations

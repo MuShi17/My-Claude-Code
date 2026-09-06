@@ -1,23 +1,16 @@
-"""C04 domain and shadow-sink contract tests."""
+"""Canonical RuntimeEvent domain and sink contract tests."""
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import pytest
 
-import mini_claude.logger as logger_module
 from mini_claude.event_ids import IdentityFactory, RunContext
 from mini_claude.event_sink import (
     CanonicalSink,
     CanonicalSinkError,
-    CompositeEventSink,
-    DiagnosticSinkError,
-    LegacyShadowSink,
     RecordingEventSink,
     RuntimeEventEmitter,
 )
-from mini_claude.logger import AgentLogger
 from mini_claude.redaction import RedactionPolicy, bound_payload, redact_event_dict, redact_payload
 from mini_claude.runtime_event import RuntimeEvent, RuntimeEventValidationError
 
@@ -25,13 +18,18 @@ from runtime_fixtures import FaultInjector, build_scenario, scenario_events
 
 
 def _event(kind: str = "text") -> RuntimeEvent:
-    data = next(item for item in scenario_events(build_scenario()) if item["kind"] == kind)
+    data = next(
+        item
+        for item in scenario_events(build_scenario())
+        if item.get("content", {}).get("kind") == kind
+        or kind in item.get("actions", {})
+    )
     return RuntimeEvent.from_dict(data)
 
 
-def test_fixture_event_is_normalized_to_frozen_canonical_envelope():
+def test_fixture_event_is_strict_frozen_canonical_envelope():
     event = _event("invocation_opened")
-    assert event.schema_version == 1
+    assert event.schema_version == 2
     assert event.kind == "invocation_opened"
     assert event.ts == 1767323045678
     assert event.validate() is None
@@ -59,6 +57,20 @@ def test_canonical_digest_is_independent_of_input_mapping_order():
     assert RuntimeEvent.from_dict(base).digest() == RuntimeEvent.from_dict(reordered).digest()
 
 
+def test_canonical_refs_round_trip_all_replay_boundaries():
+    data = _event("function_call").to_dict()
+    data["refs"] = {
+        "operation_id": "operation-1",
+        "step_id": "step-1",
+        "provider_event_id": "provider-event-1",
+        "artifact_ref": "artifact:sha256:" + "a" * 64,
+        "continuation_id": "continuation-1",
+    }
+    event = RuntimeEvent.from_dict(data)
+    assert event.to_dict()["refs"] == data["refs"]
+    assert RuntimeEvent.from_dict(event.to_dict()) == event
+
+
 def test_invalid_envelope_has_contract_error_not_transport_error():
     data = _event("text").to_dict()
     data["run_id"] = ""
@@ -69,6 +81,48 @@ def test_invalid_envelope_has_contract_error_not_transport_error():
     data["status"] = "completed"
     data["partial"] = True
     with pytest.raises(RuntimeEventValidationError, match="partial"):
+        RuntimeEvent.from_dict(data)
+
+
+def test_legacy_envelope_is_rejected_without_field_inference():
+    legacy = {
+        "schema_version": 2,
+        "id": "event",
+        "kind": "text",
+        "timestamp": "2026-09-05T00:00:00Z",
+        "ts": 0,
+        "session_id": "session",
+        "turn_id": "turn",
+        "run_id": "run",
+        "invocation_id": "invocation",
+        "text": "legacy",
+        "partial": False,
+        "role": "model",
+        "author": "agent",
+    }
+    with pytest.raises(RuntimeEventValidationError, match="legacy or unknown fields"):
+        RuntimeEvent.from_dict(legacy)
+
+
+def test_invocation_opening_requires_protocol_route_and_source():
+    data = _event("invocation_opened").to_dict()
+    del data["content"]["route"]
+    with pytest.raises(RuntimeEventValidationError, match="content.route"):
+        RuntimeEvent.from_dict(data)
+
+    data = _event("invocation_opened").to_dict()
+    data["content"]["source"]["kind"] = "legacy"
+    with pytest.raises(RuntimeEventValidationError, match="source.kind"):
+        RuntimeEvent.from_dict(data)
+
+    data = _event("invocation_opened").to_dict()
+    data["partial"] = True
+    with pytest.raises(RuntimeEventValidationError, match="opening event cannot be partial"):
+        RuntimeEvent.from_dict(data)
+
+    data = _event("text").to_dict()
+    data["actions"] = {"end_run": True}
+    with pytest.raises(RuntimeEventValidationError, match="end_run requires"):
         RuntimeEvent.from_dict(data)
 
 
@@ -100,96 +154,24 @@ def test_redaction_and_bounded_reference_never_expose_secret():
     assert reference["sha256"].startswith("sha256:")
 
 
-def test_emitter_redacts_before_canonical_and_diagnostic_sinks():
+def test_emitter_redacts_before_canonical_sink():
     canonical = RecordingEventSink()
-    legacy_records: list[RuntimeEvent] = []
-
-    class Diagnostic:
-        sink_name = "test-diagnostic"
-
-        def emit(self, event: RuntimeEvent) -> RuntimeEvent:
-            legacy_records.append(event)
-            return event
-
-        def flush(self) -> None:
-            return None
-
-        def close(self) -> None:
-            return None
 
     source = _event("function_call").to_dict()
     source["content"]["args"] = {"api_key": "sk-ant-hidden"}
     emitted = RuntimeEventEmitter(
-        CompositeEventSink(canonical, [Diagnostic()]),
+        CanonicalSink(canonical),
     ).emit(source)
     assert emitted.content["args"]["api_key"] == "[REDACTED]"
     assert canonical.events[0] == emitted
-    assert legacy_records[0] == emitted
 
 
-def test_composite_is_canonical_first_and_diagnostic_failure_is_observable():
-    canonical = RecordingEventSink()
-
-    class BrokenDiagnostic:
-        sink_name = "broken-legacy"
-
-        def emit(self, event: RuntimeEvent) -> RuntimeEvent:
-            del event
-            raise OSError("legacy disk full")
-
-        def flush(self) -> None:
-            return None
-
-        def close(self) -> None:
-            return None
-
-    composite = CompositeEventSink(canonical, [BrokenDiagnostic()])
-    event = composite.emit(_event("text"))
-    assert canonical.events == [event]
-    assert composite.diagnostic_failures[0].message == "legacy disk full"
-
-    strict = CompositeEventSink(canonical, [BrokenDiagnostic()], continue_on_diagnostic_failure=False)
-    with pytest.raises(DiagnosticSinkError, match="legacy disk full"):
-        strict.emit(_event("text"))
-
-
-def test_canonical_failure_is_fail_closed_and_legacy_is_not_called():
-    calls: list[str] = []
-
+def test_canonical_failure_is_fail_closed():
     def fail(point: str, event: RuntimeEvent) -> None:
         del event
         if point == "emit":
             raise OSError("canonical unavailable")
 
-    class ShouldNotRun:
-        def emit(self, event: RuntimeEvent) -> RuntimeEvent:
-            del event
-            calls.append("legacy")
-            return _event("text")
-
-        def flush(self) -> None:
-            return None
-
-        def close(self) -> None:
-            return None
-
     canonical = CanonicalSink(RecordingEventSink(failure_hook=fail))
     with pytest.raises(CanonicalSinkError, match="canonical unavailable"):
-        CompositeEventSink(canonical, [ShouldNotRun()]).emit(_event("text"))
-    assert calls == []
-
-
-def test_legacy_shadow_sink_writes_readable_record_and_preserves_c03_layout(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    monkeypatch.setattr(logger_module, "SESSION_DIR", tmp_path / "sessions")
-    logger = AgentLogger("session-c04")
-    logger.new_ask(1)
-    LegacyShadowSink(logger).emit(_event("function_call"))
-    logger.close()
-    content = (tmp_path / "sessions" / "session-c04" / "logs" / "001.jsonl").read_text(
-        encoding="utf-8"
-    )
-    assert '"type": "runtime_event"' in content
-    assert '"runtime_kind": "function_call"' in content
-    assert '"canonical_event_id"' in content
+        canonical.emit(_event("text"))

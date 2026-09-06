@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -11,9 +12,12 @@ from mini_claude.event_sink import CanonicalSink, CanonicalSinkError, RecordingE
 from mini_claude.runtime_lifecycle import (
     DurableToolBoundary,
     ModelCallRecorder,
+    ToolOperationConflictError,
+    UncertainToolOperationError,
     decode_tool_arguments,
     request_shape_hash,
 )
+from mini_claude.runtime_store import SQLiteRuntimeStore
 
 
 def _context() -> RunContext:
@@ -154,5 +158,118 @@ def test_success_and_invalid_final_arguments_have_distinct_terminal_outcomes():
         )
         assert result.executed is False
         assert result.error_type == "ValidationError"
+
+    asyncio.run(scenario())
+
+
+def test_sqlite_tool_operation_is_durable_idempotent_and_correlatable(tmp_path: Path):
+    async def scenario():
+        database = tmp_path / "runtime.sqlite"
+        with SQLiteRuntimeStore(database) as store:
+            emitter = RuntimeEventEmitter(store)
+            recorder = ModelCallRecorder(
+                emitter, _context(), provider="fixture", model="fixture-model"
+            )
+            recorder.start("request-tool")
+            boundary = DurableToolBoundary(emitter, _context())
+            calls: list[str] = []
+            first = await boundary.execute(
+                call_id="provider-call-1",
+                name="read_file",
+                arguments={"file_path": "sample.txt"},
+                executor=lambda: calls.append("executed") or "alpha",
+            )
+            second = await boundary.execute(
+                call_id="provider-call-1",
+                name="read_file",
+                arguments={"file_path": "sample.txt"},
+                executor=lambda: calls.append("replayed") or "wrong",
+            )
+            operation = store.read_tool_operation(first.operation_id or "")
+            assert operation is not None
+            assert operation.state == "completed"
+            assert operation.provider_tool_call_id == "provider-call-1"
+            assert operation.canonical_args_hash.startswith("sha256:")
+            assert first.result == second.result == "alpha"
+            assert calls == ["executed"]
+            assert len(store.connection.execute(
+                "SELECT journal_id FROM runtime_tool_journal WHERE operation_id = ?",
+                (first.operation_id,),
+            ).fetchall()) == 2
+
+    asyncio.run(scenario())
+
+
+def test_sqlite_tool_operation_conflict_and_unknown_are_fail_closed(tmp_path: Path):
+    async def scenario():
+        database = tmp_path / "runtime.sqlite"
+        with SQLiteRuntimeStore(database) as store:
+            emitter = RuntimeEventEmitter(store)
+            recorder = ModelCallRecorder(
+                emitter, _context(), provider="fixture", model="fixture-model"
+            )
+            recorder.start("request-tool")
+            boundary = DurableToolBoundary(emitter, _context())
+            await boundary.execute(
+                call_id="provider-call-1",
+                name="read_file",
+                arguments={"file_path": "sample.txt"},
+                executor=lambda: "alpha",
+            )
+            with pytest.raises(ToolOperationConflictError):
+                await boundary.execute(
+                    call_id="provider-call-1",
+                    name="read_file",
+                    arguments={"file_path": "other.txt"},
+                    executor=lambda: pytest.fail("conflicting operation must not execute"),
+                )
+
+            store.connection.execute(
+                "UPDATE runtime_tool_operations SET state = 'dispatched', "
+                "outcome_event_id = NULL, success = NULL, executed = NULL, result_json = NULL, "
+                "result_digest = NULL, result_size_bytes = NULL WHERE provider_tool_call_id = ?",
+                ("provider-call-1",),
+            )
+            assert store.mark_unknown_tool_operations(run_id="run-c06") == 1
+            with pytest.raises(UncertainToolOperationError):
+                await boundary.execute(
+                    call_id="provider-call-1",
+                    name="read_file",
+                    arguments={"file_path": "sample.txt"},
+                    executor=lambda: pytest.fail("unknown operation must not execute"),
+                )
+
+    asyncio.run(scenario())
+
+
+def test_dispatch_store_failure_does_not_invoke_executor(tmp_path: Path):
+    async def scenario():
+        database = tmp_path / "runtime.sqlite"
+        with SQLiteRuntimeStore(database) as store:
+            emitter = RuntimeEventEmitter(store)
+            recorder = ModelCallRecorder(
+                emitter, _context(), provider="fixture", model="fixture-model"
+            )
+            recorder.start("request-tool")
+            class CommitFault:
+                commits = 0
+
+                def check(self, point: str) -> None:
+                    if point == "store.append":
+                        self.commits += 1
+                        if self.commits == 3:
+                            raise RuntimeError("dispatch persistence failed")
+
+            store.fault_hook = CommitFault()
+            boundary = DurableToolBoundary(emitter, _context())
+            calls: list[str] = []
+            with pytest.raises(Exception, match="dispatch persistence failed"):
+                await boundary.execute(
+                    call_id="provider-call-1",
+                    name="write_file",
+                    arguments={"file_path": "sample.txt", "content": "x"},
+                    executor=lambda: calls.append("executed"),
+                )
+            assert calls == []
 
     asyncio.run(scenario())

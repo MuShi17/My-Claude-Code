@@ -83,7 +83,7 @@ def test_isolated_home_never_uses_user_session_directory():
 def test_golden_fixture_is_versioned_bounded_and_redacted():
     golden_path = Path(__file__).parent / "golden" / "canonical_runtime_event.json"
     golden = json.loads(golden_path.read_text(encoding="utf-8"))
-    assert golden["schema_version"] == 1
+    assert golden["schema_version"] == 2
     assert set(golden) >= {"events", "messages", "trace", "compaction"}
     assert_no_secrets(golden)
     assert len(json.dumps(golden, ensure_ascii=False)) < 30_000
@@ -92,7 +92,14 @@ def test_golden_fixture_is_versioned_bounded_and_redacted():
 def test_contract_inputs_are_not_silently_empty():
     events = scenario_events(build_scenario())
     assert events
-    assert {event["kind"] for event in events} >= {
+    kinds: set[str] = set()
+    for event in events:
+        content = event.get("content") or {}
+        actions = event.get("actions") or {}
+        if content.get("kind"):
+            kinds.add(content["kind"])
+        kinds.update(actions)
+    assert kinds >= {
         "invocation_opened",
         "function_call",
         "permission",

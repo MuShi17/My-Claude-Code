@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from mini_claude.projections import ModelReplayProjection, RunTraceProjection, SessionProjection
+from mini_claude.projections import (
+    CanonicalMetricsProjection,
+    ModelReplayProjection,
+    RunTraceProjection,
+    SessionProjection,
+)
 from mini_claude.runtime_event import RuntimeEvent
 from mini_claude.runtime_store import SQLiteRuntimeStore
 from mini_claude.session import load_session
@@ -82,12 +87,110 @@ def test_provider_parity_uses_same_stable_projection_fields():
     assert anthropic.digest == openai.digest
 
 
-def test_session_loader_can_be_explicitly_canonical_first_without_legacy_files(tmp_path: Path):
+def test_replay_rejects_response_before_call_and_adapters_use_provider_shapes():
+    events = _events()
+    invalid_order = [events[0], events[6], events[2]]
+    replay = ModelReplayProjection().build(invalid_order)
+    assert not any(message.get("role") == "tool" for message in replay.messages)
+    assert any(item.code == "invalid_tool_order" for item in replay.diagnostics)
+
+    thinking = events[1].to_dict()
+    thinking.update(
+        {
+            "id": "signed-thinking",
+            "content": {"kind": "thinking", "text": "reason", "signature": "sig-1"},
+            "role": "model",
+        }
+    )
+    replay = ModelReplayProjection().build([events[0], RuntimeEvent.from_dict(thinking), events[1]])
+    from mini_claude.projections.provider_context import CanonicalModelContextAdapter
+
+    anthropic = CanonicalModelContextAdapter().build([events[0], RuntimeEvent.from_dict(thinking)], provider="anthropic")
+    assert anthropic.messages[0]["content"][0] == {
+        "type": "thinking",
+        "thinking": "reason",
+        "signature": "sig-1",
+    }
+    openai = CanonicalModelContextAdapter().build([events[0], RuntimeEvent.from_dict(thinking)], provider="openai")
+    assert not any("kind" in str(message) for message in openai.messages)
+
+    unsigned = thinking.copy()
+    unsigned["id"] = "unsigned-thinking"
+    unsigned["content"] = {"kind": "thinking", "text": "untrusted reason"}
+    degraded = CanonicalModelContextAdapter().build(
+        [events[0], RuntimeEvent.from_dict(unsigned)], provider="anthropic"
+    )
+    assert not any("kind" in str(message) for message in degraded.messages)
+    assert not any(
+        item.get("type") == "thinking"
+        for message in degraded.messages
+        for item in message.get("content", [])
+        if isinstance(item, dict)
+    )
+
+
+def test_session_loader_is_canonical_derived_without_legacy_files(tmp_path: Path):
     database = tmp_path / "runtime.sqlite"
     event = _events()[1]
     with SQLiteRuntimeStore(database) as store:
+        store.append(_events()[0])
         store.append(event)
-        loaded = load_session(event.session_id, runtime_store=store, canonical_first=True)
+        loaded = load_session(event.session_id, runtime_store=store)
     assert loaded is not None
     assert loaded["metadata"]["source"] == "canonical"
     assert loaded["canonicalMessages"][0]["content"] == event.content["text"]
+
+
+def test_metrics_projection_rebuilds_supported_facts_without_tracer_input():
+    events = _events()
+    partial = events[1].to_dict()
+    partial.update({"id": "metrics-partial", "ts": events[0].ts + 10, "partial": True})
+    usage = events[1].to_dict()
+    usage.update({
+        "id": "metrics-usage",
+        "role": "system",
+        "author": "agent",
+        "content": None,
+        "actions": {"usage": {"input_tokens": 11, "output_tokens": 7}},
+        "metadata": {"lifecycle": "usage", "raw_request": "sk-ant-must-not-appear"},
+    })
+    finish = events[1].to_dict()
+    finish.update({
+        "id": "metrics-finish",
+        "role": "system",
+        "author": "agent",
+        "content": None,
+        "actions": {"model_finish": {"finish_reason": "stop", "latency_ms": 42}},
+        "metadata": {"lifecycle": "model_final"},
+    })
+    outcome = events[5].to_dict()
+    outcome["actions"]["tool_outcome"]["duration_ms"] = 9
+    terminal = events[1].to_dict()
+    terminal.update({
+        "id": "metrics-terminal",
+        "role": "system",
+        "author": "system",
+        "status": "completed",
+        "actions": {"end_run": True},
+        "metadata": {"lifecycle": "run_terminal"},
+        "ts": events[0].ts + 100,
+    })
+    canonical = events + [
+        RuntimeEvent.from_dict(partial),
+        RuntimeEvent.from_dict(usage),
+        RuntimeEvent.from_dict(finish),
+        RuntimeEvent.from_dict(outcome),
+        RuntimeEvent.from_dict(terminal),
+    ]
+    projection = CanonicalMetricsProjection().build(canonical)
+    run = projection.runs[0]
+    assert run["first_token_ms"] == 10
+    assert run["first_token_available"] is True
+    assert run["input_tokens"] == 11
+    assert run["output_tokens"] == 7
+    assert run["finish_reason"] == "stop"
+    assert run["tool_duration_ms"] == 9
+    assert run["terminal_status"] == "completed"
+    assert "sk-ant-must-not-appear" not in str(projection.to_dict())
+    rebuilt = CanonicalMetricsProjection().build(canonical)
+    assert rebuilt.to_dict() == projection.to_dict()

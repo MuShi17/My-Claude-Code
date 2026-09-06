@@ -484,31 +484,6 @@ class ArtifactArchive:
         return self.diagnose()
 
 
-class LegacyToolResultsAdapter:
-    """Read-only, bounded compatibility adapter for the old tool-results dir."""
-
-    def __init__(self, root: str | Path | None = None, *, max_read_bytes: int = 64 * 1024) -> None:
-        self.root = Path(root) if root is not None else Path.home() / ".mini-claude" / "tool-results"
-        self.max_read_bytes = max_read_bytes
-
-    def list(self) -> list[Path]:
-        if not self.root.exists():
-            return []
-        return sorted(path for path in self.root.iterdir() if path.is_file())
-
-    def read(self, path: str | Path, *, max_bytes: int | None = None) -> str:
-        candidate = Path(path)
-        if not candidate.is_absolute():
-            candidate = self.root / candidate
-        try:
-            candidate.resolve().relative_to(self.root.resolve())
-        except ValueError as error:
-            raise ArtifactAccessError("legacy tool-result path escapes compatibility root") from error
-        limit = self.max_read_bytes if max_bytes is None else max_bytes
-        data = candidate.read_bytes()
-        return data[:limit].decode("utf-8", errors="replace")
-
-
 __all__ = [
     "ARTIFACT_REF_PREFIX",
     "ARTIFACT_SCHEMA_VERSION",
@@ -521,5 +496,4 @@ __all__ = [
     "ArtifactNotFoundError",
     "ArtifactRef",
     "ArtifactSizeLimitError",
-    "LegacyToolResultsAdapter",
 ]

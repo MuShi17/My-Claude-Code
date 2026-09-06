@@ -16,7 +16,6 @@ from .session import (
     CanonicalRecoveryError,
     get_latest_session_id,
     list_canonical_runtime_sessions,
-    list_sessions,
     list_runtime_store_paths,
     load_session,
 )
@@ -43,7 +42,7 @@ def parse_args() -> argparse.Namespace:
         dest="thinking",
         action="store_true",
         default=None,
-        help="Enable extended thinking (legacy compatibility flag)",
+        help="Enable extended thinking",
     )
     parser.add_argument(
         "--no-thinking",
@@ -62,22 +61,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true", help="Resume last session")
     parser.add_argument("--list", dest="list_sessions", action="store_true", help="List local sessions")
     parser.add_argument("--latest", action="store_true", help="Show the latest local session")
-    parser.add_argument(
-        "--log-authority",
-        choices=("legacy", "shadow", "canonical"),
-        default=os.getenv("MINI_CLAUDE_LOG_AUTHORITY", "shadow"),
-        help="Runtime log route: legacy, shadow, or gated canonical",
-    )
-    parser.add_argument(
-        "--log-rollback",
-        action="store_true",
-        help="Route logging back to legacy without deleting canonical data",
-    )
-    parser.add_argument(
-        "--approve-canonical",
-        action="store_true",
-        help="Explicitly approve Canonical authority for this invocation",
-    )
     parser.add_argument("--max-cost", type=float, default=None, help="Max USD spend")
     parser.add_argument("--max-turns", type=int, default=None, help="Max agentic turns")
     parser.add_argument("--help", "-h", action="store_true", help="Show help")
@@ -286,7 +269,7 @@ Options:
   --plan              Plan mode: read-only, describe changes without executing
   --accept-edits      Auto-approve file edits, still confirm dangerous shell
   --dont-ask          Auto-deny anything needing confirmation (for CI)
-  --thinking          Enable extended thinking (legacy compatibility flag)
+  --thinking          Enable extended thinking
   --no-thinking       Disable extended thinking
   --thinking-effort   Thinking effort: none, low, high, or max (default: max,
                       or MINI_CLAUDE_THINKING_EFFORT)
@@ -295,9 +278,7 @@ Options:
   --resume            Resume the last session
   --list              List local sessions without contacting a provider
   --latest            Show the latest local session without contacting a provider
-  --log-authority     Log route: legacy, shadow, or gated canonical
-  --log-rollback      Route logging back to legacy; retain canonical data
-  --approve-canonical Explicitly approve Canonical authority for this invocation
+  Runtime logs are always written to the canonical session SQLite store.
   --max-cost USD      Stop when estimated cost exceeds this amount
   --max-turns N       Stop after N agentic turns
   --help, -h          Show this help
@@ -369,6 +350,11 @@ Examples:
                 for item in recovered:
                     if item.status in {"corrupt", "uncertain", "unmatched"}:
                         print(f"Recovery {item.status}: {item.run_id} - {item.recommended_action}")
+                if any(item.status == "corrupt" for item in recovered):
+                    raise CanonicalRecoveryError(
+                        "canonical recovery found corrupt event data",
+                        path=resume_store.database,
+                    )
         except CanonicalRecoveryError as error:
             print_error(f"Canonical recovery blocked ({error.classification}): {error}")
             if resume_store is not None:
@@ -381,11 +367,7 @@ Examples:
         except CanonicalRecoveryError as error:
             print_error(f"Canonical listing blocked ({error.classification}): {error}")
             sys.exit(2)
-        legacy_sessions = [
-            item for item in list_sessions()
-            if item.get("source") == "legacy-readonly"
-        ]
-        sessions = canonical_sessions + legacy_sessions
+        sessions = canonical_sessions
         if args.latest:
             if sessions:
                 latest = sorted(
@@ -397,33 +379,24 @@ Examples:
                     ),
                     reverse=True,
                 )[0]
-                print(f"Latest session: {latest.get('id')} ({latest.get('source', 'canonical')})")
+                print(f"Latest session: {latest.get('id')} (canonical)")
             else:
                 print("No previous sessions found.")
         elif sessions:
             for item in sorted(sessions, key=lambda value: str(value.get("id", ""))):
-                print(f"{item.get('id')} ({item.get('source', 'canonical')})")
+                print(f"{item.get('id')} (canonical)")
         else:
             print("No previous sessions found.")
         return
 
     if not resolved_api_key:
         # A resume-only invocation is also a useful offline inspection command.
-        # Do not require provider credentials merely to classify/load local
-        # canonical or legacy state.  Continuing with a new turn still needs a
-        # key and will be rejected on the next invocation.
+        # Do not require provider credentials merely to inspect canonical state.
         if args.resume and not args.prompt:
-            canonical_id = resume_session_id or (
-                get_latest_session_id(runtime_store=resume_store) if resume_store else None
-            )
-            if canonical_id:
-                print(f"Canonical session available: {canonical_id}")
+            if resume_session_id:
+                print(f"Canonical session available: {resume_session_id}")
             else:
-                legacy_id = get_latest_session_id()
-                if legacy_id:
-                    print(f"Legacy readonly session available: {legacy_id}")
-                else:
-                    print("No previous sessions found.")
+                print("No canonical sessions found.")
             if resume_store is not None:
                 resume_store.close()
             return
@@ -445,24 +418,17 @@ Examples:
         anthropic_base_url=resolved_api_base if not resolved_use_openai else None,
         api_key=resolved_api_key,
         runtime_store=resume_store,
-        runtime_authority=args.log_authority,
-        runtime_authority_approved=args.approve_canonical,
-        runtime_rollback=args.log_rollback,
+        runtime_session_id=resume_session_id,
     )
 
     # Resume session
     if args.resume:
         canonical_ids = resume_store.list_session_ids() if resume_store is not None else []
-        session_id = (
-            resume_session_id
-            if canonical_ids
-            else get_latest_session_id()
-        )
+        session_id = resume_session_id if canonical_ids else None
         if session_id:
             session = load_session(
                 session_id,
                 runtime_store=resume_store,
-                canonical_first=bool(canonical_ids),
             )
             if session:
                 agent.restore_session({

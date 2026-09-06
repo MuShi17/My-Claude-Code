@@ -1,13 +1,12 @@
 """Provider-neutral canonical runtime event domain model.
 
 This module deliberately contains no file, SQLite, provider SDK, or Agent
-Loop code.  It is the small value-object boundary shared by the later durable
-store and the legacy shadow adapter.
+Loop code.  It is the small value-object boundary shared by the durable store
+and all canonical projections.
 
 The shape follows Maka's RuntimeEvent split between an immutable event
-envelope and projections, while retaining the Python project's frozen schema
-version and the legacy fixture vocabulary (``kind``, ``call_id`` and ISO
-``timestamp``) at the input boundary.
+envelope and projections.  The input boundary is intentionally strict: only
+the canonical envelope is accepted and legacy field inference is not allowed.
 """
 
 from __future__ import annotations
@@ -20,9 +19,9 @@ from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Any, TypeAlias
 
-from .event_ids import IdentityFactory, RunContext, create_event_id
+from .event_ids import IdentityFactory, RunContext
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SUPPORTED_SCHEMA_VERSIONS = frozenset({SCHEMA_VERSION})
 RUNTIME_EVENT_ROLES = ("user", "model", "tool", "system")
 RUNTIME_EVENT_AUTHORS = ("user", "host", "agent", "tool", "system")
@@ -171,132 +170,6 @@ def _timestamp_ms(value: Any, field: str = "ts") -> int:
     raise RuntimeEventValidationError("must be an integer epoch millisecond", field=field)
 
 
-def _legacy_kind(data: Mapping[str, Any]) -> str | None:
-    kind = data.get("kind")
-    if isinstance(kind, str):
-        return kind
-    content = data.get("content")
-    if isinstance(content, Mapping) and isinstance(content.get("kind"), str):
-        return str(content["kind"])
-    actions = data.get("actions")
-    if isinstance(actions, Mapping):
-        for candidate in ACTION_KINDS:
-            if candidate in actions:
-                return candidate
-    return None
-
-
-def _defaults_for_kind(kind: str) -> tuple[str, str]:
-    if kind in {"text", "thinking", "function_call"}:
-        return "model", "agent"
-    if kind in {"function_response", "tool_outcome"}:
-        return "tool", "tool"
-    if kind == "permission":
-        return "system", "system"
-    if kind in {"invocation_opened", "tool_dispatch", "compaction", "error"}:
-        return "system", "system"
-    return "system", "system"
-
-
-def _normalise_legacy(data: Mapping[str, Any]) -> dict[str, Any]:
-    """Accept C02 fixture/legacy vocabulary and produce the frozen envelope."""
-
-    source = dict(data)
-    kind = _legacy_kind(source)
-    if kind is None:
-        return source
-    role, author = _defaults_for_kind(kind)
-    def value_or(name: str, fallback: Any) -> Any:
-        value = source.get(name)
-        return fallback if value is None else value
-
-    output: dict[str, Any] = {
-        "schema_version": source.get("schema_version", SCHEMA_VERSION),
-        "id": value_or("id", value_or("event_id", create_event_id())),
-        "invocation_id": value_or("invocation_id", value_or("request_id", "legacy-invocation")),
-        "run_id": value_or("run_id", "legacy-run"),
-        "session_id": value_or("session_id", "legacy-session"),
-        "turn_id": value_or("turn_id", "legacy-turn"),
-        "ts": source.get("ts", source.get("timestamp")),
-        "partial": source.get("partial", False),
-        "role": source.get("role", role),
-        "author": source.get("author", author),
-    }
-    for field in ("branch", "parent_run_id", "origin", "model_visibility", "status"):
-        if field in source:
-            output[field] = source[field]
-    metadata: dict[str, Any] = dict(source.get("metadata") or {})
-    if source.get("provider") is not None:
-        metadata.setdefault("provider", source["provider"])
-    # A canonical event already has its semantic kind in content/actions and
-    # its lifecycle in metadata.  Add the compatibility marker only while
-    # translating the old top-level ``kind`` vocabulary; otherwise a second
-    # round-trip would incorrectly turn tool_outcome into function_response.
-    if "kind" in source or "timestamp" in source:
-        metadata.setdefault("legacy_kind", kind)
-    if metadata:
-        output["metadata"] = metadata
-
-    if "content" in source and isinstance(source["content"], Mapping):
-        output["content"] = dict(source["content"])
-    elif kind == "text":
-        output["content"] = {"kind": "text", "text": source.get("text", "")}
-    elif kind == "thinking":
-        output["content"] = {"kind": "thinking", "text": source.get("text", "")}
-    elif kind == "function_call":
-        output["content"] = {
-            "kind": "function_call",
-            "id": source.get("call_id") or source.get("tool_call_id") or "legacy-call",
-            "name": source.get("name", "unknown"),
-            "args": source.get("arguments", source.get("args", {})),
-        }
-    elif kind in {"function_response", "tool_outcome"}:
-        output["content"] = {
-            "kind": "function_response",
-            "id": source.get("call_id") or source.get("tool_call_id") or "legacy-call",
-            "name": source.get("name", "unknown"),
-            "result": source.get("result", ""),
-            "isError": not bool(source.get("success", True)) if kind == "tool_outcome" else bool(source.get("is_error", False)),
-        }
-    elif kind == "error":
-        output["content"] = {
-            "kind": "error",
-            "message": source.get("message", "runtime error"),
-            "code": source.get("error_type"),
-        }
-    elif kind == "invocation_opened":
-        output["content"] = {"kind": "invocation_opened"}
-
-    actions: dict[str, Any] = dict(source.get("actions") or {})
-    if kind == "permission":
-        actions.setdefault(
-            "permission",
-            {"decision": source.get("decision", "unknown"), "reason": source.get("reason", "")},
-        )
-    elif kind == "tool_dispatch":
-        actions.setdefault(
-            "tool_dispatch",
-            {key: source[key] for key in ("name", "arguments_digest") if key in source},
-        )
-    elif kind == "tool_outcome":
-        actions.setdefault(
-            "tool_outcome",
-            {key: source[key] for key in ("name", "success", "duration_ms", "error_type") if key in source},
-        )
-    elif kind == "compaction":
-        actions.setdefault("compaction", {key: source[key] for key in source if key in {"source_high_water", "source_digest"}})
-    if actions:
-        output["actions"] = actions
-
-    refs: dict[str, Any] = dict(source.get("refs") or {})
-    call_id = source.get("call_id") or source.get("tool_call_id")
-    if call_id is not None:
-        refs.setdefault("tool_call_id", call_id)
-    if refs:
-        output["refs"] = refs
-    return output
-
-
 @dataclass(frozen=True, slots=True)
 class RuntimeEvent:
     """An immutable, provider-neutral runtime fact."""
@@ -337,28 +210,26 @@ class RuntimeEvent:
     def from_dict(cls, value: Mapping[str, Any]) -> "RuntimeEvent":
         if not isinstance(value, Mapping):
             raise RuntimeEventValidationError("event must be an object")
-        data = _normalise_legacy(value)
-        if data.get("ts") is None and data.get("timestamp") is None:
-            raise RuntimeEventValidationError("timestamp is required", field="ts")
-        kwargs = dict(data)
-        if "timestamp" in kwargs and "ts" not in kwargs:
-            kwargs["ts"] = kwargs.pop("timestamp")
-        kwargs.pop("kind", None)
-        # Legacy fixture names are translated into the canonical snake_case
-        # envelope; unknown top-level presentation fields are retained as
-        # metadata only when they are JSON-safe.
-        known = {
-            "schema_version", "id", "invocation_id", "run_id", "session_id", "turn_id", "ts",
-            "timestamp", "partial", "role", "author", "branch", "parent_run_id", "origin",
-            "model_visibility", "status", "content", "actions", "refs", "metadata",
+        required = {
+            "schema_version", "id", "invocation_id", "run_id", "session_id",
+            "turn_id", "ts", "partial", "role", "author",
         }
-        extra = {key: value for key, value in kwargs.items() if key not in known}
-        if extra:
-            metadata = dict(kwargs.get("metadata") or {})
-            metadata.setdefault("source_fields", extra)
-            kwargs["metadata"] = metadata
-        kwargs.pop("timestamp", None)
-        return cls(**kwargs)
+        optional = {
+            "branch", "parent_run_id", "origin", "model_visibility", "status",
+            "content", "actions", "refs", "metadata",
+        }
+        missing = sorted(key for key in required if key not in value)
+        if missing:
+            raise RuntimeEventValidationError(
+                f"missing required fields: {', '.join(missing)}", field="envelope"
+            )
+        unknown = sorted(set(value) - required - optional)
+        if unknown:
+            raise RuntimeEventValidationError(
+                f"legacy or unknown fields are not allowed: {', '.join(unknown)}",
+                field="envelope",
+            )
+        return cls(**dict(value))
 
     @classmethod
     def create(
@@ -400,8 +271,6 @@ class RuntimeEvent:
 
     @property
     def kind(self) -> str | None:
-        if self.metadata and self.metadata.get("legacy_kind"):
-            return str(self.metadata["legacy_kind"])
         if self.metadata and self.metadata.get("lifecycle") in {
             "invocation_opened",
             "usage",
@@ -421,7 +290,10 @@ class RuntimeEvent:
 
     @property
     def is_terminal(self) -> bool:
-        return self.status in TERMINAL_STATUSES or bool(self.actions and self.actions.get("end_run") is True)
+        # Terminality is a typed envelope fact.  ``end_run`` is retained as a
+        # redundant action marker for recovery/display, but can never turn an
+        # otherwise open event into a sealed run.
+        return self.status in TERMINAL_STATUSES
 
     @property
     def is_partial(self) -> bool:
@@ -489,9 +361,17 @@ class RuntimeEvent:
             _identifier(self.branch, "branch")
         if self.status in TERMINAL_STATUSES and self.partial:
             raise RuntimeEventValidationError("terminal event cannot be partial", field="partial")
+        if self.actions and self.actions.get("end_run") is True and self.status not in TERMINAL_STATUSES:
+            raise RuntimeEventValidationError(
+                "end_run requires a terminal status", field="status"
+            )
         if self.content is None and self.actions is None and self.refs is None:
             raise RuntimeEventValidationError("one of content/actions/refs is required", field="payload")
         if self.content is not None:
+            if self.content.get("kind") == "invocation_opened" and self.partial:
+                raise RuntimeEventValidationError(
+                    "opening event cannot be partial", field="partial"
+                )
             self._validate_content(self.content)
         if self.actions is not None:
             if not self.actions:
@@ -527,6 +407,27 @@ class RuntimeEvent:
                 raise RuntimeEventValidationError("function response requires result", field="content.result")
         if kind == "error" and not isinstance(content.get("message"), str):
             raise RuntimeEventValidationError("error content requires message", field="content.message")
+        if kind == "invocation_opened":
+            if content.get("protocol") != "invocation_opened_v1":
+                raise RuntimeEventValidationError(
+                    "opening requires protocol invocation_opened_v1", field="content.protocol"
+                )
+            for field in ("route", "configuration", "root", "source"):
+                value = content.get(field)
+                if not isinstance(value, Mapping) or not value:
+                    raise RuntimeEventValidationError(
+                        "opening requires a non-empty object", field=f"content.{field}"
+                    )
+            source_kind = content["source"].get("kind")
+            if source_kind not in {"fresh", "continuation"}:
+                raise RuntimeEventValidationError(
+                    "source.kind must be fresh or continuation", field="content.source.kind"
+                )
+            root_kind = content["root"].get("kind")
+            if root_kind not in {"user", "agent", "system"}:
+                raise RuntimeEventValidationError(
+                    "root.kind must identify the invocation root", field="content.root.kind"
+                )
 
 
 def is_terminal_runtime_event(event: RuntimeEvent) -> bool:

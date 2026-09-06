@@ -1,8 +1,8 @@
-# Agent Log Canonical Runtime Event：问题清单、修复计划与验收 Gate
+# （历史）Agent Log Canonical Runtime Event：问题清单、修复计划与验收 Gate
 
-> 状态：整改与 G0-G9 受控验收完成
+> 状态：历史批次整改记录；当前状态以 Canonical-only 批次和最新 Acceptance Report 为准
 >
-> 当前批次结论：隔离 HOME 的 Canonical authority 切换、切换后 smoke 与 rollback 已通过；默认入口仍由显式 flag 控制
+> 历史批次结论：隔离 HOME 的 Canonical authority 切换、切换后 smoke 与 rollback 已通过；当时默认入口仍由显式 flag 控制
 >
 > 依据：两份独立只读验收报告的综合结果
 >
@@ -12,7 +12,7 @@
 
 R-01 至 R-10 的实现、集成测试和 R-11 工件回写已经完成，G0-G8 验收通过。测试全绿仍只证明当前代码与离线/fake-provider 场景满足既定契约，不能替代真实生产 provider、多进程/多实例并发和生产指标验证，也不能自动授权切换 Canonical authority。
 
-在下列条件全部满足前，运行时必须继续保持 `shadow/legacy` 读取路径：
+在历史批次的设计阶段，在下列条件全部满足前，运行时必须继续保持 `shadow/legacy` 读取路径：
 
 1. 所有运行时事件都从真实 Agent Loop 发出并可被 canonical store 接收。
 2. Session、Model Replay、Trace、Compaction、Recovery 均使用 canonical event，而不是仅存在独立 helper。
@@ -20,7 +20,7 @@ R-01 至 R-10 的实现、集成测试和 R-11 工件回写已经完成，G0-G8 
 4. 11 个 change 的 OPSX 工件、批次源文档和验收报告状态一致。
 5. 所有验收 Gate 通过，并取得用户对 Canonical authority 的显式批准。
 
-本文件同时作为整改后的收口记录，不会自动切换 authority，也不替代 G9 所需的用户显式批准。
+本文件只作为历史整改收口和审计追溯记录，不描述当前运行时路由，也不替代最新 Canonical-only 方案。
 
 ## 2. 验收基线
 

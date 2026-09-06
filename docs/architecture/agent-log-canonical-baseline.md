@@ -1,6 +1,8 @@
-# Agent Log Canonical Runtime Event 实施基线
+# Agent Log Canonical Runtime Event 实施基线（历史）
 
 > 本文记录 Item 01 的实施基线和设计参考。它不授权 commit、push、merge、发布、删除数据或清理用户工作区。
+>
+> 当前运行时状态以 Canonical-only 批次和 [Canonical-only Acceptance Report](agent-log-canonical-acceptance-report.md) 为准；本文中的 shadow/cutover 方案是历史记录。
 
 ## 目标仓库
 
@@ -43,10 +45,10 @@ Maka 目录只读，不复制其后续提交的漂移设计。
 
 ## Change 顺序与边界
 
-主 Gate 顺序为：C01 契约与基线 → C02 测试夹具 → C03 legacy correctness → C04 domain/shadow sink → C05 SQLite store → C06 Agent Loop durable boundary → C07 run lifecycle → C08 projections → C09 compaction/artifacts/capture → C10 resume/recovery → C11 parity/cutover。
+历史 Gate 顺序为：C01 契约与基线 → C02 测试夹具 → C03 legacy correctness → C04 domain/shadow sink → C05 SQLite store → C06 Agent Loop durable boundary → C07 run lifecycle → C08 projections → C09 compaction/artifacts/capture → C10 resume/recovery → C11 parity/cutover。当前实现已追加 Canonical-only 清理批次 C12-C18。
 
 C04 与 C05 可以分别在纯领域层和纯存储层开发，但在 C05 不变量通过前，工具执行路径不得依赖 Canonical Store。C08-C10 只能读取已冻结事件语义；如果必须改变历史语义，需提升 `schema_version` 并回到 C01/C04，而不是修改投影来掩盖缺口。
 
 ## 删除与回滚禁令
 
-任何阶段不得删除或原地改写 `runtime.sqlite`、`session.json`、`logs/`、`traces/`、`llm/` 或既有 tool-results。authority rollback 只能改变配置路由；legacy fallback 不得伪造 tool dispatch 或副作用 outcome。
+历史阶段不得删除或原地改写用户数据。当前 Canonical-only 清理同样不删除既有 `logs/`、`traces/`、旧 session、旧根数据库或 tool-results；但已删除运行时对这些格式的读取、写入、fallback 和 authority rollback 代码。

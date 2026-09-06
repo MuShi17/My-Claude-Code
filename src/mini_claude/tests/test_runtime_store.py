@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -55,6 +56,8 @@ def test_store_uses_ordinal_not_timestamp_and_keeps_child_filter_separate(tmp_pa
     with SQLiteRuntimeStore(database) as store:
         results = [store.append(event) for event in events[:3]]
         assert [item.ordinal for item in results] == [1, 2, 3]
+        assert [item.event_seq for item in results] == [1, 2, 3]
+        assert store.run_state(events[0].run_id).last_event_seq == 3
         prefix = store.read_immutable_prefix(session_id=events[0].session_id, high_water=2)
         assert prefix.high_water == 2
         assert list(prefix.events) == events[:2]
@@ -65,13 +68,38 @@ def test_store_uses_ordinal_not_timestamp_and_keeps_child_filter_separate(tmp_pa
         child = RuntimeEvent.from_dict(child_data)
         result = store.append(child)
         assert result.ordinal == 4
+        assert result.event_seq == 4
         assert store.read_events(run_id="child-run") == [child]
+
+
+def test_store_assigns_invocation_sequence_under_concurrent_writers(tmp_path: Path):
+    database = tmp_path / "runtime.sqlite"
+    events = _events()
+    with SQLiteRuntimeStore(database) as store:
+        store.append(events[0])
+
+    def append_one(index: int):
+        payload = events[1].to_dict()
+        payload["id"] = f"concurrent-event-{index}"
+        payload["content"] = {"kind": "text", "text": f"event-{index}"}
+        event = RuntimeEvent.from_dict(payload)
+        with SQLiteRuntimeStore(database, timeout=5) as store:
+            return store.append(event)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(append_one, range(8)))
+
+    assert sorted(result.event_seq for result in results) == list(range(2, 10))
+    assert len({result.ordinal for result in results}) == 8
+    with SQLiteRuntimeStore(database) as store:
+        assert store.run_state(events[0].run_id).last_event_seq == 9
 
 
 def test_store_conflicting_payload_and_terminal_seal_are_explicit(tmp_path: Path):
     database = tmp_path / "runtime.sqlite"
     event = _events()[1]
     with SQLiteRuntimeStore(database) as store:
+        store.append(_events()[0])
         store.append(event)
         conflict = dict(event.to_dict())
         conflict["content"] = {"kind": "text", "text": "different"}
@@ -83,7 +111,7 @@ def test_store_conflicting_payload_and_terminal_seal_are_explicit(tmp_path: Path
         terminal_data["status"] = "completed"
         terminal = RuntimeEvent.from_dict(terminal_data)
         sealed = store.seal_run(terminal)
-        assert sealed.ordinal == 2
+        assert sealed.ordinal == 3
         assert store.run_state(event.run_id).sealed is True
         assert store.append(terminal).idempotent is True
 
@@ -91,6 +119,41 @@ def test_store_conflicting_payload_and_terminal_seal_are_explicit(tmp_path: Path
         after["id"] = "after-terminal"
         with pytest.raises(SealedRunError):
             store.append(RuntimeEvent.from_dict(after))
+
+
+def test_tool_outcome_cannot_cross_run_or_be_recorded_twice(tmp_path: Path):
+    events = _events()
+    with SQLiteRuntimeStore(tmp_path / "runtime.sqlite") as store:
+        store.append(events[0])
+        store.append(events[4])
+        store.append(events[5])
+
+        duplicate = events[5].to_dict()
+        duplicate["id"] = "duplicate-tool-outcome"
+        with pytest.raises(IdempotencyConflictError, match="already recorded"):
+            store.append(RuntimeEvent.from_dict(duplicate))
+
+        foreign_opening = events[0].to_dict()
+        foreign_opening.update(
+            {
+                "id": "foreign-opening",
+                "turn_id": "foreign-turn",
+                "run_id": "foreign-run",
+                "invocation_id": "foreign-invocation",
+            }
+        )
+        store.append(RuntimeEvent.from_dict(foreign_opening))
+        foreign_outcome = events[5].to_dict()
+        foreign_outcome.update(
+            {
+                "id": "foreign-outcome",
+                "turn_id": "foreign-turn",
+                "run_id": "foreign-run",
+                "invocation_id": "foreign-invocation",
+            }
+        )
+        with pytest.raises(IdempotencyConflictError, match="identity conflict"):
+            store.append(RuntimeEvent.from_dict(foreign_outcome))
 
 
 def test_partial_snapshot_is_bounded_and_recoverable(tmp_path: Path):
@@ -124,3 +187,15 @@ def test_malformed_row_is_not_silently_projected(tmp_path: Path):
         with pytest.raises(CorruptionError, match=event.id):
             store.read_events()
 
+
+def test_event_sequence_gap_is_not_silently_projected(tmp_path: Path):
+    database = tmp_path / "runtime.sqlite"
+    events = _events()
+    with SQLiteRuntimeStore(database) as store:
+        for event in events[:3]:
+            store.append(event)
+        store.connection.execute(
+            "DELETE FROM runtime_events WHERE event_id = ?", (events[1].id,)
+        )
+        with pytest.raises(CorruptionError, match="event sequence gap"):
+            store.read_events()

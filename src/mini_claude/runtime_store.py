@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -13,7 +14,7 @@ from .event_sink import EventSink, EventSinkError
 from .redaction import RedactionPolicy, bound_payload, redact_event_dict
 from .runtime_event import RuntimeEvent, RuntimeEventError, canonical_json_bytes
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class RuntimeStoreError(RuntimeError):
@@ -63,10 +64,35 @@ class StoreFaultError(StoreIOError):
 
 
 @dataclass(frozen=True, slots=True)
+class ToolOperationRecord:
+    operation_id: str
+    session_id: str
+    run_id: str
+    invocation_id: str
+    turn_id: str
+    provider_tool_call_id: str
+    tool_name: str
+    canonical_args_hash: str
+    recovery_mode: str
+    state: str
+    dispatch_event_id: str
+    outcome_event_id: str | None
+    success: bool | None
+    executed: bool | None
+    result: Any
+    result_digest: str | None
+    result_size_bytes: int | None
+    error_type: str | None
+    created_at: str
+    updated_at: str
+
+
+@dataclass(frozen=True, slots=True)
 class AppendResult:
     event: RuntimeEvent
     ordinal: int
     digest: str
+    event_seq: int = 0
     idempotent: bool = False
 
 
@@ -107,6 +133,7 @@ class RunState:
     terminal_event_id: str | None
     terminal_ordinal: int | None
     high_water: int
+    last_event_seq: int = 0
 
 
 def _utc_now() -> str:
@@ -210,6 +237,7 @@ class SQLiteRuntimeStore:
                 CREATE TABLE IF NOT EXISTS runtime_events (
                     event_id TEXT PRIMARY KEY,
                     ordinal INTEGER NOT NULL UNIQUE,
+                    event_seq INTEGER NOT NULL,
                     schema_version INTEGER NOT NULL,
                     session_id TEXT NOT NULL,
                     turn_id TEXT NOT NULL,
@@ -246,7 +274,8 @@ class SQLiteRuntimeStore:
                     sealed INTEGER NOT NULL DEFAULT 0,
                     terminal_event_id TEXT,
                     terminal_ordinal INTEGER,
-                    high_water INTEGER NOT NULL DEFAULT 0
+                    high_water INTEGER NOT NULL DEFAULT 0,
+                    last_event_seq INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS runtime_partial_snapshots (
@@ -295,7 +324,86 @@ class SQLiteRuntimeStore:
                     checkpoint_json BLOB NOT NULL,
                     created_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS runtime_tool_operations (
+                    operation_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    invocation_id TEXT NOT NULL,
+                    turn_id TEXT NOT NULL,
+                    provider_tool_call_id TEXT NOT NULL,
+                    tool_name TEXT NOT NULL,
+                    canonical_args_hash TEXT NOT NULL,
+                    recovery_mode TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    dispatch_event_id TEXT NOT NULL UNIQUE,
+                    outcome_event_id TEXT UNIQUE,
+                    success INTEGER,
+                    executed INTEGER,
+                    result_json BLOB,
+                    result_digest TEXT,
+                    result_size_bytes INTEGER,
+                    error_type TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(invocation_id, provider_tool_call_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_runtime_tool_operations_run_state
+                    ON runtime_tool_operations(run_id, state, created_at);
+                CREATE INDEX IF NOT EXISTS idx_runtime_tool_operations_invocation
+                    ON runtime_tool_operations(invocation_id, created_at);
+
+                CREATE TABLE IF NOT EXISTS runtime_tool_journal (
+                    journal_id TEXT PRIMARY KEY,
+                    operation_id TEXT NOT NULL,
+                    event_id TEXT NOT NULL UNIQUE,
+                    event_kind TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    payload_json BLOB NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(operation_id) REFERENCES runtime_tool_operations(operation_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_runtime_tool_journal_operation
+                    ON runtime_tool_journal(operation_id, created_at);
                 """
+            )
+            columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(runtime_events)").fetchall()
+            }
+            if "event_seq" not in columns:
+                connection.execute("ALTER TABLE runtime_events ADD COLUMN event_seq INTEGER")
+                rows = connection.execute(
+                    "SELECT event_id, invocation_id FROM runtime_events ORDER BY ordinal ASC"
+                ).fetchall()
+                counters: dict[str, int] = {}
+                for row in rows:
+                    invocation_id = str(row["invocation_id"])
+                    counters[invocation_id] = counters.get(invocation_id, 0) + 1
+                    connection.execute(
+                        "UPDATE runtime_events SET event_seq = ? WHERE event_id = ?",
+                        (counters[invocation_id], row["event_id"]),
+                    )
+            run_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(runtime_run_state)").fetchall()
+            }
+            if "last_event_seq" not in run_columns:
+                connection.execute(
+                    "ALTER TABLE runtime_run_state ADD COLUMN last_event_seq INTEGER NOT NULL DEFAULT 0"
+                )
+                connection.execute(
+                    """
+                    UPDATE runtime_run_state
+                    SET last_event_seq = COALESCE((
+                        SELECT MAX(event_seq) FROM runtime_events
+                        WHERE runtime_events.run_id = runtime_run_state.run_id
+                    ), 0)
+                    """
+                )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_events_invocation_event_seq "
+                "ON runtime_events(invocation_id, event_seq)"
             )
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             connection.commit()
@@ -323,7 +431,13 @@ class SQLiteRuntimeStore:
             event = RuntimeEvent.from_dict(data)
         except (RuntimeEventError, UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as error:
             raise CorruptionError(f"cannot decode runtime_events event_id={row['event_id']}: {error}") from error
-        if event.id != row["event_id"] or event.digest() != row["digest"]:
+        if (
+            event.id != row["event_id"]
+            or event.session_id != row["session_id"]
+            or event.run_id != row["run_id"]
+            or event.invocation_id != row["invocation_id"]
+            or event.digest() != row["digest"]
+        ):
             raise CorruptionError(f"digest mismatch for runtime_events event_id={row['event_id']}")
         return event
 
@@ -336,7 +450,13 @@ class SQLiteRuntimeStore:
         stored = self._event_from_row(row)
         if stored.digest() != event.digest():
             raise IdempotencyConflictError(f"event id {event.id} has a different payload")
-        return AppendResult(stored, int(row["ordinal"]), row["digest"], idempotent=True)
+        return AppendResult(
+            stored,
+            int(row["ordinal"]),
+            row["digest"],
+            event_seq=int(row["event_seq"]),
+            idempotent=True,
+        )
 
     def append(self, event: RuntimeEvent | Mapping[str, Any]) -> AppendResult:
         try:
@@ -359,14 +479,44 @@ class SQLiteRuntimeStore:
                 connection.rollback()
                 return existing
             state = connection.execute(
-                "SELECT sealed, terminal_event_id, high_water FROM runtime_run_state WHERE run_id = ?",
+                """
+                SELECT session_id, invocation_id, sealed, terminal_event_id, high_water, last_event_seq
+                FROM runtime_run_state WHERE run_id = ?
+                """,
                 (canonical.run_id,),
             ).fetchone()
+            if state is not None and state["session_id"] != canonical.session_id:
+                connection.rollback()
+                raise StoreValidationError(
+                    f"run {canonical.run_id} identity does not match canonical event"
+                )
             if state is not None and bool(state["sealed"]):
                 connection.rollback()
                 raise SealedRunError(
                     f"run {canonical.run_id} is sealed by {state['terminal_event_id']}"
                 )
+            existing_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM runtime_events WHERE invocation_id = ?",
+                    (canonical.invocation_id,),
+                ).fetchone()[0]
+            )
+            if existing_count == 0 and canonical.kind != "invocation_opened":
+                connection.rollback()
+                raise StoreValidationError(
+                    "the first canonical event for an invocation must be invocation_opened"
+                )
+            if existing_count > 0 and canonical.kind == "invocation_opened":
+                connection.rollback()
+                raise StoreValidationError(
+                    "an invocation can have only one opening event"
+                )
+            event_seq = int(
+                connection.execute(
+                    "SELECT COALESCE(MAX(event_seq), 0) + 1 FROM runtime_events WHERE invocation_id = ?",
+                    (canonical.invocation_id,),
+                ).fetchone()[0]
+            )
             ordinal = int(
                 connection.execute("SELECT COALESCE(MAX(ordinal), 0) + 1 FROM runtime_events").fetchone()[0]
             )
@@ -374,14 +524,15 @@ class SQLiteRuntimeStore:
             connection.execute(
                 """
                 INSERT INTO runtime_events(
-                    event_id, ordinal, schema_version, session_id, turn_id, run_id,
+                    event_id, ordinal, event_seq, schema_version, session_id, turn_id, run_id,
                     invocation_id, parent_run_id, ts, partial, terminal, digest,
                     event_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     canonical.id,
                     ordinal,
+                    event_seq,
                     canonical.schema_version,
                     canonical.session_id,
                     canonical.turn_id,
@@ -410,7 +561,8 @@ class SQLiteRuntimeStore:
                     INSERT INTO runtime_run_state(
                         run_id, session_id, invocation_id, parent_run_id, status,
                         sealed, terminal_event_id, terminal_ordinal, high_water
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        , last_event_seq
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         canonical.run_id,
@@ -422,6 +574,7 @@ class SQLiteRuntimeStore:
                         canonical.id if canonical.is_terminal else None,
                         ordinal if canonical.is_terminal else None,
                         ordinal,
+                        event_seq,
                     ),
                 )
             else:
@@ -432,7 +585,8 @@ class SQLiteRuntimeStore:
                         sealed = CASE WHEN ? THEN 1 ELSE sealed END,
                         terminal_event_id = CASE WHEN ? THEN ? ELSE terminal_event_id END,
                         terminal_ordinal = CASE WHEN ? THEN ? ELSE terminal_ordinal END,
-                        high_water = ?
+                        high_water = ?,
+                        last_event_seq = ?
                     WHERE run_id = ?
                     """,
                     (
@@ -444,12 +598,14 @@ class SQLiteRuntimeStore:
                         int(canonical.is_terminal),
                         ordinal,
                         ordinal,
+                        event_seq,
                         canonical.run_id,
                     ),
                 )
+            self._apply_tool_operation(connection, canonical, ordinal=ordinal, created_at=now)
             self._fault("store.commit")
             connection.commit()
-            return AppendResult(canonical, ordinal, digest, idempotent=False)
+            return AppendResult(canonical, ordinal, digest, event_seq=event_seq, idempotent=False)
         except (SealedRunError, IdempotencyConflictError, StoreFaultError, RuntimeStoreError):
             if connection.in_transaction:
                 connection.rollback()
@@ -468,6 +624,188 @@ class SQLiteRuntimeStore:
             if connection.in_transaction:
                 connection.rollback()
             raise StoreIOError(f"SQLite append failed: {error}") from error
+
+    @staticmethod
+    def _apply_tool_operation(
+        connection: sqlite3.Connection,
+        event: RuntimeEvent,
+        *,
+        ordinal: int,
+        created_at: str,
+    ) -> None:
+        """Project operation state inside the same transaction as its event."""
+
+        actions = event.actions or {}
+        dispatch = actions.get("tool_dispatch")
+        outcome = actions.get("tool_outcome")
+        if dispatch is not None:
+            if not isinstance(dispatch, Mapping):
+                raise StoreValidationError("tool_dispatch action must be an object")
+            refs = event.refs or {}
+            operation_id = dispatch.get("operation_id") or refs.get("operation_id")
+            provider_call_id = dispatch.get("provider_tool_call_id") or refs.get("tool_call_id")
+            tool_name = dispatch.get("tool_name") or dispatch.get("name")
+            args_hash = dispatch.get("canonical_args_hash") or dispatch.get("arguments_digest")
+            recovery_mode = dispatch.get("recovery_mode", "manual_on_unknown")
+            values = {
+                "operation_id": operation_id,
+                "provider_tool_call_id": provider_call_id,
+                "tool_name": tool_name,
+                "canonical_args_hash": args_hash,
+                "recovery_mode": recovery_mode,
+            }
+            missing = [key for key, value in values.items() if not isinstance(value, str) or not value.strip()]
+            if missing:
+                raise StoreValidationError(
+                    "tool_dispatch requires " + ", ".join(missing)
+                )
+            existing = connection.execute(
+                "SELECT * FROM runtime_tool_operations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            by_call = connection.execute(
+                "SELECT * FROM runtime_tool_operations "
+                "WHERE invocation_id = ? AND provider_tool_call_id = ?",
+                (event.invocation_id, provider_call_id),
+            ).fetchone()
+            identity = (
+                event.session_id,
+                event.run_id,
+                event.invocation_id,
+                event.turn_id,
+                provider_call_id,
+                tool_name,
+                args_hash,
+                recovery_mode,
+            )
+            if existing is not None or by_call is not None:
+                row = existing or by_call
+                stored_identity = (
+                    row["session_id"], row["run_id"], row["invocation_id"], row["turn_id"],
+                    row["provider_tool_call_id"], row["tool_name"],
+                    row["canonical_args_hash"], row["recovery_mode"],
+                )
+                if row["operation_id"] != operation_id or stored_identity != identity:
+                    raise IdempotencyConflictError(
+                        f"tool operation identity conflict for {provider_call_id}"
+                    )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO runtime_tool_operations(
+                        operation_id, session_id, run_id, invocation_id, turn_id,
+                        provider_tool_call_id, tool_name, canonical_args_hash,
+                        recovery_mode, state, dispatch_event_id, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'dispatched', ?, ?, ?)
+                    """,
+                    (
+                        operation_id, event.session_id, event.run_id, event.invocation_id,
+                        event.turn_id, provider_call_id, tool_name, args_hash,
+                        recovery_mode, event.id, created_at, created_at,
+                    ),
+                )
+            connection.execute(
+                """
+                INSERT INTO runtime_tool_journal(
+                    journal_id, operation_id, event_id, event_kind, state, payload_json, created_at
+                ) VALUES (?, ?, ?, 'dispatch', 'dispatched', ?, ?)
+                """,
+                (
+                    f"tool-journal:{event.id}", operation_id, event.id,
+                    canonical_json_bytes({"ordinal": ordinal, "action": dispatch}), created_at,
+                ),
+            )
+
+        if outcome is None:
+            return
+        if not isinstance(outcome, Mapping):
+            raise StoreValidationError("tool_outcome action must be an object")
+        refs = event.refs or {}
+        operation_id = outcome.get("operation_id") or refs.get("operation_id")
+        if not isinstance(operation_id, str) or not operation_id.strip():
+            return
+        row = connection.execute(
+            "SELECT * FROM runtime_tool_operations WHERE operation_id = ?", (operation_id,)
+        ).fetchone()
+        if row is None:
+            raise StoreValidationError(f"tool outcome has no durable dispatch: {operation_id}")
+        success = outcome.get("success")
+        executed = outcome.get("executed")
+        if not isinstance(success, bool) or not isinstance(executed, bool):
+            raise StoreValidationError("tool_outcome requires boolean success and executed")
+        content = event.content or {}
+        result = content.get("result") if isinstance(content, Mapping) else None
+        provider_call_id = (
+            outcome.get("provider_tool_call_id")
+            or (content.get("id") if isinstance(content, Mapping) else None)
+            or refs.get("tool_call_id")
+        )
+        tool_name = (
+            outcome.get("tool_name")
+            or outcome.get("name")
+            or (content.get("name") if isinstance(content, Mapping) else None)
+        )
+        if not isinstance(provider_call_id, str) or not provider_call_id.strip():
+            raise StoreValidationError("tool_outcome requires provider_tool_call_id")
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            raise StoreValidationError("tool_outcome requires tool_name")
+        stored_identity = (
+            row["session_id"],
+            row["run_id"],
+            row["invocation_id"],
+            row["turn_id"],
+            row["provider_tool_call_id"],
+            row["tool_name"],
+        )
+        outcome_identity = (
+            event.session_id,
+            event.run_id,
+            event.invocation_id,
+            event.turn_id,
+            provider_call_id,
+            tool_name,
+        )
+        if stored_identity != outcome_identity:
+            raise IdempotencyConflictError(
+                f"tool outcome identity conflict for operation {operation_id}"
+            )
+        result_json = canonical_json_bytes(result)
+        result_digest = "sha256:" + hashlib.sha256(result_json).hexdigest()
+        state = "completed" if success else ("denied" if not executed else "failed")
+        error_type = outcome.get("error_type")
+        if error_type is not None and not isinstance(error_type, str):
+            raise StoreValidationError("tool_outcome error_type must be a string")
+        if row["state"] in {"completed", "failed", "denied", "cancelled"}:
+            # A different event id is a second outcome fact, even when its
+            # payload happens to match.  Exact re-submission is handled by
+            # append's event-id/digest idempotency check before this method.
+            raise IdempotencyConflictError(
+                f"tool outcome already recorded for operation {operation_id}"
+            )
+        connection.execute(
+            """
+            UPDATE runtime_tool_operations
+            SET state = ?, outcome_event_id = COALESCE(outcome_event_id, ?),
+                success = ?, executed = ?, result_json = ?, result_digest = ?,
+                result_size_bytes = ?, error_type = ?, updated_at = ?
+            WHERE operation_id = ?
+            """,
+            (
+                state, event.id, int(success), int(executed), result_json, result_digest,
+                len(result_json), error_type, created_at, operation_id,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO runtime_tool_journal(
+                journal_id, operation_id, event_id, event_kind, state, payload_json, created_at
+            ) VALUES (?, ?, ?, 'outcome', ?, ?, ?)
+            """,
+            (
+                f"tool-journal:{event.id}", operation_id, event.id, state,
+                canonical_json_bytes({"ordinal": ordinal, "action": outcome}), created_at,
+            ),
+        )
 
     emit = append
 
@@ -496,6 +834,105 @@ class SQLiteRuntimeStore:
             self._raise_sqlite(error, operation="read")
             raise AssertionError("unreachable")
 
+    @staticmethod
+    def _tool_operation_from_row(row: sqlite3.Row) -> ToolOperationRecord:
+        result = None
+        if row["result_json"] is not None:
+            try:
+                raw = row["result_json"]
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8")
+                result = json.loads(raw)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise CorruptionError(
+                    f"cannot decode tool operation {row['operation_id']} result: {error}"
+                ) from error
+        return ToolOperationRecord(
+            operation_id=str(row["operation_id"]),
+            session_id=str(row["session_id"]),
+            run_id=str(row["run_id"]),
+            invocation_id=str(row["invocation_id"]),
+            turn_id=str(row["turn_id"]),
+            provider_tool_call_id=str(row["provider_tool_call_id"]),
+            tool_name=str(row["tool_name"]),
+            canonical_args_hash=str(row["canonical_args_hash"]),
+            recovery_mode=str(row["recovery_mode"]),
+            state=("outcome_unknown" if row["state"] == "dispatched" else str(row["state"])),
+            dispatch_event_id=str(row["dispatch_event_id"]),
+            outcome_event_id=str(row["outcome_event_id"]) if row["outcome_event_id"] else None,
+            success=None if row["success"] is None else bool(row["success"]),
+            executed=None if row["executed"] is None else bool(row["executed"]),
+            result=result,
+            result_digest=str(row["result_digest"]) if row["result_digest"] else None,
+            result_size_bytes=(
+                int(row["result_size_bytes"]) if row["result_size_bytes"] is not None else None
+            ),
+            error_type=str(row["error_type"]) if row["error_type"] else None,
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def read_tool_operation(self, operation_id: str) -> ToolOperationRecord | None:
+        self._ensure_open()
+        row = self.connection.execute(
+            "SELECT * FROM runtime_tool_operations WHERE operation_id = ?", (operation_id,)
+        ).fetchone()
+        return self._tool_operation_from_row(row) if row is not None else None
+
+    def read_tool_operation_for_call(
+        self, invocation_id: str, provider_tool_call_id: str
+    ) -> ToolOperationRecord | None:
+        self._ensure_open()
+        row = self.connection.execute(
+            "SELECT * FROM runtime_tool_operations "
+            "WHERE invocation_id = ? AND provider_tool_call_id = ?",
+            (invocation_id, provider_tool_call_id),
+        ).fetchone()
+        return self._tool_operation_from_row(row) if row is not None else None
+
+    def read_tool_operations(
+        self, *, run_id: str | None = None, invocation_id: str | None = None
+    ) -> list[ToolOperationRecord]:
+        self._ensure_open()
+        clauses: list[str] = []
+        params: list[str] = []
+        if run_id is not None:
+            clauses.append("run_id = ?")
+            params.append(run_id)
+        if invocation_id is not None:
+            clauses.append("invocation_id = ?")
+            params.append(invocation_id)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.connection.execute(
+            f"SELECT * FROM runtime_tool_operations{where} ORDER BY created_at, operation_id",
+            params,
+        ).fetchall()
+        return [self._tool_operation_from_row(row) for row in rows]
+
+    def mark_unknown_tool_operations(self, *, run_id: str | None = None) -> int:
+        """Materialize the conservative recovery state for dispatch-only operations."""
+
+        self._ensure_open()
+        where = "WHERE state = 'dispatched'"
+        params: tuple[str, ...] = ()
+        if run_id is not None:
+            where += " AND run_id = ?"
+            params = (run_id,)
+        connection = self.connection
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                f"UPDATE runtime_tool_operations SET state = 'outcome_unknown', updated_at = ? {where}",
+                (_utc_now(), *params),
+            )
+            connection.commit()
+            return int(cursor.rowcount)
+        except sqlite3.Error as error:
+            if connection.in_transaction:
+                connection.rollback()
+            self._raise_sqlite(error, operation="tool recovery")
+            raise AssertionError("unreachable")
+
     def read_event_records(
         self,
         *,
@@ -510,6 +947,7 @@ class SQLiteRuntimeStore:
 
         connection = self._ensure_open()
         self._fault("store.corrupt_read")
+        self._validate_event_sequences(connection)
         clauses: list[str] = []
         parameters: list[Any] = []
         for field, value in (
@@ -536,6 +974,31 @@ class SQLiteRuntimeStore:
         except sqlite3.Error as error:
             self._raise_sqlite(error, operation="read")
             raise AssertionError("unreachable")
+
+    @staticmethod
+    def _validate_event_sequences(connection: sqlite3.Connection) -> None:
+        """Reject a ledger with a missing or duplicated invocation sequence."""
+
+        rows = connection.execute(
+            "SELECT invocation_id, event_seq FROM runtime_events "
+            "ORDER BY invocation_id ASC, event_seq ASC"
+        ).fetchall()
+        expected: dict[str, int] = {}
+        for row in rows:
+            invocation_id = str(row["invocation_id"])
+            try:
+                sequence = int(row["event_seq"])
+            except (TypeError, ValueError) as error:
+                raise CorruptionError(
+                    f"invalid event_seq for invocation {invocation_id}"
+                ) from error
+            next_sequence = expected.get(invocation_id, 0) + 1
+            if sequence != next_sequence:
+                raise CorruptionError(
+                    f"event sequence gap for invocation {invocation_id}: "
+                    f"expected {next_sequence}, got {sequence}"
+                )
+            expected[invocation_id] = sequence
 
     def high_water(
         self, *, session_id: str | None = None, run_id: str | None = None
@@ -590,6 +1053,7 @@ class SQLiteRuntimeStore:
             terminal_event_id=row["terminal_event_id"],
             terminal_ordinal=row["terminal_ordinal"],
             high_water=int(row["high_water"]),
+            last_event_seq=int(row["last_event_seq"]),
         )
 
     def list_run_states(self) -> list[RunState]:
@@ -1013,5 +1477,6 @@ __all__ = [
     "StoreFaultError",
     "StoreIOError",
     "StoreValidationError",
+    "ToolOperationRecord",
     "RuntimeStoreError",
 ]

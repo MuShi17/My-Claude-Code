@@ -46,13 +46,12 @@ from .ui import (
     start_spinner,
     stop_spinner,
 )
-from .session import runtime_store_path, save_session, save_session_v2
+from .session import runtime_store_path, save_session_v2
 from .prompt import build_system_prompt
 from .subagent import get_sub_agent_config
 from .mcp_client import McpManager
-from .logger import AgentLogger
 from .event_ids import RunContext
-from .event_sink import CompositeEventSink, EventSink, LegacyShadowSink, RuntimeEventEmitter
+from .event_sink import EventSink, RuntimeEventEmitter
 from .runtime_event import RuntimeEvent
 from .runtime_lifecycle import DurableToolBoundary, ModelCallRecorder
 from .runtime_store import SQLiteRuntimeStore
@@ -62,7 +61,6 @@ from .projections.model_replay_projection import ModelReplayProjection
 from .projections.provider_context import CanonicalModelContextAdapter
 from .artifact_archive import ArtifactArchive
 from .llm_capture import LLMCaptureManager, LLMCapturePolicy
-from .cutover import AuthorityConfig, select_event_sink
 
 # ─── 指数退避重试 ──────────────────────────────────────────
 # 对 429（限流）、503/529（过载）、网络错误进行最多 3 次重试，
@@ -289,17 +287,13 @@ class Agent:
         custom_system_prompt: str | None = None,
         custom_tools: list[ToolDef] | None = None,
         is_sub_agent: bool = False,
-        logger: AgentLogger | None = None,
         runtime_store: SQLiteRuntimeStore | None = None,
         runtime_sink: EventSink | None = None,
-        enable_legacy_shadow: bool = True,
         runtime_parent_run_id: str | None = None,
         runtime_run_id: str | None = None,
+        runtime_session_id: str | None = None,
         artifact_archive: ArtifactArchive | None = None,
         llm_capture_policy: LLMCapturePolicy | None = None,
-        runtime_authority: str = "shadow",
-        runtime_authority_approved: bool = False,
-        runtime_rollback: bool = False,
     ):
         self.permission_mode = permission_mode
         self.thinking_effort = _normalize_thinking_effort(thinking_effort)
@@ -311,7 +305,6 @@ class Agent:
         self.model = model
         self.use_openai = bool(api_base)
         self.is_sub_agent = is_sub_agent
-        self._logger = logger
         self._runtime_store = runtime_store
         self._runtime_sink = runtime_sink
         self._runtime_emitter: RuntimeEventEmitter | None = None
@@ -319,7 +312,6 @@ class Agent:
         self._runtime_recorder: ModelCallRecorder | None = None
         self._runtime_boundary: DurableToolBoundary | None = None
         self._runtime_store_owned = False
-        self._enable_legacy_shadow = enable_legacy_shadow
         self._runtime_parent_run_id = runtime_parent_run_id
         self._runtime_run_id = runtime_run_id
         self._runtime_guard: RunStateGuard | None = None
@@ -328,16 +320,13 @@ class Agent:
         self._artifact_archive = artifact_archive
         self._llm_capture_policy = llm_capture_policy or LLMCapturePolicy()
         self._llm_capture_manager: LLMCaptureManager | None = None
-        self._runtime_authority = runtime_authority
-        self._runtime_authority_approved = runtime_authority_approved
-        self._runtime_rollback = runtime_rollback
         self.tools = custom_tools or tool_definitions
         self.max_cost_usd = max_cost_usd
         self.max_turns = max_turns
         self.confirm_fn = confirm_fn
         # 有效上下文窗口 = 模型窗口 - 20K 留白（给 system prompt + output）
         self.effective_window = _get_context_window(model) - 20000
-        self.session_id = uuid.uuid4().hex[:8]
+        self.session_id = runtime_session_id or uuid.uuid4().hex[:8]
         self.session_start_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
         # Token 累计统计
@@ -443,7 +432,7 @@ class Agent:
                 pass  # 观测错误不影响主流程
 
     def _setup_runtime_facade(self) -> None:
-        """Create the canonical facade for one ask after the legacy ask opens."""
+        """Create the canonical facade for one canonical invocation."""
 
         if self._runtime_emitter is not None and not self._runtime_store_owned:
             # A caller-owned sink/store remains available across asks.
@@ -454,7 +443,7 @@ class Agent:
                     runtime_store_path(self.session_id)
                 )
                 self._runtime_store_owned = True
-            canonical: EventSink = self._runtime_sink or self._runtime_store  # type: ignore[assignment]
+            canonical: EventSink = self._runtime_store or self._runtime_sink  # type: ignore[assignment]
             if canonical is None:
                 raise RuntimeError("runtime facade requires a canonical sink")
             if self._artifact_archive is None:
@@ -467,18 +456,7 @@ class Agent:
                 archive=self._artifact_archive,
                 runtime_store=self._runtime_store,
             )
-            legacy = LegacyShadowSink(self._logger) if self._enable_legacy_shadow and self._logger else None
-            sink: EventSink = select_event_sink(
-                canonical,
-                legacy,
-                AuthorityConfig(
-                    mode=self._runtime_authority,
-                    rollback=self._runtime_rollback,
-                    shadow_enabled=self._enable_legacy_shadow,
-                ),
-                approved=self._runtime_authority_approved,
-            )
-            self._runtime_emitter = RuntimeEventEmitter(sink)
+            self._runtime_emitter = RuntimeEventEmitter(canonical)
 
         self._runtime_context = RunContext(
             session_id=self.session_id,
@@ -530,10 +508,6 @@ class Agent:
         terminal = None
         if self._runtime_guard is not None:
             terminal = self._runtime_guard.budget_exceeded(reason)
-        elif self._runtime_recorder is not None and not getattr(self._runtime_recorder, "_finished", False):
-            # Compatibility for an embedding that supplies a recorder but no
-            # run guard.  Normal Agent chats always take the guard branch.
-            terminal = self._runtime_recorder.budget_exceeded(reason)
         if terminal is not None:
             self._runtime_exit_status = "budget_exceeded"
             self._runtime_exit_reason = reason
@@ -552,10 +526,7 @@ class Agent:
 
         del request_id
         if self._runtime_boundary is None:
-            # Compatibility fallback is used only when an embedding explicitly
-            # disables canonical logging; normal Agent chats always set it up.
-            raw = await self._execute_tool_call(name, inp)
-            return raw, not (isinstance(raw, str) and raw.startswith("Error:")), True
+            raise RuntimeError("canonical durable tool boundary is not initialized")
         result = await self._runtime_boundary.execute(
             call_id=call_id,
             name=name,
@@ -569,22 +540,37 @@ class Agent:
         return result.result, result.success, result.executed
 
     def _emit_runtime_observation(self, event: str, payload: Any) -> None:
-        """Persist non-provider lifecycle observations without using logger APIs."""
+        """Persist non-provider lifecycle observations through the emitter."""
 
         if self._runtime_emitter is None or self._runtime_context is None:
             return
-        if event not in {"compaction"}:
+        if event not in {"chat_start", "chat_error", "first_token", "turn_start", "turn_end", "compaction"}:
             return
         details = dict(payload or {})
-        runtime_event = RuntimeEvent.create(
-            self._runtime_context,
-            role="system",
-            author="system",
-            content={"kind": "invocation_opened"},
-            actions={event: details},
-            ts=int(time.time() * 1000),
-            metadata={"lifecycle": event},
-        )
+        if event == "chat_error":
+            runtime_event = RuntimeEvent.create(
+                self._runtime_context,
+                role="system",
+                author="system",
+                content={
+                    "kind": "error",
+                    "code": "chat_error",
+                    "message": str(details.get("error", "chat failed")),
+                },
+                ts=int(time.time() * 1000),
+                metadata={"lifecycle": event},
+            )
+        else:
+            if event == "chat_start":
+                details = {"started": True}
+            runtime_event = RuntimeEvent.create(
+                self._runtime_context,
+                role="system",
+                author="system",
+                actions={event: details},
+                ts=int(time.time() * 1000),
+                metadata={"lifecycle": event},
+            )
         self._runtime_emitter.emit(runtime_event)
 
     def _emit_canonical_user_event(self, user_message: str) -> None:
@@ -615,11 +601,11 @@ class Agent:
             author="agent",
             actions={"sub_agent": {"name": name, "agent_type": agent_type, "prompt_summary": prompt[:200]}},
             ts=int(time.time() * 1000),
-            metadata={"legacy_kind": "sub_agent", "lifecycle": "child_run_opened"},
+            metadata={"lifecycle": "child_run_opened"},
         )
         self._runtime_emitter.emit(event)
 
-    def _capture_legacy_llm(
+    def _capture_llm(
         self,
         *,
         request_id: str,
@@ -632,15 +618,7 @@ class Agent:
         cache_read_tokens: int | None,
         finish_reason: str,
     ) -> None:
-        """Capture according to policy, then shadow only bounded metadata.
-
-        ``AgentLogger.save_llm_content`` is a raw request/response writer.  It
-        predates ``LLMCaptureManager`` and therefore cannot be called after a
-        policy decision: doing so would bypass ``off`` and ``metadata-only``
-        and would also make ``redacted`` capture unsafe.  The legacy shadow
-        record below is deliberately metadata-only; redacted body storage is
-        owned by ``LLMCaptureManager`` and its artifact archive.
-        """
+        """Capture according to the explicit privacy policy only."""
 
         capture = None
         if self._llm_capture_manager is not None and self._runtime_context is not None:
@@ -660,33 +638,7 @@ class Agent:
             )
             self._emit_llm_capture_observation(request_id, capture)
 
-        if not self._logger or not self._enable_legacy_shadow:
-            return
-
-        capture_status = capture.capture_status if capture is not None else self._llm_capture_policy.mode
-        llm_ref = (
-            capture.llm_ref
-            if capture is not None and capture.capture_status == "saved"
-            else None
-        )
-        record: dict[str, Any] = {
-            "type": "api_response",
-            "request_id": request_id,
-            "latency_ms": latency_ms,
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "cache_read_tokens": cache_read_tokens,
-            "finish_reason": finish_reason,
-            "llm_capture_status": capture_status,
-        }
-        if llm_ref is not None:
-            record["llm_ref"] = llm_ref
-        if capture is not None and capture.error:
-            record["llm_capture_error"] = str(capture.error)[:512]
-        try:
-            self._logger.log_runtime_event(record)
-        except Exception:
-            pass
+        del input_tokens, output_tokens, cache_read_tokens, finish_reason, latency_ms
 
     def _emit_llm_capture_observation(self, request_id: str, capture: Any) -> None:
         if self._runtime_emitter is None or self._runtime_context is None:
@@ -696,7 +648,6 @@ class Agent:
             self._runtime_context,
             role="system",
             author="agent",
-            content={"kind": "invocation_opened"},
             actions={
                 "llm_capture": {
                     "request_id": request_id,
@@ -812,29 +763,6 @@ class Agent:
         self._aborted = False
         self._ask_count += 1
 
-        # 创建观测器（仅主 Agent）
-        tracer: Any = None
-        if self.is_sub_agent:
-            # Child loggers share the parent's open legacy file but still need
-            # an explicit ask boundary; otherwise their events are dropped.
-            if self._logger:
-                self._logger.new_ask()
-        else:
-            from .tracer import SessionTracer
-            if self._logger:
-                self._logger.close()
-            self._logger = AgentLogger(self.session_id, agent_id="main")
-            self._logger.new_ask(self._ask_count)
-            tracer = SessionTracer(self._ask_count, user_message, self._logger)
-            self.on("turn_start", tracer.on_turn_start)
-            self.on("first_token", tracer.on_first_token)
-            self.on("turn_end", tracer.on_turn_end)
-            self.on("tool_start", tracer.on_tool_start)
-            self.on("tool_end", tracer.on_tool_end)
-            self.on("tool_deny", tracer.on_tool_deny)
-            self.on("compaction", tracer.on_compaction)
-            self.on("permission", tracer.on_permission)
-
         self._setup_runtime_facade()
 
         self._emit_canonical_user_event(user_message)
@@ -844,6 +772,7 @@ class Agent:
         self._current_task = asyncio.current_task()
         primary_error: BaseException | None = None
         canonical_failure: Exception | None = None
+        snapshot_saved = False
         try:
             await coro
         except asyncio.CancelledError as error:
@@ -875,32 +804,6 @@ class Agent:
                     self._runtime_exit_status = "failed"
                     self._runtime_exit_reason = f"canonical terminal finalize failed: {error}"
                     print(f"[runtime] terminal finalize failed: {error}", flush=True)
-            # 取消观测订阅 + 写 trace
-            if tracer:
-                for evt, cb in [
-                    ("turn_start", tracer.on_turn_start),
-                    ("first_token", tracer.on_first_token),
-                    ("turn_end", tracer.on_turn_end),
-                    ("tool_start", tracer.on_tool_start),
-                    ("tool_end", tracer.on_tool_end),
-                    ("tool_deny", tracer.on_tool_deny),
-                    ("compaction", tracer.on_compaction),
-                    ("permission", tracer.on_permission),
-                ]:
-                    self.off(evt, cb)
-                try:
-                    tracer.write_ask_summary()
-                except Exception as error:
-                    print(f"[tracer] flush failed: {error}", flush=True)
-            if self._logger:
-                try:
-                    self._logger.flush()
-                except Exception as error:
-                    # Never replace the original model/tool exception with a
-                    # diagnostic sink failure.
-                    print(f"[logger] flush failed: {error}", flush=True)
-                finally:
-                    self._logger.close()
             if self._runtime_emitter:
                 try:
                     self._runtime_emitter.flush()
@@ -911,6 +814,16 @@ class Agent:
                     print(f"[runtime] flush failed: {error}", flush=True)
                 finally:
                     if self._runtime_store_owned:
+                        try:
+                            # The owned SQLite connection is closed below;
+                            # materialize the derived snapshot while the
+                            # canonical source is still readable.
+                            self._auto_save()
+                            snapshot_saved = True
+                        except Exception as error:
+                            canonical_failure = canonical_failure or error
+                            self._runtime_exit_status = "failed"
+                            self._runtime_exit_reason = f"canonical snapshot failed: {error}"
                         try:
                             self._runtime_emitter.close()
                         except Exception as error:
@@ -935,7 +848,8 @@ class Agent:
 
         if not self.is_sub_agent:
             print_divider()
-            self._auto_save()
+            if not snapshot_saved:
+                self._auto_save()
 
     # ─── Sub-Agent 入口 ──────────────────────────────────────
     # 子 Agent 通过 run_once 执行单次任务并返回结果，
@@ -1003,14 +917,12 @@ class Agent:
     def restore_session(self, data: dict) -> None:
         meta = data.get("metadata")
         if meta and meta.get("id"):
-            # Canonical and legacy restores must continue writing events into
-            # the same session namespace on the next ask.
+            # Continuations stay in the same canonical session namespace.
             self.session_id = meta["id"]
             restored_ask_count = meta.get("askCount")
             if restored_ask_count is None:
-                # Canonical v2 snapshots use coverage.turnIds instead of the
-                # legacy askCount field.  Recover the largest completed turn
-                # so the next chat gets a fresh run identity.
+                # Canonical snapshots use coverage.turnIds.  Recover the
+                # largest completed turn so the next chat gets a fresh run.
                 turn_numbers = []
                 coverage = data.get("coverage") or {}
                 for turn_id in coverage.get("turnIds") or []:
@@ -1024,14 +936,9 @@ class Agent:
             # the session namespace, but always allocate a fresh run for the
             # next turn instead of reusing that sealed run identity.
             self._runtime_run_id = None
-        if data.get("source") == "canonical" or data.get("metadata", {}).get("source") == "canonical":
-            self.restore_canonical_context(data.get("canonicalMessages", []))
-            return
-        if data.get("anthropicMessages"):
-            self._anthropic_messages = data["anthropicMessages"]
-        if data.get("openaiMessages"):
-            self._openai_messages = data["openaiMessages"]
-        print_info(f"Session restored ({self._get_message_count()} messages).")
+        if data.get("source") != "canonical" and data.get("metadata", {}).get("source") != "canonical":
+            raise ValueError("session snapshot is not canonical-derived")
+        self.restore_canonical_context(data.get("canonicalMessages", []))
 
     def restore_canonical_context(self, messages: list[dict[str, Any]]) -> None:
         """Restore provider context from a canonical model projection only."""
@@ -1087,15 +994,12 @@ class Agent:
     def _refresh_provider_context_from_canonical(self):
         """Rebuild the provider message array from the canonical event log.
 
-        A caller-owned event sink without a readable store is still supported
-        for lightweight observers and tests; in that case the provider array
-        remains the compatibility context assembled by the loop.  Once a
-        readable canonical store exists, stale provider arrays are never used
-        as the source of the next request.
+        The provider array is a request materialization only.  It is rebuilt
+        from the canonical store before every provider request.
         """
 
         if self._runtime_store is None or not hasattr(self._runtime_store, "read_event_records"):
-            return None
+            raise RuntimeError("canonical runtime store is not initialized")
         context = CanonicalModelContextAdapter().build(
             self._runtime_store,
             provider="openai" if self.use_openai else "anthropic",
@@ -1112,36 +1016,9 @@ class Agent:
         return len(self._openai_messages) if self.use_openai else len(self._anthropic_messages)
 
     def _auto_save(self) -> None:
-        try:
-            canonical_store = self._runtime_store
-            temporary_store = None
-            if canonical_store is None and self._runtime_emitter is None:
-                database = runtime_store_path(self.session_id)
-                if database.exists():
-                    temporary_store = SQLiteRuntimeStore(database)
-                    canonical_store = temporary_store
-            if canonical_store is not None:
-                snapshot = save_session_v2(self.session_id, canonical_store)
-                if snapshot is not None:
-                    if temporary_store is not None:
-                        temporary_store.close()
-                    return
-            if temporary_store is not None:
-                temporary_store.close()
-            save_session(self.session_id, {
-                "metadata": {
-                    "id": self.session_id,
-                    "model": self.model,
-                    "cwd": str(Path.cwd()),
-                    "startTime": self.session_start_time,
-                    "messageCount": self._get_message_count(),
-                    "askCount": self._ask_count,
-                },
-                "anthropicMessages": self._anthropic_messages if not self.use_openai else None,
-                "openaiMessages": self._openai_messages if self.use_openai else None,
-            })
-        except Exception:
-            pass
+        if self._runtime_store is None:
+            raise RuntimeError("canonical runtime store is not initialized")
+        save_session_v2(self.session_id, self._runtime_store)
 
     # ─── 自动压缩 ────────────────────────────────────────────
     # 当上下文利用率超过 85% 时自动触发完整压缩（compact）。
@@ -1249,7 +1126,6 @@ class Agent:
                         self._runtime_context,
                         role="system",
                         author="system",
-                        content={"kind": "invocation_opened"},
                         actions={
                             "compaction": {
                                 "checkpoint_id": checkpoint.checkpoint_id,
@@ -1477,7 +1353,7 @@ class Agent:
                 mime_type="text/plain",
                 encoding="utf-8",
                 scope="tool-result",
-                metadata={"tool_name": tool_name, "legacy_path": False},
+                metadata={"tool_name": tool_name},
             )
             return json.dumps(archived.placeholder(), ensure_ascii=False, sort_keys=True)
         except Exception as error:
@@ -1536,17 +1412,17 @@ class Agent:
                 custom_tools=tools,
                 is_sub_agent=True,
                 permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
-                logger=AgentLogger(self.session_id, agent_id=f"main.skill_{skill_name}", parent_logger=self._logger) if self._logger else None,
                 runtime_store=self._runtime_store,
                 runtime_sink=self._runtime_sink,
                 runtime_parent_run_id=self._runtime_context.run_id if self._runtime_context else None,
                 runtime_run_id=f"run-{self.session_id}-skill-{skill_name}-{uuid.uuid4().hex[:8]}",
-                enable_legacy_shadow=self._enable_legacy_shadow,
+                runtime_session_id=(
+                    self._runtime_context.session_id
+                    if self._runtime_context is not None
+                    else self.session_id
+                ),
                 artifact_archive=self._artifact_archive,
                 llm_capture_policy=self._llm_capture_policy,
-                runtime_authority=self._runtime_authority,
-                runtime_authority_approved=self._runtime_authority_approved,
-                runtime_rollback=self._runtime_rollback,
             )
             try:
                 sub_result = await sub_agent.run_once(inp.get("args") or "Execute this skill task.")
@@ -1704,17 +1580,17 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             custom_tools=config["tools"],
             is_sub_agent=True,
             permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
-            logger=AgentLogger(self.session_id, agent_id=f"main.{agent_type}_1", parent_logger=self._logger) if self._logger else None,
-            runtime_store=self._runtime_store,
-            runtime_sink=self._runtime_sink,
-            runtime_parent_run_id=self._runtime_context.run_id if self._runtime_context else None,
-            runtime_run_id=f"run-{self.session_id}-{agent_type}-{uuid.uuid4().hex[:8]}",
-            enable_legacy_shadow=self._enable_legacy_shadow,
-            artifact_archive=self._artifact_archive,
-            llm_capture_policy=self._llm_capture_policy,
-            runtime_authority=self._runtime_authority,
-            runtime_authority_approved=self._runtime_authority_approved,
-            runtime_rollback=self._runtime_rollback,
+                runtime_store=self._runtime_store,
+                runtime_sink=self._runtime_sink,
+                runtime_parent_run_id=self._runtime_context.run_id if self._runtime_context else None,
+                runtime_run_id=f"run-{self.session_id}-{agent_type}-{uuid.uuid4().hex[:8]}",
+                runtime_session_id=(
+                    self._runtime_context.session_id
+                    if self._runtime_context is not None
+                    else self.session_id
+                ),
+                artifact_archive=self._artifact_archive,
+                llm_capture_policy=self._llm_capture_policy,
         )
 
         try:
@@ -1787,7 +1663,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             if not self.is_sub_agent:
                 start_spinner()
 
-            request_id = AgentLogger.generate_request_id()
+            request_id = uuid.uuid4().hex
             self._current_request_id = request_id
             api_start = time.time()
             self._start_runtime_model_call(request_id, "anthropic", {"messages": self._anthropic_messages})
@@ -1843,11 +1719,11 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 "finish_reason": finish,
             })
 
-            if self._logger or self._llm_capture_manager:
+            if self._llm_capture_manager:
                 latency_ms = int((time.time() - api_start) * 1000)
                 response_dict = {"content": [self._block_to_dict(b) for b in response.content]}
                 usage_dict = {"input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens}
-                self._capture_legacy_llm(
+                self._capture_llm(
                     request_id=request_id,
                     messages=self._anthropic_messages,
                     response=response_dict,
@@ -1997,9 +1873,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                                 self._emit_text("\n")
                                 first_text = False
                                 # ★ 发射 first_token 事件
-                                asyncio.create_task(
-                                    self._emit("first_token", {"is_thinking": False})
-                                )
+                                await self._emit("first_token", {"is_thinking": False})
                             self._emit_text(delta.text)
                             if self._runtime_recorder:
                                 self._runtime_recorder.partial_text(delta.text)
@@ -2009,9 +1883,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                                 self._emit_text("\n")
                                 first_thinking = False
                                 # ★ 发射 first_token 事件
-                                asyncio.create_task(
-                                    self._emit("first_token", {"is_thinking": True})
-                                )
+                                await self._emit("first_token", {"is_thinking": True})
                             self._emit_text(delta.thinking)
                             if self._runtime_recorder:
                                 self._runtime_recorder.partial_text(delta.thinking)
@@ -2101,7 +1973,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             if not self.is_sub_agent:
                 start_spinner()
 
-            request_id = AgentLogger.generate_request_id()
+            request_id = uuid.uuid4().hex
             self._current_request_id = request_id
             api_start = time.time()
             self._start_runtime_model_call(request_id, "openai", {"messages": self._openai_messages})
@@ -2167,8 +2039,8 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 "cache_create_tokens": 0,  # OpenAI 不单独报告创建
                 "finish_reason": finish,
             })
-            if self._logger or self._llm_capture_manager:
-                self._capture_legacy_llm(
+            if self._llm_capture_manager:
+                self._capture_llm(
                     request_id=request_id,
                     messages=self._openai_messages.copy(),
                     response={"choices": [{"message": message}]},
@@ -2362,9 +2234,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 if rc:
                     if not reasoning_content:
                         self._emit_text("\n")
-                        asyncio.create_task(
-                            self._emit("first_token", {"is_thinking": True})
-                        )
+                        await self._emit("first_token", {"is_thinking": True})
                     self._emit_text(rc)
                     if self._runtime_recorder:
                         self._runtime_recorder.partial_text(rc)
@@ -2375,9 +2245,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         stop_spinner()
                         self._emit_text("\n")
                         first_text = False
-                        asyncio.create_task(
-                            self._emit("first_token", {"is_thinking": False})
-                        )
+                        await self._emit("first_token", {"is_thinking": False})
                     self._emit_text(delta.content)
                     if self._runtime_recorder:
                         self._runtime_recorder.partial_text(delta.content)

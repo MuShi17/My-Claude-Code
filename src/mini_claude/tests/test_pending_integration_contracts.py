@@ -1,4 +1,4 @@
-"""Non-silent integration probes reserved for C06-C11."""
+"""Import probes for retained canonical projections."""
 
 from __future__ import annotations
 
@@ -14,15 +14,3 @@ def test_recovery_module_is_importable():
     from mini_claude.recovery import RecoveryProjection
 
     assert RecoveryProjection is not None
-
-
-def test_shadow_parity_module_is_importable():
-    from mini_claude.shadow_parity import ShadowParityReport
-
-    assert ShadowParityReport is not None
-
-
-def test_legacy_shadow_sink_is_importable():
-    from mini_claude.event_sink import LegacyShadowSink
-
-    assert LegacyShadowSink is not None

@@ -274,23 +274,9 @@ class RecoveryProjection:
         return self.scan(store)
 
 
-def classify_legacy_only(data: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Return an explicit readonly legacy classification without inference."""
-
-    return {
-        "status": "legacy-only",
-        "source": "legacy-readonly",
-        "readonly": True,
-        "fabricated_dispatch": False,
-        "diagnostics": [] if data is not None else [{"code": "legacy_missing", "severity": "error"}],
-        "data": dict(data or {}),
-    }
-
-
 __all__ = [
     "RECOVERY_VERSION",
     "RecoveryDiagnostic",
     "RecoveryProjection",
     "RecoveryRecord",
-    "classify_legacy_only",
 ]

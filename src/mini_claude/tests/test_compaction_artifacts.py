@@ -12,7 +12,6 @@ from mini_claude.artifact_archive import (
     ArtifactArchive,
     ArtifactIntegrityError,
     ArtifactSizeLimitError,
-    LegacyToolResultsAdapter,
 )
 from mini_claude.compaction import (
     CheckpointSourceMismatchError,
@@ -196,6 +195,7 @@ def test_projection_keeps_artifact_ref_bounded_and_does_not_write_store(tmp_path
     data["metadata"] = {"lifecycle": "function_response"}
     ref_event = RuntimeEvent.from_dict(data)
     with SQLiteRuntimeStore(tmp_path / "runtime.sqlite") as store:
+        store.append(events[0])
         store.append(events[2])
         store.append(ref_event)
         before = store.current_high_water
@@ -224,16 +224,3 @@ def test_diagnostics_detect_orphan_and_hash_mismatch_without_canonical_rewrite(t
         with pytest.raises(CheckpointSourceMismatchError):
             CompactionCheckpointBuilder().verify(checkpoint, [events[0], events[2]])
         assert store.current_high_water == before + 1
-
-
-def test_legacy_tool_results_are_read_only_and_do_not_overlap_new_archive(tmp_path: Path):
-    legacy = tmp_path / "tool-results"
-    legacy.mkdir()
-    old = legacy / "old.txt"
-    old.write_text("old result", encoding="utf-8")
-    adapter = LegacyToolResultsAdapter(legacy)
-    assert adapter.read(old) == "old result"
-    archive = ArtifactArchive(tmp_path / "artifacts")
-    new = archive.archive("new result", mime_type="text/plain", encoding="utf-8")
-    assert new.ref not in str(old)
-    assert [item.name for item in adapter.list()] == ["old.txt"]

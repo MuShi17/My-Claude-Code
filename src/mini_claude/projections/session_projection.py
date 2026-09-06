@@ -52,7 +52,7 @@ class SessionProjectionResult:
 
 
 class SessionProjection:
-    """Rebuild conversation state without consulting legacy files."""
+    """Rebuild conversation state from canonical events."""
 
     projection_version = PROJECTION_VERSION
 

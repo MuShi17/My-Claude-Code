@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import json
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -10,9 +10,9 @@ import pytest
 import mini_claude.session as session_module
 from mini_claude.artifact_archive import ArtifactArchive
 from mini_claude.compaction import CompactionCheckpointBuilder
-from mini_claude.recovery import RecoveryProjection, classify_legacy_only
+from mini_claude.recovery import RecoveryProjection
 from mini_claude.runtime_event import RuntimeEvent
-from mini_claude.runtime_store import SQLiteRuntimeStore
+from mini_claude.runtime_store import SQLiteRuntimeStore, SchemaVersionError
 from mini_claude.session import (
     CanonicalRecoveryError,
     build_session_v2,
@@ -20,7 +20,6 @@ from mini_claude.session import (
     list_runtime_store_paths,
     load_session,
     runtime_store_path,
-    save_session,
     save_session_v2,
 )
 
@@ -60,8 +59,9 @@ def test_recovery_classifies_terminal_open_partial_and_uncertain(tmp_path: Path)
     with SQLiteRuntimeStore(tmp_path / "partial.sqlite") as store:
         data = events[1].to_dict()
         data.update({"id": "partial-only-c10", "partial": True})
+        store.append(events[0])
         store.append(RuntimeEvent.from_dict(data))
-        assert RecoveryProjection().scan(store)[0].status == "partial-only"
+        assert RecoveryProjection().scan(store)[0].status == "open"
 
     with SQLiteRuntimeStore(tmp_path / "uncertain.sqlite") as store:
         for event in events[:5]:
@@ -115,6 +115,7 @@ def test_corrupt_event_and_artifact_ref_are_diagnostic_only(tmp_path: Path):
     data["metadata"] = {"artifact": placeholder}
     # Runtime ref integrity is diagnosed by recovery when a bounded_ref occurs.
     with SQLiteRuntimeStore(tmp_path / "ref.sqlite") as store:
+        store.append(events[0])
         store.append(RuntimeEvent.from_dict(data))
         result = RecoveryProjection(artifact_archive=archive).scan(store)[0]
         assert any(item.code == "artifact_not_found" for item in result.diagnostics)
@@ -137,9 +138,13 @@ def test_session_v2_is_canonical_derived_and_stale_snapshot_is_not_authority(tmp
         current = build_session_v2(events[0].session_id, store)
         assert current["metadata"]["highWater"] == 3
         assert current["metadata"]["sourceDigest"] != first["metadata"]["sourceDigest"]
-        loaded = load_session(events[0].session_id, runtime_store=store, canonical_first=True)
+        loaded = load_session(events[0].session_id, runtime_store=store)
         assert loaded["metadata"]["highWater"] == 3
-        assert load_session(events[0].session_id)["metadata"]["source"] == "canonical"
+        snapshot_path = tmp_path / "sessions" / events[0].session_id / "session.v2.json"
+        snapshot_path.unlink()
+        rebuilt = load_session(events[0].session_id, runtime_store=store)
+        assert rebuilt["metadata"]["source"] == "canonical"
+        assert snapshot_path.exists()
 
 
 def test_v2_atomic_write_preserves_old_snapshot_on_migration_failure(tmp_path: Path, monkeypatch):
@@ -160,19 +165,16 @@ def test_v2_atomic_write_preserves_old_snapshot_on_migration_failure(tmp_path: P
         assert store.read_events() == [events[0]]
 
 
-def test_legacy_fallback_is_explicit_readonly_and_has_no_fabricated_dispatch(tmp_path: Path, monkeypatch):
+def test_legacy_files_are_inaccessible_and_have_no_fabricated_dispatch(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(session_module, "SESSION_DIR", tmp_path / "sessions")
-    save_session("legacy-session", {
-        "metadata": {"id": "legacy-session"},
-        "anthropicMessages": [{"role": "user", "content": "old"}],
-    })
-    loaded = load_session("legacy-session")
-    assert loaded["metadata"]["source"] == "legacy-readonly"
-    assert loaded["metadata"]["readonly"] is True
-    classified = classify_legacy_only(loaded)
-    assert classified["status"] == "legacy-only"
-    assert classified["fabricated_dispatch"] is False
-    assert list_sessions()[0]["source"] == "legacy-readonly"
+    legacy_dir = tmp_path / "sessions" / "legacy-session"
+    legacy_dir.mkdir(parents=True)
+    (legacy_dir / "session.json").write_text(
+        '{"metadata":{"id":"legacy-session"},"anthropicMessages":[{"role":"user","content":"old"}]}',
+        encoding="utf-8",
+    )
+    assert load_session("legacy-session") is None
+    assert list_sessions() == []
 
 
 def test_checkpoint_source_mismatch_is_safe_diagnostic(tmp_path: Path):
@@ -202,7 +204,7 @@ def test_canonical_corruption_is_raised_and_database_is_retained(tmp_path: Path,
         )
     with SQLiteRuntimeStore(database) as store:
         with pytest.raises(CanonicalRecoveryError) as error:
-            load_session("corrupt-session", runtime_store=store, canonical_first=True)
+            load_session("corrupt-session", runtime_store=store)
     assert error.value.classification == "corrupt"
     assert database.exists()
     with SQLiteRuntimeStore(database) as store:
@@ -210,6 +212,15 @@ def test_canonical_corruption_is_raised_and_database_is_retained(tmp_path: Path,
             "SELECT event_json FROM runtime_events WHERE event_id = ?", (events[0].id,)
         ).fetchone()[0]
     assert raw == b"{broken"
+
+
+def test_future_schema_is_rejected_without_replacing_database(tmp_path: Path):
+    database = tmp_path / "future.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA user_version = 999")
+    with pytest.raises(SchemaVersionError):
+        SQLiteRuntimeStore(database)
+    assert database.exists()
 
 
 def test_runtime_store_paths_are_session_isolated(tmp_path: Path, monkeypatch):
@@ -225,11 +236,20 @@ def test_runtime_store_paths_are_session_isolated(tmp_path: Path, monkeypatch):
         "invocation_id": "invocation-session-two",
     })
     with SQLiteRuntimeStore(runtime_store_path("session-one")) as first:
-        first.append(RuntimeEvent.from_dict({
+        first_event = RuntimeEvent.from_dict({
             **event_one.to_dict(), "session_id": "session-one", "run_id": "run-session-one",
             "turn_id": "turn-session-one", "invocation_id": "invocation-session-one",
-        }))
+        })
+        first.append(first_event)
     with SQLiteRuntimeStore(runtime_store_path("session-two")) as second:
+        second.append(RuntimeEvent.from_dict({
+            **events[0].to_dict(),
+            "id": "session-two-opening",
+            "session_id": "session-two",
+            "run_id": "run-session-two",
+            "turn_id": "turn-session-two",
+            "invocation_id": "invocation-session-two",
+        }))
         second.append(event_two)
 
     paths = list_runtime_store_paths()
@@ -239,3 +259,11 @@ def test_runtime_store_paths_are_session_isolated(tmp_path: Path, monkeypatch):
         assert {event.session_id for event in first.read_events()} == {"session-one"}
     with SQLiteRuntimeStore(runtime_store_path("session-two")) as second:
         assert {event.session_id for event in second.read_events()} == {"session-two"}
+
+    # Pre-isolation locations and flat snapshots are retained as inert files,
+    # but are not discovery candidates for canonical list/latest/resume.
+    (tmp_path / "runtime.sqlite").write_bytes(b"legacy root database")
+    (tmp_path / "sessions" / "flat-session.json").write_text("{}", encoding="utf-8")
+    paths = list_runtime_store_paths()
+    assert tmp_path / "runtime.sqlite" not in paths
+    assert all(path.parent.name in {"session-one", "session-two"} for path in paths)

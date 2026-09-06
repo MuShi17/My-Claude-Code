@@ -5,12 +5,10 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-import hashlib
 from pathlib import Path
 
 import pytest
 
-import mini_claude.logger as logger_module
 import mini_claude.session as session_module
 from mini_claude import __main__ as cli_module
 from mini_claude.agent import Agent
@@ -56,14 +54,13 @@ def test_resume_smoke_uses_isolated_home(tmp_path: Path):
 
 
 @pytest.mark.parametrize("provider", ["anthropic", "openai"])
-def test_cli_fake_provider_covers_one_shot_list_latest_resume_shadow_and_rollback(
+def test_cli_fake_provider_covers_canonical_one_shot_list_latest_and_resume(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], provider: str
 ):
     home = tmp_path / "home"
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     session_root = home / ".mini-claude" / "sessions"
     monkeypatch.setattr(session_module, "SESSION_DIR", session_root)
-    monkeypatch.setattr(logger_module, "SESSION_DIR", session_root)
     monkeypatch.setenv("ANTHROPIC_API_KEY", "fixture-key" if provider == "anthropic" else "")
     monkeypatch.setenv("OPENAI_API_KEY", "fixture-key" if provider == "openai" else "")
     monkeypatch.setenv("PYTHON_DOTENV_DISABLED", "1")
@@ -91,7 +88,7 @@ def test_cli_fake_provider_covers_one_shot_list_latest_resume_shadow_and_rollbac
     monkeypatch.setattr(Agent, "_chat_anthropic", fake_anthropic)
     monkeypatch.setattr(Agent, "_chat_openai", fake_openai)
 
-    args = ["--log-authority", "shadow"]
+    args: list[str] = []
     if provider == "openai":
         args += ["--api-base", "https://fake-provider.invalid/v1"]
     monkeypatch.setattr(sys, "argv", ["mini-claude", *args, "one-shot"])
@@ -102,9 +99,8 @@ def test_cli_fake_provider_covers_one_shot_list_latest_resume_shadow_and_rollbac
     databases = sorted(session_root.glob("*/runtime.sqlite"))
     assert len(databases) == 1
     session_id = databases[0].parent.name
-    legacy_log = session_root / session_id / "logs" / "001.jsonl"
-    assert legacy_log.exists()
-    assert "one-shot" in legacy_log.read_text(encoding="utf-8")
+    assert not (session_root / session_id / "logs").exists()
+    assert (session_root / session_id / "session.v2.json").exists()
 
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
@@ -114,7 +110,7 @@ def test_cli_fake_provider_covers_one_shot_list_latest_resume_shadow_and_rollbac
 
     monkeypatch.setattr(sys, "argv", ["mini-claude", "--latest"])
     cli_module.main()
-    assert f"Latest session: {session_id}" in capsys.readouterr().out
+    assert f"Latest session: {session_id} (canonical)" in capsys.readouterr().out
 
     monkeypatch.setattr(sys, "argv", ["mini-claude", "--resume"])
     cli_module.main()
@@ -124,82 +120,40 @@ def test_cli_fake_provider_covers_one_shot_list_latest_resume_shadow_and_rollbac
         monkeypatch.setenv("ANTHROPIC_API_KEY", "fixture-key")
     else:
         monkeypatch.setenv("OPENAI_API_KEY", "fixture-key")
-    rollback_args = ["--log-rollback"]
+    resume_args = ["--resume"]
     if provider == "openai":
-        rollback_args += ["--api-base", "https://fake-provider.invalid/v1"]
-    monkeypatch.setattr(sys, "argv", ["mini-claude", *rollback_args, "rollback"])
+        resume_args += ["--api-base", "https://fake-provider.invalid/v1"]
+    monkeypatch.setattr(sys, "argv", ["mini-claude", *resume_args, "resume-turn"])
     cli_module.main()
-    capsys.readouterr()
+    assert "fake reply: resume-turn" in capsys.readouterr().out
     assert databases[0].exists()
 
 
-def test_cli_canonical_cutover_and_post_cutover_smoke_preserves_legacy_and_rollback(
+def test_cli_legacy_files_are_ignored_and_old_authority_flags_are_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ):
-    """Execute the approved G9 route in an isolated HOME and verify rollback."""
-
     home = tmp_path / "home"
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     session_root = home / ".mini-claude" / "sessions"
     monkeypatch.setattr(session_module, "SESSION_DIR", session_root)
-    monkeypatch.setattr(logger_module, "SESSION_DIR", session_root)
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "fixture-key")
-    monkeypatch.setenv("PYTHON_DOTENV_DISABLED", "1")
+    legacy_dir = session_root / "legacy-session"
+    legacy_dir.mkdir(parents=True)
+    (legacy_dir / "session.json").write_text(
+        '{"metadata":{"id":"legacy-session"}}', encoding="utf-8"
+    )
+    (session_root / "flat-session.json").write_text("{}", encoding="utf-8")
+    (home / ".mini-claude" ).mkdir(parents=True, exist_ok=True)
+    (home / ".mini-claude" / "runtime.sqlite").write_bytes(b"old root")
 
-    async def fake_anthropic(self: Agent, user_message: str) -> None:
-        self._runtime_emitter.emit(RuntimeEvent.create(
-            self._runtime_context,
-            role="model",
-            author="agent",
-            content={"kind": "text", "text": f"canonical reply: {user_message}"},
-            metadata={"lifecycle": "model_final", "provider": "anthropic"},
-        ))
-        self._emit_text(f"canonical reply: {user_message}")
-
-    monkeypatch.setattr(Agent, "_chat_anthropic", fake_anthropic)
-
-    monkeypatch.setattr(sys, "argv", [
-        "mini-claude", "--log-authority", "shadow", "before-cutover"
-    ])
-    cli_module.main()
-    assert "canonical reply: before-cutover" in capsys.readouterr().out
-
-    database = next(session_root.glob("*/runtime.sqlite"))
-    session_id = database.parent.name
-    legacy_log = session_root / session_id / "logs" / "001.jsonl"
-    legacy_before = hashlib.sha256(legacy_log.read_bytes()).hexdigest()
-    canonical_before = database.read_bytes()
-
-    monkeypatch.setattr(sys, "argv", [
-        "mini-claude", "--resume", "--log-authority", "canonical",
-        "--approve-canonical", "after-cutover",
-    ])
-    cli_module.main()
-    assert "canonical reply: after-cutover" in capsys.readouterr().out
-    assert database.read_bytes() != canonical_before
-    assert hashlib.sha256(legacy_log.read_bytes()).hexdigest() == legacy_before
-
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.setattr(sys, "argv", ["mini-claude", "--list"])
     cli_module.main()
-    assert session_id in capsys.readouterr().out
+    assert "No previous sessions found." in capsys.readouterr().out
 
     monkeypatch.setattr(sys, "argv", ["mini-claude", "--latest"])
     cli_module.main()
-    assert f"Latest session: {session_id}" in capsys.readouterr().out
+    assert "No previous sessions found." in capsys.readouterr().out
 
-    monkeypatch.setattr(sys, "argv", ["mini-claude", "--resume"])
-    cli_module.main()
-    assert "Canonical session available" in capsys.readouterr().out
-
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "fixture-key")
-    monkeypatch.setattr(sys, "argv", [
-        "mini-claude", "--resume", "--log-rollback", "after-rollback"
-    ])
-    cli_module.main()
-    assert "canonical reply: after-rollback" in capsys.readouterr().out
-    assert database.exists()
-    assert any(
-        "after-rollback" in path.read_text(encoding="utf-8")
-        for path in (session_root / session_id / "logs").glob("*.jsonl")
-    )
+    monkeypatch.setattr(sys, "argv", ["mini-claude", "--log-authority", "shadow"])
+    with pytest.raises(SystemExit) as error:
+        cli_module.main()
+    assert error.value.code == 2

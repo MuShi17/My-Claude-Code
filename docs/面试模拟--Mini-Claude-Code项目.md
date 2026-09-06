@@ -93,15 +93,15 @@ MiniClaudeCode：基于Harness Engineering的Coding Agent CLI
 **项目描述**: 基于 Observer 模式的事件驱动观测体系，全链路埋点记录 Agent 运行指标。
 
 **你的回答**:
-> Agent 的两个后端（Anthropic / OpenAI）在核心循环的关键节点发射事件：turn_start、first_token、turn_end、tool_start、tool_end、compaction、permission。SessionTracer 订阅这些事件，在每次 ask 中累积指标，结束后序列化为 JSONL trace 文件。
+> Agent 的两个后端（Anthropic / OpenAI）在核心循环的关键节点向 Canonical RuntimeEvent ledger 发射事件：turn_start、first_token、turn_end、tool_start、tool_outcome、compaction、permission。Metrics Projection 从 Canonical Events 重建首 token 延迟、Token 用量、工具调用耗时、重试和终态等指标，并与 Session/Model Replay/Recovery 共享同一事实源。
 >
-> 每条 trace 包含两层数据：ask 概览行（总耗时、总 Token、总工具调用次数）+ 每轮 turn 明细行（首Token延迟、输入/输出 Token、缓存读取量、工具调用详情和耗时、是否触发压缩）。文件按 `traces/{ask_index:03d}.jsonl` 组织，便于按对话轮次回溯。
+> 这些指标不再依赖独立 trace 文件；Session、Metrics 和 Trace 都是可删除、可重建的 projection，Canonical SQLite ledger 记录事件顺序、工具 durable boundary 和 terminal seal。
 
 **追问 — 为什么不直接用 logging？**
-> Logging 是文本流，适合人类阅读但不适合结构化分析。JSONL 格式每行是一个独立 JSON 对象，可以直接被 pandas 加载、被 jq 查询、被 benchmark reporter 聚合。目标是让观测数据"可计算"，而不是"可读"。
+> 文本日志无法同时承担不可变事实、事件关联和恢复边界。Canonical 事件使用严格 envelope、session/turn/run/invocation identity、store-assigned ordinal 和 digest；Metrics 等消费者再按需投影为可计算视图。
 
 **追问 — 事件发射会影响 Agent 性能吗？**
-> 基本不会。事件回调是同步/异步兼容的轻量函数调用，trace 写入在 ask 结束后批量完成，不在热路径上。first_token 事件用 `asyncio.create_task` 发射，不阻塞流式输出。
+> 事件提交是同步 durable boundary，确保工具副作用前的 dispatch 已落盘；Provider request 数组只是从 Canonical Replay 物化的临时上下文。代价是必要的 SQLite 写入，但避免了事实丢失、双写不一致和恢复时的隐式重放。
 
 ---
 

@@ -31,6 +31,7 @@ _NON_SEMANTIC_KEYS = {
     # This digest is derived from fixture arguments and therefore changes when
     # a test intentionally swaps one temporary workspace for another.
     "arguments_digest",
+    "canonical_args_hash",
 }
 
 
@@ -128,104 +129,165 @@ def scenario_events(
     ids = ids or DeterministicIdFactory()
     ctx = scenario.context
     call_id = ids.new("call")
+    operation_id = f"operation-{call_id}"
     event_id = lambda: ids.new("event")
-    now = lambda: clock.now().isoformat().replace("+00:00", "Z")
+    now = lambda: int(clock.now().timestamp() * 1000)
+    args_digest = hashlib.sha256(
+        json.dumps(scenario.tool.arguments, sort_keys=True).encode()
+    ).hexdigest()
 
     return [
         {
+            "schema_version": 2,
             "id": event_id(),
-            "timestamp": now(),
+            "ts": now(),
             "session_id": ctx.session_id,
             "turn_id": ctx.turn_id,
             "run_id": ctx.run_id,
             "invocation_id": ctx.invocation_id,
-            "provider": provider,
-            "kind": "invocation_opened",
             "partial": False,
+            "role": "system",
+            "author": "agent",
+            "content": {
+                "kind": "invocation_opened",
+                "protocol": "invocation_opened_v1",
+                "route": {"provider": provider, "model": "fixture-model"},
+                "configuration": {"attempt": 1},
+                "root": {"kind": "agent"},
+                "source": {"kind": "fresh"},
+            },
+            "metadata": {"provider": provider, "model": "fixture-model", "lifecycle": "invocation_opened"},
         },
         {
+            "schema_version": 2,
             "id": event_id(),
-            "timestamp": now(),
+            "ts": now(),
             "session_id": ctx.session_id,
             "turn_id": ctx.turn_id,
             "run_id": ctx.run_id,
             "invocation_id": ctx.invocation_id,
-            "provider": provider,
-            "kind": "text",
-            "text": scenario.model_text,
             "partial": False,
+            "role": "model",
+            "author": "agent",
+            "content": {"kind": "text", "text": scenario.model_text},
+            "metadata": {"provider": provider, "model": "fixture-model", "lifecycle": "model_final"},
         },
         {
+            "schema_version": 2,
             "id": event_id(),
-            "timestamp": now(),
+            "ts": now(),
             "session_id": ctx.session_id,
             "turn_id": ctx.turn_id,
             "run_id": ctx.run_id,
             "invocation_id": ctx.invocation_id,
-            "call_id": call_id,
-            "provider": provider,
-            "kind": "function_call",
-            "name": scenario.tool.name,
-            "arguments": scenario.tool.arguments,
             "partial": False,
+            "role": "model",
+            "author": "agent",
+            "content": {
+                "kind": "function_call",
+                "id": call_id,
+                "name": scenario.tool.name,
+                "args": scenario.tool.arguments,
+            },
+            "refs": {"tool_call_id": call_id},
+            "metadata": {"provider": provider, "model": "fixture-model", "lifecycle": "tool_call_final"},
         },
         {
+            "schema_version": 2,
             "id": event_id(),
-            "timestamp": now(),
+            "ts": now(),
             "session_id": ctx.session_id,
             "turn_id": ctx.turn_id,
             "run_id": ctx.run_id,
             "invocation_id": ctx.invocation_id,
-            "call_id": call_id,
-            "provider": provider,
-            "kind": "permission",
-            "decision": scenario.permission.decision,
-            "reason": scenario.permission.reason,
             "partial": False,
+            "role": "system",
+            "author": "system",
+            "actions": {
+                "permission": {
+                    "decision": scenario.permission.decision,
+                    "reason": scenario.permission.reason,
+                }
+            },
+            "refs": {"tool_call_id": call_id},
+            "metadata": {"provider": provider, "model": "fixture-model", "lifecycle": "permission"},
         },
         {
+            "schema_version": 2,
             "id": event_id(),
-            "timestamp": now(),
+            "ts": now(),
             "session_id": ctx.session_id,
             "turn_id": ctx.turn_id,
             "run_id": ctx.run_id,
             "invocation_id": ctx.invocation_id,
-            "call_id": call_id,
-            "provider": provider,
-            "kind": "tool_dispatch",
-            "name": scenario.tool.name,
-            "arguments_digest": hashlib.sha256(
-                json.dumps(scenario.tool.arguments, sort_keys=True).encode()
-            ).hexdigest(),
             "partial": False,
+            "role": "system",
+            "author": "system",
+            "actions": {
+                "tool_dispatch": {
+                    "protocol": "tool_dispatch_v1",
+                    "operation_id": operation_id,
+                    "provider_tool_call_id": call_id,
+                    "tool_name": scenario.tool.name,
+                    "name": scenario.tool.name,
+                    "canonical_args_hash": f"sha256:{args_digest}",
+                    "recovery_mode": "manual_on_unknown",
+                }
+            },
+            "refs": {"tool_call_id": call_id, "operation_id": operation_id},
+            "metadata": {"provider": provider, "model": "fixture-model", "lifecycle": "tool_dispatch"},
         },
         {
+            "schema_version": 2,
             "id": event_id(),
-            "timestamp": now(),
+            "ts": now(),
             "session_id": ctx.session_id,
             "turn_id": ctx.turn_id,
             "run_id": ctx.run_id,
             "invocation_id": ctx.invocation_id,
-            "call_id": call_id,
-            "provider": provider,
-            "kind": "tool_outcome",
-            "name": scenario.tool.name,
-            "success": scenario.tool.success,
-            "result": scenario.tool.result,
             "partial": False,
+            "role": "tool",
+            "author": "tool",
+            "content": {
+                "kind": "function_response",
+                "id": call_id,
+                "name": scenario.tool.name,
+                "result": scenario.tool.result,
+                "isError": not scenario.tool.success,
+            },
+            "actions": {
+                "tool_outcome": {
+                    "operation_id": operation_id,
+                    "provider_tool_call_id": call_id,
+                    "tool_name": scenario.tool.name,
+                    "name": scenario.tool.name,
+                    "success": scenario.tool.success,
+                    "executed": True,
+                }
+            },
+            "refs": {"tool_call_id": call_id, "operation_id": operation_id},
+            "metadata": {"provider": provider, "model": "fixture-model", "lifecycle": "tool_outcome"},
         },
         {
+            "schema_version": 2,
             "id": event_id(),
-            "timestamp": now(),
+            "ts": now(),
             "session_id": ctx.session_id,
             "turn_id": ctx.turn_id,
             "run_id": ctx.run_id,
             "invocation_id": ctx.invocation_id,
-            "call_id": call_id,
-            "provider": provider,
-            "kind": "function_response",
-            "result": scenario.tool.result,
             "partial": False,
+            "role": "tool",
+            "author": "tool",
+            "content": {
+                "kind": "function_response",
+                "id": call_id,
+                "name": scenario.tool.name,
+                "result": scenario.tool.result,
+                "isError": not scenario.tool.success,
+            },
+            "refs": {"tool_call_id": call_id, "operation_id": operation_id},
+            "metadata": {"provider": provider, "model": "fixture-model", "lifecycle": "function_response"},
         },
     ]
 
@@ -247,7 +309,17 @@ class FakeProviderScript:
 
     def stream(self) -> Iterator[ProviderChunk]:
         for event in scenario_events(self.scenario, provider=self.provider):
-            yield ProviderChunk(event["kind"], event)
+            actions = event.get("actions", {})
+            if isinstance(actions, dict) and actions:
+                kind = next(iter(actions))
+            else:
+                content = event.get("content", {})
+                kind = content.get("kind") if isinstance(content, dict) else None
+                if kind is None:
+                    metadata = event.get("metadata", {})
+                    kind = metadata.get("lifecycle") if isinstance(metadata, dict) else None
+            kind = kind or "unknown"
+            yield ProviderChunk(kind, event)
 
     def final_response(self) -> dict[str, Any]:
         return {

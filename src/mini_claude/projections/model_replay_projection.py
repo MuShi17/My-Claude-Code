@@ -119,6 +119,8 @@ class ModelReplayProjection:
                 kind == "function_response"
                 and event.id in response_event_ids
                 and (event.run_id, str(content.get("id", ""))) in reducer.calls
+                and record.ordinal
+                > reducer.calls[(event.run_id, str(content.get("id", "")))].ordinal
                 and event.kind != "tool_outcome"
                 and (event.metadata or {}).get("lifecycle") != "tool_outcome"
             ):

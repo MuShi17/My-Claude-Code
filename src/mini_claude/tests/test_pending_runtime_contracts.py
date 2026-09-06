@@ -1,9 +1,4 @@
-"""Explicit contract probes for capabilities delivered by later changes.
-
-These are strict expected failures while C04/C05/C08/C10 are pending.  They
-are deliberately not skips: once the module exists, its behavior must satisfy
-the probe or the suite fails normally.
-"""
+"""Strict contract probes for the canonical runtime store."""
 
 from __future__ import annotations
 
@@ -19,7 +14,7 @@ def test_c01_event_contract_is_importable_and_canonical():
 
     event = RuntimeEvent.from_dict(scenario_events(build_scenario())[0])
     encoded = event.canonical_bytes()
-    assert event.schema_version == 1
+    assert event.schema_version == 2
     assert encoded == event.canonical_bytes()
     assert event.validate() is None
 

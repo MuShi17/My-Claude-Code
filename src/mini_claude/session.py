@@ -43,19 +43,16 @@ def runtime_store_path(session_id: str) -> Path:
 
 
 def list_runtime_store_paths() -> list[Path]:
-    """List canonical stores without opening or mutating them.
+    """List only session-scoped canonical stores.
 
-    The root-level database is retained as a read-only discovery fallback for
-    stores created before session isolation was introduced.  New writes always
-    use :func:`runtime_store_path`.
+    A root-level database may still exist from an older installation, but it
+    is deliberately outside the application's discovery boundary.  Files from
+    older formats remain untouched and are not candidates for list/latest/resume.
     """
 
     paths = [
         path for path in SESSION_DIR.glob("*/runtime.sqlite") if path.is_file()
     ] if SESSION_DIR.exists() else []
-    legacy_path = SESSION_DIR.parent / "runtime.sqlite"
-    if legacy_path.is_file():
-        paths.append(legacy_path)
     return sorted(
         paths,
         key=lambda path: (path.stat().st_mtime_ns, str(path)),
@@ -63,28 +60,8 @@ def list_runtime_store_paths() -> list[Path]:
     )
 
 
-def _session_path(session_id: str) -> Path:
-    return _session_dir(session_id) / "session.json"
-
-
 def _session_v2_path(session_id: str) -> Path:
     return _session_dir(session_id) / "session.v2.json"
-
-
-def _traces_dir(session_id: str) -> Path:
-    return _session_dir(session_id) / "traces"
-
-
-def _legacy_session_path(session_id: str) -> Path:
-    """旧格式路径：~/.mini-claude/sessions/{session_id}.json（向后兼容）"""
-    return SESSION_DIR / f"{session_id}.json"
-
-
-def save_session(session_id: str, data: dict[str, Any]) -> None:
-    _ensure_dir()
-    sdir = _session_dir(session_id)
-    sdir.mkdir(parents=True, exist_ok=True)
-    _atomic_write_json(_session_path(session_id), data)
 
 
 def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
@@ -112,6 +89,7 @@ def build_session_v2(
 ) -> dict[str, Any] | None:
     """Build a canonical-derived v2 snapshot from one immutable prefix."""
 
+    from .projections.metrics_projection import CanonicalMetricsProjection
     from .projections.session_projection import SessionProjection
 
     projection = SessionProjection().build(
@@ -122,6 +100,7 @@ def build_session_v2(
     if projection.high_water == 0 and not projection.messages and not projection.runs:
         return None
     records = runtime_store.read_event_records(session_id=session_id, high_water=projection.high_water)
+    metrics = CanonicalMetricsProjection().build(records, high_water=projection.high_water)
     ordinals = [ordinal for ordinal, _ in records]
     turns = sorted({event.turn_id for _, event in records})
     return {
@@ -148,6 +127,7 @@ def build_session_v2(
         "terminals": list(projection.terminals),
         "partialCount": projection.partial_count,
         "diagnostics": [item.to_dict() for item in projection.diagnostics],
+        "metrics": metrics.to_dict(),
     }
 
 
@@ -172,9 +152,8 @@ def load_canonical_session(session_id: str, runtime_store: Any) -> dict[str, Any
 
         return build_session_v2(session_id, runtime_store)
     except Exception as error:
-        # Canonical-first callers must distinguish a genuinely empty store from
-        # a damaged canonical source.  Legacy fallback is decided by the CLI,
-        # never by this reader.
+        # A damaged canonical source must be surfaced to the caller; it is
+        # never interpreted as an empty session.
         raise CanonicalRecoveryError(
             f"canonical session projection failed: {error}",
             path=getattr(runtime_store, "database", None),
@@ -185,87 +164,46 @@ def load_session(
     session_id: str,
     *,
     runtime_store: Any | None = None,
-    canonical_first: bool = False,
 ) -> dict[str, Any] | None:
-    if canonical_first and runtime_store is not None:
-        canonical = load_canonical_session(session_id, runtime_store)
-        if canonical is not None:
-            return canonical
-        return None
-    # Prefer the canonical-derived v2 cache, then the old snapshot.
-    path = _session_v2_path(session_id)
-    if not path.exists():
-        path = _session_path(session_id)
-    if not path.exists():
-        # 回退旧格式
-        path = _legacy_session_path(session_id)
-        if not path.exists():
+    """Load a canonical-derived session view, rebuilding its cache as needed."""
+    owned_store = None
+    if runtime_store is None:
+        database = runtime_store_path(session_id)
+        if not database.is_file():
             return None
+        from .runtime_store import SQLiteRuntimeStore
+
+        try:
+            owned_store = SQLiteRuntimeStore(database)
+            runtime_store = owned_store
+        except Exception as error:
+            raise CanonicalRecoveryError(
+                f"canonical session store failed to open: {error}", path=database
+            ) from error
+
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if path.name != "session.v2.json":
-            metadata = dict(data.get("metadata") or {})
-            metadata.setdefault("source", "legacy-readonly")
-            metadata.setdefault("readonly", True)
-            data["metadata"] = metadata
-            data.setdefault("source", "legacy-readonly")
-            data.setdefault("readonly", True)
-        return data
-    except Exception:
-        return None
+        canonical = load_canonical_session(session_id, runtime_store)
+        if canonical is None:
+            return None
+        # The JSON file is a disposable display cache.  Rewriting it is safe
+        # because the source boundary and digest are derived from the ledger.
+        save_session_v2(session_id, runtime_store)
+        return canonical
+    finally:
+        if owned_store is not None:
+            owned_store.close()
 
 
 def list_sessions(runtime_store: Any | None = None) -> list[dict[str, Any]]:
+    """List sessions represented by canonical SQLite ledgers only."""
+
     if runtime_store is not None:
-        canonical = list_canonical_sessions(runtime_store)
-        if canonical:
-            return canonical
-    if not SESSION_DIR.exists():
-        return []
-    results = []
-    seen: set[str] = set()
-
-    # 新格式：遍历子目录
-    for d in SESSION_DIR.iterdir():
-        if not d.is_dir():
-            continue
-        sid = d.name
-        sf = d / "session.v2.json"
-        if not sf.is_file():
-            sf = d / "session.json"
-        if sf.is_file():
-            try:
-                data = json.loads(sf.read_text(encoding="utf-8"))
-                if "metadata" in data:
-                    metadata = dict(data["metadata"])
-                    if sf.name != "session.v2.json":
-                        metadata.setdefault("source", "legacy-readonly")
-                        metadata.setdefault("readonly", True)
-                    results.append(metadata)
-                    seen.add(sid)
-            except Exception:
-                pass
-
-    # 旧格式兼容：扁平 .json 文件
-    for f in SESSION_DIR.glob("*.json"):
-        sid = f.stem
-        if sid in seen:
-            continue
-        try:
-            data = json.loads(f.read_text(encoding="utf-8"))
-            if "metadata" in data:
-                metadata = dict(data["metadata"])
-                metadata.setdefault("source", "legacy-readonly")
-                metadata.setdefault("readonly", True)
-                results.append(metadata)
-        except Exception:
-            pass
-
-    return results
+        return list_canonical_sessions(runtime_store)
+    return list_canonical_runtime_sessions()
 
 
 def list_canonical_sessions(runtime_store: Any) -> list[dict[str, Any]]:
-    """List sessions represented by canonical events, with no legacy reads."""
+    """List sessions represented by canonical events only."""
 
     result: list[dict[str, Any]] = []
     for session_id in getattr(runtime_store, "list_session_ids", lambda: [])():
@@ -296,15 +234,6 @@ def list_canonical_runtime_sessions() -> list[dict[str, Any]]:
     return result
 
 
-def save_trace(session_id: str, ask_index: int, lines: list[str]) -> None:
-    """将 JSONL 行列表写入 trace 文件。"""
-    _ensure_dir()
-    td = _traces_dir(session_id)
-    td.mkdir(parents=True, exist_ok=True)
-    filepath = td / f"{ask_index:03d}.jsonl"
-    filepath.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
 def get_latest_session_id(runtime_store: Any | None = None) -> str | None:
     sessions = list_canonical_sessions(runtime_store) if runtime_store is not None else list_sessions()
     if not sessions:
@@ -328,8 +257,6 @@ __all__ = [
     "list_runtime_store_paths",
     "load_canonical_session",
     "load_session",
-    "save_session",
     "save_session_v2",
-    "save_trace",
     "runtime_store_path",
 ]

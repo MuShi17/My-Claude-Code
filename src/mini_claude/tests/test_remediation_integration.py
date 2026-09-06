@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,33 +15,23 @@ from mini_claude.compaction import CompactionCheckpointBuilder, CompactionError
 from mini_claude.event_ids import RunContext
 from mini_claude.event_sink import RecordingEventSink
 from mini_claude.llm_capture import LLMCapturePolicy
-from mini_claude.logger import AgentLogger
 from mini_claude.projections import CanonicalModelContextAdapter
 from mini_claude.projections import ModelReplayProjection
 from mini_claude.runtime_event import RuntimeEvent
 from mini_claude.runtime_store import SQLiteRuntimeStore
 
-import mini_claude.logger as logger_module
-
 from runtime_fixtures import DeterministicIdFactory, build_scenario, scenario_events
 
 
-def _legacy_lines(root: Path, session_id: str) -> list[dict]:
-    path = root / "sessions" / session_id / "logs" / "001.jsonl"
-    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-
-
-def _capture_once(tmp_path: Path, policy: LLMCapturePolicy, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, list[dict], Path]:
-    logger_root = tmp_path / "legacy"
-    monkeypatch.setattr(logger_module, "SESSION_DIR", logger_root / "sessions")
+def _capture_once(
+    tmp_path: Path, policy: LLMCapturePolicy, monkeypatch: pytest.MonkeyPatch
+) -> tuple[dict, Path]:
+    del monkeypatch
     session_id = "integration-capture"
-    logger = AgentLogger(session_id)
-    logger.new_ask(1)
     database = tmp_path / "runtime.sqlite"
     with SQLiteRuntimeStore(database) as store:
         archive = ArtifactArchive(tmp_path / "artifacts", metadata_store=store)
         agent = Agent(
-            logger=logger,
             runtime_store=store,
             runtime_sink=RecordingEventSink(),
             artifact_archive=archive,
@@ -49,9 +39,11 @@ def _capture_once(tmp_path: Path, policy: LLMCapturePolicy, monkeypatch: pytest.
         )
         agent._ask_count = 1
         agent._setup_runtime_facade()
-        agent._capture_legacy_llm(
+        agent._capture_llm(
             request_id="req-integration",
-            messages=[{"role": "user", "content": "password=sk-ant-integration-secret"}],
+            messages=[
+                {"role": "user", "content": "password=sk-ant-integration-secret"}
+            ],
             response={"content": "response-secret"},
             usage={"input_tokens": 1, "output_tokens": 1},
             latency_ms=1,
@@ -60,46 +52,41 @@ def _capture_once(tmp_path: Path, policy: LLMCapturePolicy, monkeypatch: pytest.
             cache_read_tokens=None,
             finish_reason="stop",
         )
-        if agent._runtime_emitter is not None:
-            agent._runtime_emitter.close()
-    logger.close()
-    session_root = logger_root / "sessions" / session_id
-    return session_root, _legacy_lines(logger_root, session_id), tmp_path / "artifacts"
+        capture = store.read_llm_capture("llm:req-integration:attempt:1")
+    assert capture is not None
+    return capture, tmp_path / "artifacts"
 
 
 def test_agent_capture_off_never_writes_legacy_raw_body(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    session_root, records, artifacts = _capture_once(tmp_path, LLMCapturePolicy(mode="off"), monkeypatch)
+    capture, artifacts = _capture_once(tmp_path, LLMCapturePolicy(mode="off"), monkeypatch)
 
-    assert records[-1]["type"] == "api_response"
-    assert records[-1]["llm_capture_status"] == "off"
-    assert "llm_ref" not in records[-1]
-    assert not (session_root / "llm").exists()
+    assert capture["capture_status"] == "off"
+    assert capture["metadata"]["body_present"] is False
     assert not list(artifacts.rglob("*"))
-    assert "sk-ant-integration-secret" not in json.dumps(records)
+    assert "sk-ant-integration-secret" not in json.dumps(capture)
 
 
 def test_agent_metadata_only_keeps_legacy_shadow_body_free(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    session_root, records, artifacts = _capture_once(
+    capture, artifacts = _capture_once(
         tmp_path, LLMCapturePolicy(mode="metadata-only"), monkeypatch
     )
 
-    assert records[-1]["llm_capture_status"] == "metadata-only"
-    assert "llm_ref" not in records[-1]
-    assert not (session_root / "llm").exists()
+    assert capture["capture_status"] == "metadata-only"
+    assert capture["metadata"]["body_present"] is False
     assert not list(artifacts.rglob("*"))
-    assert "sk-ant-integration-secret" not in json.dumps(records)
+    assert "sk-ant-integration-secret" not in json.dumps(capture)
 
 
 def test_agent_redacted_capture_does_not_call_legacy_raw_writer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    session_root, records, artifacts = _capture_once(
+    capture, artifacts = _capture_once(
         tmp_path,
         LLMCapturePolicy(mode="redacted", max_body_bytes=128, archive_bodies=True),
         monkeypatch,
     )
 
-    assert records[-1]["llm_capture_status"] == "saved"
-    assert records[-1]["llm_ref"].startswith("llm:req-integration")
-    assert not (session_root / "llm").exists()
+    assert capture["capture_status"] == "saved"
+    assert capture["llm_ref"].startswith("llm:req-integration")
+    assert capture["metadata"]["body_present"] is True
     archived = list(artifacts.rglob("*.bin"))
     assert archived
     assert all("sk-ant-integration-secret" not in path.read_text(encoding="utf-8", errors="replace") for path in archived)
@@ -123,7 +110,6 @@ def test_chat_emits_original_user_event_for_both_provider_loops(
         api_key="fixture-key",
         is_sub_agent=True,
         runtime_sink=sink,
-        enable_legacy_shadow=False,
     )
     asyncio.run(agent.chat("hello from user"))
 
@@ -172,7 +158,6 @@ def test_provider_loop_refreshes_stale_arrays_from_canonical_store(
             api_key="fixture-key",
             is_sub_agent=True,
             runtime_store=store,
-            enable_legacy_shadow=False,
         )
         agent._ask_count = 1
         agent._setup_runtime_facade()
@@ -211,7 +196,6 @@ def test_real_agent_compaction_writes_checkpoint_and_replays_compacted_context(
             api_key="fixture-key",
             is_sub_agent=True,
             runtime_store=store,
-            enable_legacy_shadow=False,
         )
         agent._ask_count = 1
         agent._setup_runtime_facade()
@@ -236,7 +220,7 @@ def test_real_agent_compaction_writes_checkpoint_and_replays_compacted_context(
         checkpoints = store.list_compaction_checkpoints()
         assert len(checkpoints) == 1
         checkpoint = checkpoints[0]
-        assert checkpoint["source_high_water"] == 2
+        assert checkpoint["source_high_water"] == 3
         assert checkpoint["summary"]["text"] == "bounded summary"
         checkpoint_object = CompactionCheckpointBuilder().build(
             store, high_water=checkpoint["source_high_water"],
@@ -252,10 +236,12 @@ def test_real_agent_compaction_writes_checkpoint_and_replays_compacted_context(
         assert replay.messages[-1]["role"] == "tool"
 
         later = RuntimeEvent.from_dict(
-            {
-                "id": "later-event",
-                "timestamp": "2026-09-05T00:00:00Z",
-                "session_id": agent.session_id,
+                {
+                    "schema_version": 2,
+                    "id": "later-event",
+                    "ts": "2026-09-05T00:00:00Z",
+                    "partial": False,
+                    "session_id": agent.session_id,
                 "turn_id": agent._runtime_context.turn_id,
                 "run_id": agent._runtime_context.run_id,
                 "invocation_id": agent._runtime_context.invocation_id,
@@ -287,14 +273,13 @@ def test_compaction_checkpoint_failure_preserves_canonical_prefix_without_ref(
             api_key="fixture-key",
             is_sub_agent=True,
             runtime_store=store,
-            enable_legacy_shadow=False,
         )
         agent._ask_count = 1
         agent._setup_runtime_facade()
         agent._emit_canonical_user_event("prefix survives")
         with pytest.raises(CompactionError, match="checkpoint fsync failed"):
             agent._write_compaction_checkpoint("summary")
-        assert store.current_high_water == 2
+        assert store.current_high_water == 3
         assert store.list_compaction_checkpoints() == []
         assert not any(
             event.refs and "checkpoint_id" in event.refs
@@ -317,7 +302,7 @@ def test_canonical_terminal_finalize_failure_is_returned_as_controlled_failure(
         assert user_message == "finish me"
 
     monkeypatch.setattr(Agent, "_chat_anthropic", fake_loop)
-    agent = Agent(is_sub_agent=True, runtime_sink=sink, enable_legacy_shadow=False)
+    agent = Agent(is_sub_agent=True, runtime_sink=sink)
 
     with pytest.raises(CanonicalFinalizationError, match="seal unavailable"):
         asyncio.run(agent.chat("finish me"))
@@ -341,7 +326,6 @@ def test_provider_error_remains_primary_when_canonical_finalize_also_fails(
     agent = Agent(
         is_sub_agent=True,
         runtime_sink=RecordingEventSink(failure_hook=fail_terminal),
-        enable_legacy_shadow=False,
     )
 
     with pytest.raises(RuntimeError, match="provider exploded") as error:
@@ -366,12 +350,8 @@ def test_child_agent_inherits_runtime_policy_and_parent_identity(
         is_sub_agent=True,
         runtime_store=None,
         runtime_sink=sink,
-        enable_legacy_shadow=False,
         artifact_archive=archive,
         llm_capture_policy=policy,
-        runtime_authority="canonical",
-        runtime_authority_approved=True,
-        runtime_rollback=True,
     )
     parent._runtime_context = RunContext("session-parent", "turn-parent", "run-parent", "inv-parent")
 
@@ -386,8 +366,6 @@ def test_child_agent_inherits_runtime_policy_and_parent_identity(
     assert child._runtime_sink is parent._runtime_sink
     assert child._artifact_archive is parent._artifact_archive
     assert child._llm_capture_policy is policy
-    assert child._runtime_authority == "canonical"
-    assert child._runtime_authority_approved is True
-    assert child._runtime_rollback is True
+    assert child.session_id == "session-parent"
     assert child._runtime_parent_run_id == "run-parent"
     assert child._runtime_run_id.startswith("run-")

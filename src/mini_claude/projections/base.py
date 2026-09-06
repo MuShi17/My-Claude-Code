@@ -134,7 +134,27 @@ class RuntimeEventReducer:
         for (run_id, call_id), record in self.calls.items():
             if (run_id, call_id) not in self.responses:
                 self.diagnostics.append(ProjectionDiagnostic("unmatched_tool_call", "function call has no function response", "warning", record.event.id, run_id, call_id))
+        for (run_id, call_id), responses in self.responses.items():
+            call = self.calls.get((run_id, call_id))
+            if call is None:
+                continue
+            for response in responses:
+                if response.ordinal <= call.ordinal:
+                    self.diagnostics.append(
+                        ProjectionDiagnostic(
+                            "invalid_tool_order",
+                            "function response must follow its function call",
+                            "error",
+                            response.event.id,
+                            run_id,
+                            call_id,
+                        )
+                    )
 
     def response_for(self, run_id: str, call_id: str) -> EventRecord | None:
         values = self.responses.get((run_id, call_id), [])
-        return values[0] if values else None
+        call = self.calls.get((run_id, call_id))
+        if call is None:
+            return None
+        valid = [response for response in values if response.ordinal > call.ordinal]
+        return valid[0] if valid else None
