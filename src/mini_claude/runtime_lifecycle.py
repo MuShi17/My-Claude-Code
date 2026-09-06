@@ -226,6 +226,20 @@ class ModelCallRecorder:
             metadata={"lifecycle": "model_final"},
         )
 
+    def final_thinking(self, text: str, *, signature: str | None = None) -> RuntimeEvent:
+        """Persist provider thinking exactly enough for a later replay."""
+
+        self._require_started()
+        content: dict[str, Any] = {"kind": "thinking", "text": text}
+        if signature is not None:
+            content["signature"] = signature
+        return self._emit(
+            role="model",
+            author="agent",
+            content=content,
+            metadata={"lifecycle": "model_final"},
+        )
+
     def final_tool_call(self, call_id: str, name: str, arguments: Any) -> RuntimeEvent:
         self._require_started()
         safe_args = redact_payload(arguments, self.redaction_policy)
@@ -327,10 +341,11 @@ class ModelCallRecorder:
         self.usage(usage)
         latency = int((time.monotonic() - self._started_at) * 1000)
         error_type = type(error).__name__
+        error_code = getattr(error, "code", error_type)
         self._emit(
             role="system",
             author="system",
-            content={"kind": "error", "code": error_type, "message": str(error)},
+            content={"kind": "error", "code": error_code, "message": str(error)},
             status="failed",
             metadata={"lifecycle": "provider_error", "error_type": error_type},
         )

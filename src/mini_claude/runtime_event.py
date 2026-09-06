@@ -42,13 +42,16 @@ CONTENT_KINDS = frozenset(
     {
         "text",
         "thinking",
+        "context",
         "function_call",
         "function_response",
         "error",
         "invocation_opened",
     }
 )
-ACTION_KINDS = frozenset({"permission", "tool_dispatch", "tool_outcome", "compaction"})
+ACTION_KINDS = frozenset(
+    {"permission", "tool_dispatch", "tool_outcome", "compaction", "context_transition"}
+)
 
 
 class FrozenDict(Mapping[str, Any]):
@@ -395,6 +398,24 @@ class RuntimeEvent:
             raise RuntimeEventValidationError(f"unsupported content kind {kind!r}", field="content.kind")
         if kind in {"text", "thinking"} and not isinstance(content.get("text"), str):
             raise RuntimeEventValidationError("text content requires a string", field="content.text")
+        if kind == "context":
+            if content.get("context_type") != "memory":
+                raise RuntimeEventValidationError(
+                    "context content requires context_type memory", field="content.context_type"
+                )
+            if not isinstance(content.get("text"), str):
+                raise RuntimeEventValidationError("context content requires a string", field="content.text")
+            for field in ("content_digest", "idempotency_key"):
+                _identifier(content.get(field), f"content.{field}")
+            sources = content.get("sources")
+            if not isinstance(sources, (list, tuple)) or not sources or not all(
+                isinstance(item, str) and item.strip() for item in sources
+            ):
+                raise RuntimeEventValidationError(
+                    "memory context requires non-empty string sources", field="content.sources"
+                )
+            if not isinstance(content.get("sequence"), int) or isinstance(content.get("sequence"), bool):
+                raise RuntimeEventValidationError("context sequence requires an integer", field="content.sequence")
         if kind == "function_call":
             for field in ("id", "name"):
                 _identifier(content.get(field), f"content.{field}")
@@ -441,7 +462,9 @@ def is_partial_runtime_event(event: RuntimeEvent) -> bool:
 def runtime_event_has_model_visible_content(event: RuntimeEvent) -> bool:
     if event.model_visibility == "hidden" or event.partial or event.content is None:
         return False
-    return event.content.get("kind") in {"text", "thinking", "function_call", "function_response"}
+    return event.content.get("kind") in {
+        "text", "thinking", "context", "function_call", "function_response"
+    }
 
 
 __all__ = [

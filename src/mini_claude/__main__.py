@@ -18,6 +18,7 @@ from .session import (
     list_canonical_runtime_sessions,
     list_runtime_store_paths,
     load_session,
+    runtime_data_dir,
 )
 from .runtime_store import SQLiteRuntimeStore
 from .recovery import RecoveryProjection
@@ -344,7 +345,7 @@ Examples:
             resume_store, resume_session_id = _open_latest_canonical_store()
             if resume_store is not None:
                 recovery = RecoveryProjection(
-                    artifact_archive=ArtifactArchive(Path.home() / ".mini-claude" / "artifacts")
+                    artifact_archive=ArtifactArchive(runtime_data_dir() / "artifacts")
                 )
                 recovered = recovery.recover_startup(resume_store)
                 for item in recovered:

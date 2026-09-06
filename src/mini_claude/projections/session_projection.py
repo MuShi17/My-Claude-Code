@@ -109,6 +109,14 @@ class SessionProjection:
             if kind == "text" and content.get("text"):
                 role = {"model": "assistant", "user": "user", "tool": "tool"}.get(event.role, event.role)
                 messages.append({"role": role, "content": content["text"], "runtime": identity})
+            elif kind == "context" and content.get("text"):
+                messages.append({
+                    "role": "context",
+                    "content": content["text"],
+                    "context_type": content.get("context_type"),
+                    "sources": list(content.get("sources", [])),
+                    "runtime": identity,
+                })
             elif kind == "function_call":
                 messages.append(
                     {

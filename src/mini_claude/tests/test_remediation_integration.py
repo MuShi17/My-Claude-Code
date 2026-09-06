@@ -9,18 +9,39 @@ from types import SimpleNamespace
 
 import pytest
 
-from mini_claude.agent import Agent, CanonicalFinalizationError
+from mini_claude.agent import (
+    Agent,
+    CanonicalFinalizationError,
+    ProviderContentNormalizationError,
+)
 from mini_claude.artifact_archive import ArtifactArchive
 from mini_claude.compaction import CompactionCheckpointBuilder, CompactionError
 from mini_claude.event_ids import RunContext
 from mini_claude.event_sink import RecordingEventSink
 from mini_claude.llm_capture import LLMCapturePolicy
+from mini_claude.provider_content import materialize_tool_result
 from mini_claude.projections import CanonicalModelContextAdapter
 from mini_claude.projections import ModelReplayProjection
 from mini_claude.runtime_event import RuntimeEvent
 from mini_claude.runtime_store import SQLiteRuntimeStore
 
 from runtime_fixtures import DeterministicIdFactory, build_scenario, scenario_events
+
+
+def _anthropic_response(*blocks, input_tokens: int = 10, output_tokens: int = 8):
+    return SimpleNamespace(
+        content=list(blocks),
+        usage=SimpleNamespace(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cache_read_input_tokens=0,
+            cache_creation_input_tokens=0,
+        ),
+    )
+
+
+def _anthropic_block(block_type: str, **fields):
+    return SimpleNamespace(type=block_type, **fields)
 
 
 def _capture_once(
@@ -118,6 +139,355 @@ def test_chat_emits_original_user_event_for_both_provider_loops(
     assert user_events[0].content["text"] == "hello from user"
     assert user_events[0].metadata["lifecycle"] == "user_input"
     assert any(event.is_terminal for event in sink.events)
+
+
+def test_anthropic_malformed_thinking_fails_before_tool_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    response = _anthropic_response(
+        _anthropic_block("tool_use", id="call-1", name="read_file", input={"path": "secret"}),
+        _anthropic_block(
+            "thinking",
+            thinking={"secret": "must not enter canonical content"},
+            signature="sig-1",
+        ),
+    )
+
+    async def fake_call(self: Agent):
+        return response
+
+    async def unexpected_tool(*args, **kwargs):
+        raise AssertionError("malformed provider content must fail before tool dispatch")
+
+    monkeypatch.setattr(Agent, "_call_anthropic_stream", fake_call)
+    monkeypatch.setattr(Agent, "_run_durable_tool", unexpected_tool)
+    with SQLiteRuntimeStore(tmp_path / "runtime.sqlite") as store:
+        agent = Agent(
+            model="deepseek-v4-flash",
+            api_key="fixture-key",
+            is_sub_agent=True,
+            runtime_store=store,
+        )
+
+        with pytest.raises(ProviderContentNormalizationError) as error:
+            asyncio.run(agent.chat("inspect safely"))
+
+        events = [event for _, event in store.read_event_records()]
+        assert error.value.block_kind == "thinking"
+        assert error.value.block_index == 1
+        assert error.value.value_type == "mapping"
+        assert "must not enter canonical content" not in str(error.value)
+        assert not any(
+            event.role == "model"
+            and event.content
+            and event.content.get("kind") in {"text", "thinking", "function_call"}
+            for event in events
+        )
+        failed = [event for event in events if event.status == "failed"]
+        assert len(failed) == 1
+        assert failed[0].content["code"] == "provider_content_normalization_failed"
+        assert failed[0].content["message"] == str(error.value)
+        assert agent._runtime_exit_status == "failed"
+
+
+def test_openai_malformed_text_fails_before_message_history_append(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    response = {
+        "choices": [{
+            "message": {
+                "content": {"secret": "must not enter openai history"},
+                "tool_calls": [],
+            }
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+    }
+
+    async def fake_call(self: Agent):
+        return response
+
+    monkeypatch.setattr(Agent, "_call_openai_stream", fake_call)
+    with SQLiteRuntimeStore(tmp_path / "runtime.sqlite") as store:
+        agent = Agent(
+            api_base="https://fake-provider.invalid/v1",
+            api_key="fixture-key",
+            is_sub_agent=True,
+            runtime_store=store,
+        )
+
+        with pytest.raises(ProviderContentNormalizationError) as error:
+            asyncio.run(agent.chat("inspect safely"))
+
+        assert error.value.provider == "openai"
+        assert error.value.block_kind == "text"
+        assert error.value.value_type == "mapping"
+        assert "must not enter openai history" not in str(error.value)
+        assert not any(
+            message.get("content") == {"secret": "must not enter openai history"}
+            for message in agent._openai_messages
+        )
+        assert any(event.status == "failed" for _, event in store.read_event_records())
+
+
+def test_openai_reasoning_is_canonical_and_replayable_with_tool_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    responses = iter([
+        {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "reasoning_content": "inspect the file",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": json.dumps({
+                                "file_path": str(tmp_path / "sample.txt")
+                            }),
+                        },
+                    }],
+                }
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        },
+        {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "inspection complete",
+                    "reasoning_content": "",
+                    "tool_calls": [],
+                }
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        },
+    ])
+    (tmp_path / "sample.txt").write_text("safe", encoding="utf-8")
+
+    async def fake_call(self: Agent):
+        return next(responses)
+
+    monkeypatch.setattr(Agent, "_call_openai_stream", fake_call)
+    with SQLiteRuntimeStore(tmp_path / "runtime.sqlite") as store:
+        agent = Agent(
+            api_base="https://fake-provider.invalid/v1",
+            api_key="fixture-key",
+            model="deepseek-v4-flash",
+            is_sub_agent=True,
+            permission_mode="bypassPermissions",
+            runtime_store=store,
+        )
+        asyncio.run(agent.chat("inspect the file"))
+
+        context = CanonicalModelContextAdapter().build(
+            store, provider="openai", system_prompt="system fixture"
+        )
+        tool_step = next(message for message in context.messages if message.get("tool_calls"))
+        assert tool_step["reasoning_content"] == "inspect the file"
+        assert tool_step["content"] == ""
+        assert any(
+            message.get("role") == "tool"
+            and message.get("tool_call_id") == "call-1"
+            for message in context.messages
+        )
+        assert any(
+            message.get("content") == "inspection complete"
+            and message.get("reasoning_content") == ""
+            for message in context.messages
+        )
+
+
+def test_valid_anthropic_multi_tool_response_preserves_signature_and_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    responses = iter([
+        _anthropic_response(
+            _anthropic_block("thinking", thinking="reasoning", signature="sig-1"),
+            _anthropic_block("text", text="I will inspect both files."),
+            _anthropic_block(
+                "tool_use", id="call-1", name="read_file", input={"file_path": str(tmp_path / "one.txt")}
+            ),
+            _anthropic_block(
+                "tool_use", id="call-2", name="read_file", input={"file_path": str(tmp_path / "two.txt")}
+            ),
+        ),
+        _anthropic_response(_anthropic_block("text", text="Inspection complete.")),
+    ])
+    (tmp_path / "one.txt").write_text("one", encoding="utf-8")
+    (tmp_path / "two.txt").write_text("two", encoding="utf-8")
+
+    async def fake_call(self: Agent):
+        return next(responses)
+
+    monkeypatch.setattr(Agent, "_call_anthropic_stream", fake_call)
+    database = tmp_path / "runtime.sqlite"
+    with SQLiteRuntimeStore(database) as store:
+        agent = Agent(
+            model="deepseek-v4-flash",
+            api_key="fixture-key",
+            is_sub_agent=True,
+            permission_mode="bypassPermissions",
+            runtime_store=store,
+            artifact_archive=ArtifactArchive(tmp_path / "artifacts", metadata_store=store),
+        )
+        asyncio.run(agent.chat("inspect both files"))
+
+        events = [event for _, event in store.read_event_records()]
+        thinking = [
+            event for event in events
+            if event.content and event.content.get("kind") == "thinking"
+        ]
+        calls = [
+            event for event in events
+            if event.content and event.content.get("kind") == "function_call"
+        ]
+        assert [(event.content["text"], event.content["signature"]) for event in thinking] == [
+            ("reasoning", "sig-1")
+        ]
+        assert list(dict.fromkeys(event.content["id"] for event in calls)) == ["call-1", "call-2"]
+
+        context = CanonicalModelContextAdapter().build(store, provider="anthropic")
+        tool_uses = [
+            block
+            for message in context.messages
+            if message.get("role") == "assistant" and isinstance(message.get("content"), list)
+            for block in message["content"]
+            if block.get("type") == "tool_use"
+        ]
+        tool_results = [
+            block
+            for message in context.messages
+            if message.get("role") == "user" and isinstance(message.get("content"), list)
+            for block in message["content"]
+            if block.get("type") == "tool_result"
+        ]
+        assert [block["id"] for block in tool_uses] == ["call-1", "call-2"]
+        assert [block["tool_use_id"] for block in tool_results] == ["call-1", "call-2"]
+        assert any(
+            block.get("type") == "thinking" and block.get("signature") == "sig-1"
+            for message in context.messages
+            if message.get("role") == "assistant" and isinstance(message.get("content"), list)
+            for block in message["content"]
+        )
+
+
+def test_anthropic_tool_end_counts_serialized_structured_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    responses = iter([
+        _anthropic_response(
+            _anthropic_block(
+                "tool_use", id="call-large", name="read_file",
+                input={"file_path": str(tmp_path / "interp.py")},
+            )
+        ),
+        _anthropic_response(_anthropic_block("text", text="Done.")),
+    ])
+    bounded_result = {
+        "kind": "bounded_ref",
+        "ref": "artifact:sha256:" + "a" * 64,
+        "size_bytes": 100_000,
+        "inline": "preview",
+        "truncated": True,
+    }
+    tool_end_events: list[dict] = []
+
+    async def fake_call(self: Agent):
+        return next(responses)
+
+    async def fake_tool(self: Agent, **kwargs):
+        return bounded_result, True, True
+
+    monkeypatch.setattr(Agent, "_call_anthropic_stream", fake_call)
+    monkeypatch.setattr(Agent, "_run_durable_tool", fake_tool)
+    with SQLiteRuntimeStore(tmp_path / "runtime.sqlite") as store:
+        agent = Agent(
+            model="deepseek-v4-flash",
+            api_key="fixture-key",
+            is_sub_agent=True,
+            permission_mode="bypassPermissions",
+            runtime_store=store,
+        )
+        agent.on("tool_end", tool_end_events.append)
+
+        asyncio.run(agent.chat("read the large file"))
+
+    expected = materialize_tool_result(bounded_result, provider="anthropic")
+    assert isinstance(expected, str)
+    assert len(tool_end_events) == 1
+    assert tool_end_events[0]["result_length"] == len(expected.encode("utf-8"))
+
+
+def test_openai_serial_tool_end_counts_serialized_structured_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    responses = iter([
+        {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "call-serial",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": "{}"},
+                    }],
+                }
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        },
+        {
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Done.",
+                    "reasoning_content": "",
+                    "tool_calls": [],
+                }
+            }],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        },
+    ])
+    bounded_result = {
+        "kind": "bounded_ref",
+        "ref": "artifact:sha256:" + "b" * 64,
+        "size_bytes": 100_000,
+        "inline": "preview",
+        "truncated": True,
+    }
+    tool_end_events: list[dict] = []
+
+    async def fake_call(self: Agent):
+        return next(responses)
+
+    async def fake_tool(self: Agent, **kwargs):
+        return bounded_result, True, True
+
+    monkeypatch.setattr(Agent, "_call_openai_stream", fake_call)
+    monkeypatch.setattr(Agent, "_run_durable_tool", fake_tool)
+    with SQLiteRuntimeStore(tmp_path / "runtime.sqlite") as store:
+        agent = Agent(
+            api_base="https://fake-provider.invalid/v1",
+            api_key="fixture-key",
+            model="deepseek-v4-flash",
+            is_sub_agent=True,
+            permission_mode="bypassPermissions",
+            runtime_store=store,
+        )
+        agent.on("tool_end", tool_end_events.append)
+
+        asyncio.run(agent.chat("run the serial tool"))
+
+    expected = materialize_tool_result(bounded_result, provider="openai")
+    assert isinstance(expected, str)
+    assert len(tool_end_events) == 1
+    assert tool_end_events[0]["result_length"] == len(expected.encode("utf-8"))
 
 
 def test_provider_context_adapter_preserves_tool_protocol_for_both_providers(tmp_path: Path):
@@ -264,7 +634,7 @@ def test_compaction_checkpoint_failure_preserves_canonical_prefix_without_ref(
     tmp_path: Path,
 ):
     class FailingStore(SQLiteRuntimeStore):
-        def write_compaction_checkpoint(self, checkpoint):
+        def append_compaction_transition(self, checkpoint, event):
             raise RuntimeError("checkpoint fsync failed")
 
     with FailingStore(tmp_path / "runtime.sqlite") as store:

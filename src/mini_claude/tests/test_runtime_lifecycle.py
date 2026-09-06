@@ -31,7 +31,9 @@ def _emitter(*, failure_hook=None) -> tuple[RuntimeEventEmitter, RecordingEventS
 
 def test_model_recorder_has_provider_neutral_lifecycle_and_unknown_usage():
     emitter, sink = _emitter()
-    ids = IdentityFactory(token_factory=iter(["1", "2", "3", "4", "5", "6", "7"]).__next__)
+    ids = IdentityFactory(
+        token_factory=iter(["1", "2", "3", "4", "5", "6", "7", "8"]).__next__
+    )
     recorder = ModelCallRecorder(
         emitter,
         _context(),
@@ -44,6 +46,7 @@ def test_model_recorder_has_provider_neutral_lifecycle_and_unknown_usage():
     recorder.partial_text("hello")
     recorder.partial_tool_arguments("call-1", "read_file", '{"file')
     recorder.final_text("hello world")
+    recorder.final_thinking("private reasoning", signature="sig-1")
     summary = recorder.finish("stop", usage={"input_tokens": 10, "output_tokens": 4})
     assert summary.attempt == 2
     assert [event.metadata["provider"] for event in sink.events] == ["anthropic"] * len(sink.events)
@@ -51,6 +54,13 @@ def test_model_recorder_has_provider_neutral_lifecycle_and_unknown_usage():
     usage = next(event for event in sink.events if event.kind == "usage")
     assert usage.actions["usage"]["input_tokens"] == 10
     assert "request_shape_hash" in sink.events[0].metadata
+    thinking = next(
+        event
+        for event in sink.events
+        if event.content and event.content.get("kind") == "thinking"
+    )
+    assert thinking.content["text"] == "private reasoning"
+    assert thinking.content["signature"] == "sig-1"
 
     emitter2, sink2 = _emitter()
     recorder2 = ModelCallRecorder(emitter2, _context(), provider="openai", model="fixture-model")

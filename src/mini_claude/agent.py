@@ -7,10 +7,13 @@ Agent 核心循环 — 双后端（Anthropic + OpenAI 兼容）、流式输出�
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import time
 import uuid
+from collections import deque
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Callable, Awaitable
 
@@ -46,18 +49,27 @@ from .ui import (
     start_spinner,
     stop_spinner,
 )
-from .session import runtime_store_path, save_session_v2
+from .session import runtime_data_dir, runtime_store_path, save_session_v2
 from .prompt import build_system_prompt
 from .subagent import get_sub_agent_config
 from .mcp_client import McpManager
 from .event_ids import RunContext
 from .event_sink import EventSink, RuntimeEventEmitter
 from .runtime_event import RuntimeEvent
+from .redaction import redact_payload
 from .runtime_lifecycle import DurableToolBoundary, ModelCallRecorder
+from .context_transition import ContextReplacement, build_context_transition
+from .provider_content import (
+    display_tool_result,
+    materialize_tool_result,
+    materialized_content_bytes,
+)
 from .runtime_store import SQLiteRuntimeStore
 from .run_lifecycle import RunStateGuard
 from .compaction import CompactionCheckpoint, CompactionCheckpointBuilder, CompactionError
+from .projections.base import EventRecord
 from .projections.model_replay_projection import ModelReplayProjection
+from .projections.incremental_replay import IncrementalModelReplayCursor, IncrementalReplayError
 from .projections.provider_context import CanonicalModelContextAdapter
 from .artifact_archive import ArtifactArchive
 from .llm_capture import LLMCaptureManager, LLMCapturePolicy
@@ -151,6 +163,70 @@ class CanonicalFinalizationError(RuntimeError):
     """The run could not durably publish its canonical terminal state."""
 
     code = "canonical_finalization_failed"
+
+
+class ProviderContentNormalizationError(ValueError):
+    """A provider returned a text-bearing block with an unsafe value shape."""
+
+    code = "provider_content_normalization_failed"
+
+    def __init__(
+        self,
+        *,
+        provider: str,
+        block_kind: str,
+        block_index: int,
+        value: Any,
+    ) -> None:
+        self.provider = provider
+        self.block_kind = block_kind
+        self.block_index = block_index
+        self.value_type = _provider_value_type(value)
+        # Keep the message useful for diagnosis while deliberately excluding
+        # the value itself: compatible providers may return secrets or huge
+        # structured payloads in malformed text fields.
+        super().__init__(
+            "provider content rejected: "
+            f"provider={provider} block_kind={block_kind} "
+            f"block_index={block_index} value_type={self.value_type}"
+        )
+
+
+def _provider_value_type(value: Any) -> str:
+    """Return a stable, payload-free type label for diagnostics."""
+
+    if value is None:
+        return "null"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, Mapping):
+        return "mapping"
+    if isinstance(value, (list, tuple)):
+        return "sequence"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, (int, float)):
+        return type(value).__name__
+    return "object"
+
+
+def _normalize_provider_text(
+    value: Any,
+    *,
+    provider: str,
+    block_kind: str,
+    block_index: int,
+) -> str:
+    """Normalize one provider text field without coercing unknown objects."""
+
+    if isinstance(value, str):
+        return value
+    raise ProviderContentNormalizationError(
+        provider=provider,
+        block_kind=block_kind,
+        block_index=block_index,
+        value=value,
+    )
 
 
 def _model_supports_adaptive_thinking(model: str) -> bool:
@@ -335,6 +411,16 @@ class Agent:
         self.last_input_token_count = 0
         self.current_turns = 0
         self.last_api_call_time = 0.0
+        self._context_epoch = "context:initial"
+        self._replay_cursor: IncrementalModelReplayCursor | None = None
+        self._replay_events_read = 0
+        self._replay_refresh_count = 0
+        self._replay_last_read_count = 0
+        self._replay_last_duration_ms = 0
+        self._replay_last_mode = "cold"
+        self._replay_last_rebuild_reason = "not_initialized"
+        self._replay_last_source_digest = ""
+        self._replay_last_projection_digest = ""
 
         # Ctrl+C 中断支持
         self._aborted = False
@@ -448,7 +534,7 @@ class Agent:
                 raise RuntimeError("runtime facade requires a canonical sink")
             if self._artifact_archive is None:
                 self._artifact_archive = ArtifactArchive(
-                    Path.home() / ".mini-claude" / "artifacts",
+                    runtime_data_dir() / "artifacts",
                     metadata_store=self._runtime_store,
                 )
             self._llm_capture_manager = LLMCaptureManager(
@@ -495,6 +581,14 @@ class Agent:
             context,
             artifact_archive=self._artifact_archive,
         )
+
+    def _record_runtime_model_error(self, error: BaseException) -> None:
+        """Seal the current model call as failed before propagating its error."""
+
+        if self._runtime_recorder:
+            self._runtime_recorder.error(error)
+            if self._runtime_guard and self._runtime_recorder.events:
+                self._runtime_guard.adopt_terminal_event(self._runtime_recorder.events[-1])
 
     def _record_budget_exceeded(self, reason: str) -> None:
         """Finalize the run budget without re-finishing the model call.
@@ -591,6 +685,69 @@ class Agent:
             },
         )
         self._runtime_emitter.emit(event)
+
+    def _persist_memory_context_event(self, memories: list[Any]) -> RuntimeEvent:
+        """Persist the exact memory context before rebuilding the request."""
+
+        if self._runtime_emitter is None or self._runtime_context is None:
+            raise RuntimeError("canonical runtime facade is not initialized")
+        source_values = [str(memory.path) for memory in memories]
+        raw_content = {
+            "kind": "context",
+            "context_type": "memory",
+            "text": format_memories_for_injection(memories),
+            "sources": source_values,
+            "sequence": 0,
+        }
+        # Put the payload under ``content`` so the redaction policy recognizes
+        # ``content.text`` as replay state and never replaces long memory text
+        # with a non-string bounded reference.
+        redacted_wrapper = redact_payload(
+            {"content": raw_content}, self._runtime_emitter.redaction_policy
+        )
+        safe_content = dict(redacted_wrapper["content"])
+        safe_text = str(safe_content["text"])
+        content_digest = hashlib.sha256(safe_text.encode("utf-8")).hexdigest()
+        idempotency_key = (
+            f"memory:{self._runtime_context.turn_id}:{content_digest}"
+        )
+        safe_content["content_digest"] = content_digest
+        safe_content["idempotency_key"] = idempotency_key
+        event_id = "memory-event:" + hashlib.sha256(
+            idempotency_key.encode("utf-8")
+        ).hexdigest()[:32]
+        if self._runtime_store is not None:
+            read_event = getattr(self._runtime_store, "read_event", None)
+            if callable(read_event):
+                existing = read_event(event_id)
+                if existing is not None:
+                    return existing
+            else:
+                for _, existing in self._runtime_store.read_event_records():
+                    if existing.id == event_id:
+                        return existing
+        elif self._runtime_emitter is not None:
+            sink_events = getattr(self._runtime_emitter.sink, "events", ())
+            for existing in sink_events:
+                if existing.id == event_id:
+                    return existing
+        event = RuntimeEvent.create(
+            self._runtime_context,
+            role="user",
+            author="system",
+            origin="code_mode",
+            model_visibility="visible",
+            content=safe_content,
+            ts=int(time.time() * 1000),
+            event_id=event_id,
+            metadata={
+                "lifecycle": "memory_injection",
+                "context_type": "memory",
+                "idempotency_key": idempotency_key,
+            },
+        )
+        self._runtime_emitter.emit(event)
+        return event
 
     def _record_sub_agent_event(self, *, name: str, agent_type: str, prompt: str) -> None:
         if self._runtime_emitter is None or self._runtime_context is None:
@@ -762,6 +919,10 @@ class Agent:
 
         self._aborted = False
         self._ask_count += 1
+        # The cursor is run-scoped.  A new user turn starts from a cold
+        # canonical prefix, then consumes only suffix ordinals for its loop.
+        self._replay_cursor = None
+        self._replay_last_rebuild_reason = "new_run"
 
         self._setup_runtime_facade()
 
@@ -992,25 +1153,127 @@ class Agent:
         return result
 
     def _refresh_provider_context_from_canonical(self):
-        """Rebuild the provider message array from the canonical event log.
-
-        The provider array is a request materialization only.  It is rebuilt
-        from the canonical store before every provider request.
-        """
+        """Refresh provider context from a cold prefix or an event suffix."""
 
         if self._runtime_store is None or not hasattr(self._runtime_store, "read_event_records"):
             raise RuntimeError("canonical runtime store is not initialized")
-        context = CanonicalModelContextAdapter().build(
-            self._runtime_store,
+        started = time.perf_counter()
+        cold = self._replay_cursor is None
+        reason = "cold_start" if cold else "warm_suffix"
+        if cold:
+            cursor = IncrementalModelReplayCursor()
+            pairs = self._runtime_store.read_event_records()
+            cursor.append(
+                EventRecord(ordinal, event) for ordinal, event in pairs
+            )
+        else:
+            cursor = self._replay_cursor
+            current_high_water = self._runtime_store.current_high_water
+            if current_high_water < cursor.high_water:
+                cold = True
+                reason = "source_high_water_regressed"
+                cursor = IncrementalModelReplayCursor()
+                pairs = self._runtime_store.read_event_records()
+                cursor.append(
+                    EventRecord(ordinal, event) for ordinal, event in pairs
+                )
+            elif current_high_water > cursor.high_water:
+                try:
+                    pairs = self._runtime_store.read_event_records(
+                        after_ordinal=cursor.high_water
+                    )
+                except TypeError:
+                    # Keep compatibility with caller-owned test stores that
+                    # expose the pre-incremental read signature.
+                    reason = "warm_suffix_fallback_full_read"
+                    all_pairs = self._runtime_store.read_event_records()
+                    pairs = [
+                        (ordinal, event)
+                        for ordinal, event in all_pairs
+                        if ordinal > cursor.high_water
+                    ]
+                try:
+                    cursor.append(
+                        EventRecord(ordinal, event) for ordinal, event in pairs
+                    )
+                except IncrementalReplayError:
+                    reason = "cursor_invalid"
+                    cold = True
+                    cursor = IncrementalModelReplayCursor()
+                    pairs = self._runtime_store.read_event_records()
+                    cursor.append(
+                        EventRecord(ordinal, event) for ordinal, event in pairs
+                    )
+            else:
+                pairs = []
+
+        read_count = len(pairs)
+        self._replay_cursor = cursor
+        self._replay_events_read += read_count
+        self._replay_refresh_count += 1
+        self._replay_last_read_count = read_count
+        self._replay_last_mode = "cold" if cold else "warm"
+
+        # A committed transition changes the effective prefix.  Reinitialize
+        # from the canonical source once at that boundary so stale call-group
+        # indexes cannot resurrect pre-transition messages.
+        if not cold and cursor.last_append_had_transition:
+            reason = "context_transition"
+            cursor = IncrementalModelReplayCursor()
+            all_pairs = self._runtime_store.read_event_records()
+            cursor.append(
+                EventRecord(ordinal, event) for ordinal, event in all_pairs
+            )
+            self._replay_cursor = cursor
+            self._replay_events_read += len(all_pairs)
+            self._replay_last_read_count += len(all_pairs)
+            self._replay_last_mode = "cold"
+
+        result = cursor.result()
+        context = CanonicalModelContextAdapter().build_result(
+            result,
             provider="openai" if self.use_openai else "anthropic",
             system_prompt=self._system_prompt if self.use_openai else None,
         )
+        errors = [
+            diagnostic for diagnostic in context.diagnostics
+            if getattr(diagnostic, "severity", None) == "error"
+            and getattr(diagnostic, "code", "") == "invalid_context_transition"
+        ]
+        if errors:
+            raise CompactionError(
+                "canonical context transition is not verifiable: "
+                + "; ".join(str(item.message) for item in errors[:3])
+            )
+        self._replay_last_duration_ms = int(
+            (time.perf_counter() - started) * 1000
+        )
+        self._replay_last_rebuild_reason = reason
+        self._replay_last_source_digest = result.source_digest
+        self._replay_last_projection_digest = result.digest
+        self._context_epoch = context.context_epoch
         messages = [dict(message) for message in context.messages]
         if self.use_openai:
             self._openai_messages = messages
         else:
             self._anthropic_messages = messages
         return context
+
+    def replay_diagnostics(self) -> dict[str, Any]:
+        """Return bounded, content-free replay instrumentation for this run."""
+
+        return {
+            "source_high_water": self._replay_cursor.high_water if self._replay_cursor else 0,
+            "context_epoch": self._context_epoch,
+            "source_digest": self._replay_last_source_digest,
+            "projection_digest": self._replay_last_projection_digest,
+            "events_read_total": self._replay_events_read,
+            "events_read_last_refresh": self._replay_last_read_count,
+            "refresh_count": self._replay_refresh_count,
+            "projection_duration_ms": self._replay_last_duration_ms,
+            "mode": self._replay_last_mode,
+            "rebuild_reason": self._replay_last_rebuild_reason,
+        }
 
     def _get_message_count(self) -> int:
         return len(self._openai_messages) if self.use_openai else len(self._anthropic_messages)
@@ -1088,15 +1351,14 @@ class Agent:
                     for block in content
                     if isinstance(block, dict) and block.get("type") == "tool_result"
                 ]
-                if tool_blocks:
-                    for block in tool_blocks:
-                        result.append({
-                            "role": "tool",
-                            "tool_call_id": block.get("tool_use_id"),
-                            "content": block.get("content", ""),
-                        })
-                elif text_blocks:
+                if text_blocks:
                     result.append({"role": "user", "content": "\n".join(text_blocks)})
+                for block in tool_blocks:
+                    result.append({
+                        "role": "tool",
+                        "tool_call_id": block.get("tool_use_id"),
+                        "content": block.get("content", ""),
+                    })
             elif role in {"user", "assistant"}:
                 result.append({"role": role, "content": content})
         return result[-8:]
@@ -1119,31 +1381,50 @@ class Agent:
                     "context_message_count": len(context_messages),
                 },
             )
-            self._runtime_store.write_compaction_checkpoint(checkpoint)
-            if self._runtime_emitter is not None:
-                self._runtime_emitter.emit(
-                    RuntimeEvent.create(
-                        self._runtime_context,
-                        role="system",
-                        author="system",
-                        actions={
-                            "compaction": {
-                                "checkpoint_id": checkpoint.checkpoint_id,
-                                "source_high_water": checkpoint.source_high_water,
-                                "source_digest": checkpoint.source_digest,
-                                "reset_model_context": True,
-                                "summary": bounded_summary,
-                                "context_messages": context_messages,
-                            }
-                        },
-                        refs={"checkpoint_id": checkpoint.checkpoint_id},
-                        ts=int(time.time() * 1000),
-                        metadata={
-                            "lifecycle": "compaction_checkpoint",
-                            "checkpoint_id": checkpoint.checkpoint_id,
-                        },
-                    )
-                )
+            next_epoch = f"context:{checkpoint.checkpoint_id}"
+            transition = build_context_transition(
+                source_high_water=checkpoint.source_high_water,
+                source_digest=checkpoint.source_digest,
+                projection_version=checkpoint.projection_version,
+                policy_version="compression-policy-v1",
+                context_epoch=next_epoch,
+                reason="full_compaction",
+                replacements=[],
+                effective_context=context_messages,
+            )
+            if self._runtime_emitter is None:
+                return None
+            transition_event = RuntimeEvent.create(
+                self._runtime_context,
+                role="system",
+                author="system",
+                actions={
+                    "compaction": {
+                        "checkpoint_id": checkpoint.checkpoint_id,
+                        "source_high_water": checkpoint.source_high_water,
+                        "source_digest": checkpoint.source_digest,
+                        "reset_model_context": True,
+                        "summary": bounded_summary,
+                        "context_messages": context_messages,
+                        "context_epoch": next_epoch,
+                    },
+                    "context_transition": transition.to_dict(),
+                },
+                refs={"checkpoint_id": checkpoint.checkpoint_id},
+                ts=int(time.time() * 1000),
+                metadata={
+                    "lifecycle": "compaction_checkpoint",
+                    "checkpoint_id": checkpoint.checkpoint_id,
+                    "context_epoch": next_epoch,
+                },
+            )
+            if hasattr(self._runtime_store, "append_compaction_transition"):
+                prepared = self._runtime_emitter.prepare(transition_event)
+                self._runtime_store.append_compaction_transition(checkpoint, prepared)
+            else:
+                self._runtime_store.write_compaction_checkpoint(checkpoint)
+                self._runtime_emitter.emit(transition_event)
+            self._context_epoch = next_epoch
             return checkpoint
         except Exception as error:
             self._runtime_exit_status = "failed"
@@ -1207,6 +1488,7 @@ class Agent:
     # Tier 4 (auto-compact) 在每轮 API 调用后检查触发。
 
     def _run_compression_pipeline(self) -> None:
+        before = self._capture_compression_tool_results()
         if self.use_openai:
             self._budget_tool_results_openai()
             self._snip_stale_results_openai()
@@ -1215,6 +1497,136 @@ class Agent:
             self._budget_tool_results_anthropic()
             self._snip_stale_results_anthropic()
             self._microcompact_anthropic()
+        self._persist_compression_replacements(before)
+
+    def _canonical_tool_response_events(self) -> tuple[tuple[str, str], ...]:
+        """Return response events in canonical/provider message order.
+
+        The event id is the durable identity.  Call ids are only labels and
+        may legitimately repeat in different runs.
+        """
+
+        if self._replay_cursor is not None:
+            return self._replay_cursor.canonical_tool_response_events()
+        if self._runtime_store is None:
+            return ()
+        result: list[tuple[str, str]] = []
+        for _, event in self._runtime_store.read_event_records():
+            content = event.content or {}
+            if content.get("kind") != "function_response":
+                continue
+            if event.kind == "tool_outcome" or (event.metadata or {}).get("lifecycle") == "tool_outcome":
+                continue
+            call_id = content.get("id")
+            if isinstance(call_id, str) and call_id:
+                result.append((event.id, call_id))
+        return tuple(result)
+
+    def _compression_tool_result_entries(
+        self,
+    ) -> list[tuple[str, str, str | list[Any]]]:
+        """Pair working tool messages with scoped canonical response ids."""
+
+        event_queues: dict[str, deque[str]] = {}
+        for event_id, call_id in self._canonical_tool_response_events():
+            event_queues.setdefault(call_id, deque()).append(event_id)
+
+        entries: list[tuple[str, str, str | list[Any]]] = []
+
+        def add(call_id: Any, content: Any) -> None:
+            if not isinstance(call_id, str) or not call_id:
+                return
+            if not isinstance(content, (str, list)):
+                return
+            queue = event_queues.get(call_id)
+            if not queue:
+                return
+            entries.append((queue.popleft(), call_id, content))
+
+        if self.use_openai:
+            for message in self._openai_messages:
+                if message.get("role") == "tool":
+                    add(message.get("tool_call_id"), message.get("content"))
+            return entries
+        for message in self._anthropic_messages:
+            if message.get("role") != "user" or not isinstance(message.get("content"), list):
+                continue
+            for block in message["content"]:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    add(block.get("tool_use_id"), block.get("content"))
+        return entries
+
+    def _capture_compression_tool_results(
+        self,
+    ) -> dict[str, tuple[str, str | list[Any]]]:
+        return {
+            event_id: (call_id, content)
+            for event_id, call_id, content in self._compression_tool_result_entries()
+        }
+
+    def _current_compression_tool_results(self) -> dict[str, str | list[Any]]:
+        return {
+            event_id: content
+            for event_id, _call_id, content in self._compression_tool_result_entries()
+        }
+
+    def _persist_compression_replacements(
+        self, before: dict[str, tuple[str, str | list[Any]]]
+    ) -> None:
+        if not before or self._runtime_store is None or self._runtime_emitter is None or self._runtime_context is None:
+            return
+        current = self._current_compression_tool_results()
+        replacements = [
+            ContextReplacement(
+                target_event_id=event_id,
+                target_call_id=call_id,
+                replacement=current[event_id],
+                reason="lightweight_compression",
+            )
+            for event_id, (call_id, old_value) in before.items()
+            if event_id in current and current[event_id] != old_value
+        ]
+        if not replacements:
+            return
+        source_high_water = self._runtime_store.current_high_water
+        replay = (
+            self._replay_cursor.result()
+            if self._replay_cursor is not None
+            and self._replay_cursor.high_water == source_high_water
+            else ModelReplayProjection().build(self._runtime_store)
+        )
+        effective_context = {
+            "replacements": [item.to_dict() for item in replacements]
+        }
+        transition = build_context_transition(
+            source_high_water=source_high_water,
+            source_digest=replay.source_digest,
+            projection_version=replay.projection_version,
+            policy_version="compression-policy-v1",
+            context_epoch=self._context_epoch,
+            reason="lightweight_compression",
+            replacements=replacements,
+            effective_context=effective_context,
+        )
+        event = RuntimeEvent.create(
+            self._runtime_context,
+            role="system",
+            author="system",
+            actions={"context_transition": transition.to_dict()},
+            refs={"context_epoch": self._context_epoch},
+            ts=int(time.time() * 1000),
+            metadata={
+                "lifecycle": "context_transition",
+                "context_epoch": self._context_epoch,
+                "reason": "lightweight_compression",
+            },
+        )
+        try:
+            self._runtime_emitter.emit(event)
+        except Exception as error:
+            self._runtime_exit_status = "failed"
+            self._runtime_exit_reason = f"context transition failed: {error}"
+            raise CompactionError(self._runtime_exit_reason) from error
 
     # Tier 1: 预算截断 — 当利用率 > 50% 时，将超长工具结果头尾保留、中间截断
     def _budget_tool_results_anthropic(self) -> None:
@@ -1330,40 +1742,6 @@ class Agent:
                 if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("id") == tool_use_id:
                     return {"name": block["name"], "input": block.get("input", {})}
         return None
-
-    # ─── 大结果持久化 ──────────────────────────────────────
-    # 当工具结果超过 30KB 时，写入磁盘并在上下文中仅保留预览和文件路径。
-    # 模型后续可用 read_file 读取完整结果 —— 信息零丢失。
-
-    def _persist_large_result(self, tool_name: str, result: str) -> str:
-        THRESHOLD = 30 * 1024  # 30 KB
-        if len(result.encode()) <= THRESHOLD:
-            return result
-        if self._artifact_archive is None:
-            return json.dumps({
-                "kind": "archive_error",
-                "error_type": "ArtifactArchiveUnavailable",
-                "message": "large tool result was not persisted",
-                "size_bytes": len(result.encode()),
-                "tool_name": tool_name,
-            }, ensure_ascii=False)
-        try:
-            archived = self._artifact_archive.archive(
-                result,
-                mime_type="text/plain",
-                encoding="utf-8",
-                scope="tool-result",
-                metadata={"tool_name": tool_name},
-            )
-            return json.dumps(archived.placeholder(), ensure_ascii=False, sort_keys=True)
-        except Exception as error:
-            return json.dumps({
-                "kind": "archive_error",
-                "error_type": type(error).__name__,
-                "message": str(error),
-                "size_bytes": len(result.encode()),
-                "tool_name": tool_name,
-            }, ensure_ascii=False)
 
     # ─── 工具执行路由 ──────────────────────────────────────
     # 统一分发：plan_mode / agent / skill / MCP / 标准工具。
@@ -1638,27 +2016,15 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             await self._emit("turn_start", {"turn_index": turn_index})
 
             # 消费记忆预取结果（非阻塞轮询，zero-wait）。
-            # 追加到最后一个 user 消息以保持 user/assistant 交替。
             if memory_prefetch and memory_prefetch.settled and not memory_prefetch.consumed:
+                memories = memory_prefetch.task.result()
+                if memories:
+                    self._persist_memory_context_event(memories)
+                    self._refresh_provider_context_from_canonical()
+                    for m in memories:
+                        self._already_surfaced_memories.add(m.path)
+                        self._session_memory_bytes += len(m.content.encode())
                 memory_prefetch.consumed = True
-                try:
-                    memories = memory_prefetch.task.result()
-                    if memories:
-                        injection_text = format_memories_for_injection(memories)
-                        last = self._anthropic_messages[-1] if self._anthropic_messages else None
-                        if last and last.get("role") == "user":
-                            content = last.get("content", "")
-                            if isinstance(content, str):
-                                last["content"] = content + "\n\n" + injection_text
-                            elif isinstance(content, list):
-                                content.append({"type": "text", "text": injection_text})
-                        else:
-                            self._anthropic_messages.append({"role": "user", "content": injection_text})
-                        for m in memories:
-                            self._already_surfaced_memories.add(m.path)
-                            self._session_memory_bytes += len(m.content.encode())
-                except Exception:
-                    pass  # prefetch errors already logged
 
             if not self.is_sub_agent:
                 start_spinner()
@@ -1670,10 +2036,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             try:
                 response = await self._call_anthropic_stream()
             except Exception as error:
-                if self._runtime_recorder:
-                    self._runtime_recorder.error(error)
-                    if self._runtime_guard and self._runtime_recorder.events:
-                        self._runtime_guard.adopt_terminal_event(self._runtime_recorder.events[-1])
+                self._record_runtime_model_error(error)
                 raise
 
             if not self.is_sub_agent:
@@ -1684,16 +2047,44 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             self.total_output_tokens += response.usage.output_tokens
             self.last_input_token_count = response.usage.input_tokens
 
-            tool_uses = [b for b in response.content if b.type == "tool_use"]
+            tool_uses = [
+                block for block in response.content if getattr(block, "type", None) == "tool_use"
+            ]
+
+            try:
+                normalized_blocks = self._normalize_anthropic_response_blocks(response.content)
+            except ProviderContentNormalizationError as error:
+                self._record_runtime_model_error(error)
+                raise
 
             if self._runtime_recorder:
-                for block in response.content:
-                    if block.type == "text":
-                        self._runtime_recorder.final_text(block.text)
-                    elif block.type == "tool_use":
-                        self._runtime_recorder.final_tool_call(
-                            block.id, block.name, dict(block.input)
-                        )
+                try:
+                    for block_index, block in enumerate(normalized_blocks):
+                        if block["type"] == "text":
+                            text = _normalize_provider_text(
+                                block.get("text"),
+                                provider="anthropic",
+                                block_kind="text",
+                                block_index=block_index,
+                            )
+                            self._runtime_recorder.final_text(text)
+                        elif block["type"] == "thinking":
+                            thinking = _normalize_provider_text(
+                                block.get("thinking"),
+                                provider="anthropic",
+                                block_kind="thinking",
+                                block_index=block_index,
+                            )
+                            self._runtime_recorder.final_thinking(
+                                thinking, signature=block.get("signature")
+                            )
+                        elif block["type"] == "tool_use":
+                            self._runtime_recorder.final_tool_call(
+                                block["id"], block["name"], block.get("input", {})
+                            )
+                except ProviderContentNormalizationError as error:
+                    self._record_runtime_model_error(error)
+                    raise
 
             # ★ 发射 turn_end 事件
             cache_read = getattr(response.usage, "cache_read_input_tokens", 0) or 0
@@ -1721,7 +2112,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
             if self._llm_capture_manager:
                 latency_ms = int((time.time() - api_start) * 1000)
-                response_dict = {"content": [self._block_to_dict(b) for b in response.content]}
+                response_dict = {"content": normalized_blocks}
                 usage_dict = {"input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens}
                 self._capture_llm(
                     request_id=request_id,
@@ -1737,7 +2128,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
             message = {
                 "role": "assistant",
-                "content": [self._block_to_dict(b) for b in response.content],
+                "content": normalized_blocks,
             }
 
             self._anthropic_messages.append(message)
@@ -1771,7 +2162,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         request_id=request_id, call_id=tu.id, name=tu.name, inp=inp,
                         permission={"decision": "deny", "reason": perm.get("message", "")},
                     )
-                    res = self._persist_large_result(tu.name, raw) if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+                    res = materialize_tool_result(raw, provider="anthropic")
                     tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
                     continue
                 if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self._confirmed_paths:
@@ -1781,7 +2172,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                             request_id=request_id, call_id=tu.id, name=tu.name, inp=inp,
                             permission={"decision": "deny", "reason": perm["message"]},
                         )
-                        res = self._persist_large_result(tu.name, raw) if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+                        res = materialize_tool_result(raw, provider="anthropic")
                         tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
                         continue
                     self._confirmed_paths.add(perm["message"])
@@ -1792,15 +2183,15 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     permission={"decision": "allow", "reason": "permission granted"},
                 )
                 tool_duration = int((time.time() - t0) * 1000)
-                res = self._persist_large_result(tu.name, raw) if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+                res = materialize_tool_result(raw, provider="anthropic")
                 await self._emit("tool_end", {
                     "tool_name": tu.name,
                     "tool_input": inp,
                     "duration_ms": tool_duration,
-                    "result_length": len(raw.encode()) if raw else 0,
+                    "result_length": len(materialized_content_bytes(res)) if res else 0,
                     "success": success,
                 })
-                print_tool_result(tu.name, res)
+                print_tool_result(tu.name, display_tool_result(res))
 
                 # Plan Mode 'clear-and-execute' 后：直接追加工具结果并跳出
                 if self._context_cleared:
@@ -1823,11 +2214,56 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         if block.type == "text":
             return {"type": "text", "text": block.text}
         if block.type == "thinking":
-            return {"type": "thinking", "thinking": block.thinking}
+            result = {"type": "thinking", "thinking": block.thinking}
+            signature = getattr(block, "signature", None)
+            if signature is not None:
+                result["signature"] = signature
+            return result
         if block.type == "tool_use":
             return {"type": "tool_use", "id": block.id, "name": block.name, "input": dict(block.input) if hasattr(block.input, 'items') else block.input}
         # Fallback
         return {"type": block.type}
+
+    def _normalize_anthropic_response_blocks(self, content: Any) -> list[dict[str, Any]]:
+        """Validate provider text fields before recording or replay storage."""
+
+        normalized: list[dict[str, Any]] = []
+        for index, block in enumerate(content):
+            block_kind = getattr(block, "type", None)
+            if block_kind == "text":
+                normalized.append(
+                    {
+                        "type": "text",
+                        "text": _normalize_provider_text(
+                            getattr(block, "text", None),
+                            provider="anthropic",
+                            block_kind="text",
+                            block_index=index,
+                        ),
+                    }
+                )
+            elif block_kind == "thinking":
+                thinking = _normalize_provider_text(
+                    getattr(block, "thinking", None),
+                    provider="anthropic",
+                    block_kind="thinking",
+                    block_index=index,
+                )
+                signature = getattr(block, "signature", None)
+                if signature is not None and not isinstance(signature, str):
+                    raise ProviderContentNormalizationError(
+                        provider="anthropic",
+                        block_kind="thinking",
+                        block_index=index,
+                        value=signature,
+                    )
+                item: dict[str, Any] = {"type": "thinking", "thinking": thinking}
+                if signature is not None:
+                    item["signature"] = signature
+                normalized.append(item)
+            else:
+                normalized.append(self._block_to_dict(block))
+        return normalized
 
     async def _call_anthropic_stream(self, on_tool_block_complete=None):
         """流式解析 Anthropic 响应；只记录 partial，不提前执行工具。"""
@@ -1868,25 +2304,37 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     elif event.type == "content_block_delta":
                         delta = event.delta
                         if hasattr(delta, 'text'):
+                            text = _normalize_provider_text(
+                                getattr(delta, "text", None),
+                                provider="anthropic",
+                                block_kind="text",
+                                block_index=getattr(event, "index", -1),
+                            )
                             if first_text:
                                 stop_spinner()
                                 self._emit_text("\n")
                                 first_text = False
                                 # ★ 发射 first_token 事件
                                 await self._emit("first_token", {"is_thinking": False})
-                            self._emit_text(delta.text)
+                            self._emit_text(text)
                             if self._runtime_recorder:
-                                self._runtime_recorder.partial_text(delta.text)
+                                self._runtime_recorder.partial_text(text)
                         elif hasattr(delta, 'thinking'):
+                            thinking = _normalize_provider_text(
+                                getattr(delta, "thinking", None),
+                                provider="anthropic",
+                                block_kind="thinking",
+                                block_index=getattr(event, "index", -1),
+                            )
                             if first_thinking:
                                 stop_spinner()
                                 self._emit_text("\n")
                                 first_thinking = False
                                 # ★ 发射 first_token 事件
                                 await self._emit("first_token", {"is_thinking": True})
-                            self._emit_text(delta.thinking)
+                            self._emit_text(thinking)
                             if self._runtime_recorder:
-                                self._runtime_recorder.partial_text(delta.thinking)
+                                self._runtime_recorder.partial_text(thinking)
                         elif hasattr(delta, 'partial_json'):
                             tb = tool_blocks_by_index.get(event.index)
                             if tb:
@@ -1905,10 +2353,12 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
                 final_message = await stream.get_final_message()
 
-            if "deepseek" in self.model:
-                final_message.content = [b for b in final_message.content]
-            else:
-                final_message.content = [b for b in final_message.content if b.type != "thinking"]
+            # Thinking blocks, including their signatures, are part of the
+            # provider response state and must be preserved for the next
+            # request.  The display path already streams their text; removing
+            # them here would make tool-use follow-ups invalid for Anthropic
+            # and compatible endpoints.
+            final_message.content = [b for b in final_message.content]
             return final_message
 
         def _record_retry(attempt: int, error: Exception) -> None:
@@ -1954,21 +2404,14 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
             # Consume memory prefetch if settled (non-blocking poll, zero-wait)
             if memory_prefetch and memory_prefetch.settled and not memory_prefetch.consumed:
+                memories = memory_prefetch.task.result()
+                if memories:
+                    self._persist_memory_context_event(memories)
+                    self._refresh_provider_context_from_canonical()
+                    for m in memories:
+                        self._already_surfaced_memories.add(m.path)
+                        self._session_memory_bytes += len(m.content.encode())
                 memory_prefetch.consumed = True
-                try:
-                    memories = memory_prefetch.task.result()
-                    if memories:
-                        injection_text = format_memories_for_injection(memories)
-                        last = self._openai_messages[-1] if self._openai_messages else None
-                        if last and last.get("role") == "user":
-                            last["content"] = (last.get("content") or "") + "\n\n" + injection_text
-                        else:
-                            self._openai_messages.append({"role": "user", "content": injection_text})
-                        for m in memories:
-                            self._already_surfaced_memories.add(m.path)
-                            self._session_memory_bytes += len(m.content.encode())
-                except Exception:
-                    pass  # prefetch errors already logged
 
             if not self.is_sub_agent:
                 start_spinner()
@@ -1999,21 +2442,44 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
             choice = response.get("choices", [{}])[0] if response.get("choices") else {}
             message = choice.get("message", {})
-
-            self._openai_messages.append(message)
-
             tool_calls = message.get("tool_calls")
 
-            if self._runtime_recorder:
-                if message.get("content"):
-                    self._runtime_recorder.final_text(message["content"])
-                for tool_call in tool_calls or []:
-                    function = tool_call.get("function", {})
-                    self._runtime_recorder.final_tool_call(
-                        tool_call.get("id", "unknown-call"),
-                        function.get("name", "unknown"),
-                        function.get("arguments", "{}"),
+            try:
+                normalized_message = dict(message)
+                if "content" in message and message.get("content") is not None:
+                    normalized_message["content"] = _normalize_provider_text(
+                        message["content"],
+                        provider="openai",
+                        block_kind="text",
+                        block_index=0,
                     )
+                if "reasoning_content" in message:
+                    normalized_message["reasoning_content"] = _normalize_provider_text(
+                        message["reasoning_content"],
+                        provider="openai",
+                        block_kind="thinking",
+                        block_index=0,
+                    )
+                message = normalized_message
+                if self._runtime_recorder:
+                    if "reasoning_content" in message:
+                        self._runtime_recorder.final_thinking(
+                            message["reasoning_content"]
+                        )
+                    if "content" in message and message.get("content") is not None:
+                        self._runtime_recorder.final_text(message["content"])
+                    for tool_call in tool_calls or []:
+                        function = tool_call.get("function", {})
+                        self._runtime_recorder.final_tool_call(
+                            tool_call.get("id", "unknown-call"),
+                            function.get("name", "unknown"),
+                            function.get("arguments", "{}"),
+                        )
+            except ProviderContentNormalizationError as error:
+                self._record_runtime_model_error(error)
+                raise
+
+            self._openai_messages.append(message)
 
             # ★ 发射 turn_end
             cache_read = 0
@@ -2128,7 +2594,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                             arguments=ct_item.get("arguments_raw"),
                             permission={"decision": "allow", "reason": ct_item.get("reason", "")},
                         )
-                        res = self._persist_large_result(ct_item["fn"], raw) if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+                        res = materialize_tool_result(raw, provider="openai")
                         return ct_item, res, success
 
                     t0_batch = time.time()
@@ -2139,10 +2605,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                             "tool_name": ct_item["fn"],
                             "tool_input": ct_item["inp"],
                             "duration_ms": tool_duration,
-                            "result_length": len(res.encode()) if res else 0,
+                            "result_length": len(materialized_content_bytes(res)) if res else 0,
                             "success": success,
                         })
-                        print_tool_result(ct_item["fn"], res)
+                        print_tool_result(ct_item["fn"], display_tool_result(res))
                         self._openai_messages.append({"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
                 else:
                     for ct in batch["items"]:
@@ -2155,7 +2621,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                                 arguments=ct.get("arguments_raw"),
                                 permission={"decision": ct.get("decision", "deny"), "reason": ct.get("reason", "")},
                             )
-                            res = self._persist_large_result(ct["fn"], raw) if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
+                            res = materialize_tool_result(raw, provider="openai")
                             self._openai_messages.append({"role": "tool", "tool_call_id": ct["tc"]["id"], "content": res})
                             continue
                         t0 = time.time()
@@ -2168,13 +2634,13 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                             permission={"decision": "allow", "reason": ct.get("reason", "")},
                         )
                         tool_duration = int((time.time() - t0) * 1000)
-                        res = self._persist_large_result(ct["fn"], raw) if isinstance(raw, str) else json.dumps(raw, ensure_ascii=False)
-                        print_tool_result(ct["fn"], res)
+                        res = materialize_tool_result(raw, provider="openai")
+                        print_tool_result(ct["fn"], display_tool_result(res))
                         await self._emit("tool_end", {
                             "tool_name": ct["fn"],
                             "tool_input": ct["inp"],
                             "duration_ms": tool_duration,
-                            "result_length": len(raw.encode()) if raw else 0,
+                            "result_length": len(materialized_content_bytes(res)) if res else 0,
                             "success": success,
                         })
                         if self._context_cleared:
@@ -2228,8 +2694,18 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
                 # 捕获 reasoning_content（DeepSeek的思考内容）
                 rc = None
-                if hasattr(delta, "reasoning_content") and delta.reasoning_content:
-                    rc = delta.reasoning_content
+                if hasattr(delta, "reasoning_content"):
+                    raw_reasoning = getattr(delta, "reasoning_content")
+                    # ``None`` is the SDK's absent-field marker.  Every other
+                    # value, including falsey values such as 0/False/[],
+                    # must cross the same strict provider boundary.
+                    if raw_reasoning is not None:
+                        rc = _normalize_provider_text(
+                            raw_reasoning,
+                            provider="openai",
+                            block_kind="thinking",
+                            block_index=0,
+                        )
 
                 if rc:
                     if not reasoning_content:
@@ -2240,16 +2716,22 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         self._runtime_recorder.partial_text(rc)
                     reasoning_content += rc
 
-                if delta and delta.content:
+                if delta is not None and getattr(delta, "content", None) is not None:
+                    text_delta = _normalize_provider_text(
+                        getattr(delta, "content"),
+                        provider="openai",
+                        block_kind="text",
+                        block_index=0,
+                    )
                     if first_text:
                         stop_spinner()
                         self._emit_text("\n")
                         first_text = False
                         await self._emit("first_token", {"is_thinking": False})
-                    self._emit_text(delta.content)
+                    self._emit_text(text_delta)
                     if self._runtime_recorder:
-                        self._runtime_recorder.partial_text(delta.content)
-                    content += delta.content
+                        self._runtime_recorder.partial_text(text_delta)
+                    content += text_delta
 
                 if delta and delta.tool_calls:
                     for tc in delta.tool_calls:

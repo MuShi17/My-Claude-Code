@@ -8,7 +8,20 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-SESSION_DIR = Path.home() / ".mini-claude" / "sessions"
+def runtime_data_dir() -> Path:
+    """Return the directory for canonical runtime data.
+
+    Harbor can point this at its mounted agent-log directory so canonical
+    events and their derived snapshots survive an outer agent timeout.
+    """
+
+    configured = os.environ.get("MINI_CLAUDE_RUNTIME_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".mini-claude"
+
+
+SESSION_DIR = runtime_data_dir() / "sessions"
 SESSION_SNAPSHOT_VERSION = 2
 
 
@@ -258,5 +271,6 @@ __all__ = [
     "load_canonical_session",
     "load_session",
     "save_session_v2",
+    "runtime_data_dir",
     "runtime_store_path",
 ]

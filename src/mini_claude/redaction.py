@@ -104,6 +104,19 @@ def redact_payload(
             }
         if isinstance(item, (list, tuple)):
             return [visit(child, _path(path, index)) for index, child in enumerate(item)]
+        replay_payload = (
+            path == "content.text"
+            or path.startswith("actions.compaction.context_messages")
+            or path.startswith("actions.context_transition.replacements")
+        )
+        if isinstance(item, str) and replay_payload:
+            # Canonical model text/thinking is replay state.  Replacing a long
+            # string with a bounded-ref mapping would violate RuntimeEvent's
+            # string-only content contract, invalidate signed thinking replay,
+            # or change the effective-context digest. Secret-shaped values
+            # were already redacted above; the remaining replay state must
+            # stay byte-stable even when it is large.
+            return item
         if isinstance(item, str) and len(item) > policy.max_string_chars:
             bounded.append(path or "$")
             return bounded_placeholder(item, ref=f"inline:{path or 'payload'}", policy=policy)

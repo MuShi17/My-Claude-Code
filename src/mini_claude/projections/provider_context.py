@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from typing import Any
 
 from .model_replay_projection import ModelReplayProjection, ModelReplayResult
+from ..provider_content import materialize_tool_result
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,11 +17,13 @@ class ProviderContext:
     projection_digest: str
     messages: tuple[dict[str, Any], ...]
     diagnostics: tuple[Any, ...]
+    context_epoch: str
 
 
 def _without_runtime_id(message: dict[str, Any]) -> dict[str, Any]:
     value = dict(message)
     value.pop("runtime_event_id", None)
+    value.pop("context_type", None)
     return value
 
 
@@ -42,11 +44,9 @@ def _anthropic_thinking_block(item: Any) -> dict[str, Any] | None:
 
 
 def _tool_result_content(value: Any) -> str | list[Any]:
-    """Keep provider-valid text/block lists and encode structured values."""
+    """Materialize tool results with one deterministic Anthropic boundary."""
 
-    if isinstance(value, str) or isinstance(value, list):
-        return value
-    return json.dumps(value, ensure_ascii=False)
+    return materialize_tool_result(value, provider="anthropic")
 
 
 def _anthropic_messages(messages: tuple[dict[str, Any], ...]) -> tuple[dict[str, Any], ...]:
@@ -137,27 +137,103 @@ def _openai_messages(
     messages: tuple[dict[str, Any], ...], *, system_prompt: str | None = None
 ) -> tuple[dict[str, Any], ...]:
     output: list[dict[str, Any]] = []
+    pending_reasoning: list[str] = []
+    pending_text: list[str] = []
+
+    def flush_pending_assistant() -> None:
+        if not pending_reasoning and not pending_text:
+            return
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": "\n".join(pending_text),
+        }
+        if pending_reasoning:
+            message["reasoning_content"] = "".join(pending_reasoning)
+        output.append(message)
+        pending_reasoning.clear()
+        pending_text.clear()
+
+    def reasoning_item_text(item: Any) -> str | None:
+        if not isinstance(item, dict) or item.get("kind") != "thinking":
+            return None
+        options = item.get("provider_options")
+        if not isinstance(options, dict):
+            return None
+        openai = options.get("openai")
+        if not isinstance(openai, dict) or openai.get("reasoning_field") != "reasoning_content":
+            return None
+        text = item.get("text")
+        return text if isinstance(text, str) else None
+
     if system_prompt is not None:
         output.append({"role": "system", "content": system_prompt})
     for source in messages:
         message = _without_runtime_id(source)
-        if message.get("role") == "assistant" and isinstance(message.get("content"), list):
-            # Chat Completions has no portable signed-thinking block.  Keep
-            # tool calls and visible text, but drop provider-internal thinking
-            # instead of emitting the projection's neutral ``kind`` shape.
-            visible_text = [
-                item.get("text", "")
-                for item in message["content"]
-                if isinstance(item, dict) and item.get("kind") == "text"
-            ]
-            if message.get("tool_calls") or visible_text:
+        role = message.get("role")
+        if role != "assistant":
+            flush_pending_assistant()
+            if role == "tool":
                 message = {
                     **message,
-                    "content": "\n".join(text for text in visible_text if text),
+                    "content": materialize_tool_result(
+                        message.get("content", ""), provider="openai"
+                    ),
                 }
-            else:
-                continue
-        output.append(message)
+            output.append(message)
+            continue
+
+        visible_text: list[str] = []
+        reasoning_text: list[str] = []
+        content = message.get("content")
+        if isinstance(content, list):
+            # Chat Completions has no neutral ``kind`` block format.  Only
+            # provider-marked OpenAI reasoning and visible text are projected;
+            # Anthropic signed/unsigned blocks are intentionally degraded.
+            for item in content:
+                if isinstance(item, dict) and item.get("kind") == "text":
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        visible_text.append(text)
+                elif (text := reasoning_item_text(item)) is not None:
+                    reasoning_text.append(text)
+        elif isinstance(content, str):
+            visible_text.append(content)
+
+        has_reasoning = bool(reasoning_text)
+        has_text = bool(visible_text)
+        tool_calls = message.get("tool_calls")
+        if tool_calls:
+            combined_reasoning = [*pending_reasoning, *reasoning_text]
+            combined_text = [*pending_text, *visible_text]
+            projected = {**message}
+            if combined_text or combined_reasoning:
+                projected["content"] = "\n".join(combined_text)
+            if combined_reasoning:
+                projected["reasoning_content"] = "".join(combined_reasoning)
+            output.append(projected)
+            pending_reasoning.clear()
+            pending_text.clear()
+        elif pending_reasoning:
+            # A visible continuation following provider reasoning belongs to
+            # the same assistant step and must be sent with that reasoning.
+            pending_text.extend(visible_text)
+        elif has_reasoning:
+            pending_reasoning.extend(reasoning_text)
+            pending_text.extend(visible_text)
+        elif has_text:
+            # Preserve the existing projection shape for ordinary OpenAI
+            # text-only turns; only reasoning-bearing steps need deferred
+            # assembly with a later tool-call message.
+            output.append({**message, "content": "\n".join(visible_text)})
+        else:
+            flush_pending_assistant()
+            # A tool-call-free assistant message with no supported content is
+            # not a valid replay carrier.  Preserve ordinary empty messages
+            # only when they have fields other than the neutral projection.
+            if not isinstance(content, list):
+                output.append(message)
+
+    flush_pending_assistant()
     return tuple(output)
 
 
@@ -176,6 +252,17 @@ class CanonicalModelContextAdapter:
         system_prompt: str | None = None,
     ) -> ProviderContext:
         result: ModelReplayResult = self.projection.build(source, high_water=high_water)
+        return self.build_result(result, provider=provider, system_prompt=system_prompt)
+
+    def build_result(
+        self,
+        result: ModelReplayResult,
+        *,
+        provider: str,
+        system_prompt: str | None = None,
+    ) -> ProviderContext:
+        """Adapt an already materialized neutral result without rereading it."""
+
         if provider == "anthropic":
             messages = _anthropic_messages(result.messages)
         elif provider == "openai":
@@ -189,6 +276,7 @@ class CanonicalModelContextAdapter:
             projection_digest=result.digest,
             messages=messages,
             diagnostics=result.diagnostics,
+            context_epoch=result.context_epoch,
         )
 
 

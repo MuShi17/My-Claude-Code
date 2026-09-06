@@ -12,7 +12,12 @@ from typing import Any, Callable, Mapping
 
 from .event_sink import EventSink, EventSinkError
 from .redaction import RedactionPolicy, bound_payload, redact_event_dict
-from .runtime_event import RuntimeEvent, RuntimeEventError, canonical_json_bytes
+from .runtime_event import (
+    SCHEMA_VERSION as RUNTIME_EVENT_SCHEMA_VERSION,
+    RuntimeEvent,
+    RuntimeEventError,
+    canonical_json_bytes,
+)
 
 SCHEMA_VERSION = 3
 
@@ -474,138 +479,10 @@ class SQLiteRuntimeStore:
         connection = self.connection
         try:
             connection.execute("BEGIN IMMEDIATE")
-            existing = self._existing_result(canonical)
-            if existing is not None:
-                connection.rollback()
-                return existing
-            state = connection.execute(
-                """
-                SELECT session_id, invocation_id, sealed, terminal_event_id, high_water, last_event_seq
-                FROM runtime_run_state WHERE run_id = ?
-                """,
-                (canonical.run_id,),
-            ).fetchone()
-            if state is not None and state["session_id"] != canonical.session_id:
-                connection.rollback()
-                raise StoreValidationError(
-                    f"run {canonical.run_id} identity does not match canonical event"
-                )
-            if state is not None and bool(state["sealed"]):
-                connection.rollback()
-                raise SealedRunError(
-                    f"run {canonical.run_id} is sealed by {state['terminal_event_id']}"
-                )
-            existing_count = int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM runtime_events WHERE invocation_id = ?",
-                    (canonical.invocation_id,),
-                ).fetchone()[0]
-            )
-            if existing_count == 0 and canonical.kind != "invocation_opened":
-                connection.rollback()
-                raise StoreValidationError(
-                    "the first canonical event for an invocation must be invocation_opened"
-                )
-            if existing_count > 0 and canonical.kind == "invocation_opened":
-                connection.rollback()
-                raise StoreValidationError(
-                    "an invocation can have only one opening event"
-                )
-            event_seq = int(
-                connection.execute(
-                    "SELECT COALESCE(MAX(event_seq), 0) + 1 FROM runtime_events WHERE invocation_id = ?",
-                    (canonical.invocation_id,),
-                ).fetchone()[0]
-            )
-            ordinal = int(
-                connection.execute("SELECT COALESCE(MAX(ordinal), 0) + 1 FROM runtime_events").fetchone()[0]
-            )
-            now = _utc_now()
-            connection.execute(
-                """
-                INSERT INTO runtime_events(
-                    event_id, ordinal, event_seq, schema_version, session_id, turn_id, run_id,
-                    invocation_id, parent_run_id, ts, partial, terminal, digest,
-                    event_json, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    canonical.id,
-                    ordinal,
-                    event_seq,
-                    canonical.schema_version,
-                    canonical.session_id,
-                    canonical.turn_id,
-                    canonical.run_id,
-                    canonical.invocation_id,
-                    canonical.parent_run_id,
-                    canonical.ts,
-                    int(canonical.partial),
-                    int(canonical.is_terminal),
-                    digest,
-                    canonical.canonical_bytes(),
-                    now,
-                ),
-            )
-            connection.execute(
-                """
-                INSERT INTO runtime_session_event_ordinals(session_id, high_water)
-                VALUES (?, ?)
-                ON CONFLICT(session_id) DO UPDATE SET high_water = excluded.high_water
-                """,
-                (canonical.session_id, ordinal),
-            )
-            if state is None:
-                connection.execute(
-                    """
-                    INSERT INTO runtime_run_state(
-                        run_id, session_id, invocation_id, parent_run_id, status,
-                        sealed, terminal_event_id, terminal_ordinal, high_water
-                        , last_event_seq
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        canonical.run_id,
-                        canonical.session_id,
-                        canonical.invocation_id,
-                        canonical.parent_run_id,
-                        canonical.status or "open",
-                        int(canonical.is_terminal),
-                        canonical.id if canonical.is_terminal else None,
-                        ordinal if canonical.is_terminal else None,
-                        ordinal,
-                        event_seq,
-                    ),
-                )
-            else:
-                connection.execute(
-                    """
-                    UPDATE runtime_run_state
-                    SET status = CASE WHEN ? THEN ? ELSE status END,
-                        sealed = CASE WHEN ? THEN 1 ELSE sealed END,
-                        terminal_event_id = CASE WHEN ? THEN ? ELSE terminal_event_id END,
-                        terminal_ordinal = CASE WHEN ? THEN ? ELSE terminal_ordinal END,
-                        high_water = ?,
-                        last_event_seq = ?
-                    WHERE run_id = ?
-                    """,
-                    (
-                        int(canonical.is_terminal),
-                        canonical.status or "open",
-                        int(canonical.is_terminal),
-                        int(canonical.is_terminal),
-                        canonical.id,
-                        int(canonical.is_terminal),
-                        ordinal,
-                        ordinal,
-                        event_seq,
-                        canonical.run_id,
-                    ),
-                )
-            self._apply_tool_operation(connection, canonical, ordinal=ordinal, created_at=now)
+            result = self._append_in_transaction(canonical, connection)
             self._fault("store.commit")
             connection.commit()
-            return AppendResult(canonical, ordinal, digest, event_seq=event_seq, idempotent=False)
+            return result
         except (SealedRunError, IdempotencyConflictError, StoreFaultError, RuntimeStoreError):
             if connection.in_transaction:
                 connection.rollback()
@@ -624,6 +501,113 @@ class SQLiteRuntimeStore:
             if connection.in_transaction:
                 connection.rollback()
             raise StoreIOError(f"SQLite append failed: {error}") from error
+
+    def _append_in_transaction(
+        self, canonical: RuntimeEvent, connection: sqlite3.Connection
+    ) -> AppendResult:
+        existing = self._existing_result(canonical)
+        if existing is not None:
+            return existing
+        state = connection.execute(
+            """
+            SELECT session_id, invocation_id, sealed, terminal_event_id, high_water, last_event_seq
+            FROM runtime_run_state WHERE run_id = ?
+            """,
+            (canonical.run_id,),
+        ).fetchone()
+        if state is not None and state["session_id"] != canonical.session_id:
+            raise StoreValidationError(
+                f"run {canonical.run_id} identity does not match canonical event"
+            )
+        if state is not None and bool(state["sealed"]):
+            raise SealedRunError(
+                f"run {canonical.run_id} is sealed by {state['terminal_event_id']}"
+            )
+        existing_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM runtime_events WHERE invocation_id = ?",
+                (canonical.invocation_id,),
+            ).fetchone()[0]
+        )
+        if existing_count == 0 and canonical.kind != "invocation_opened":
+            raise StoreValidationError(
+                "the first canonical event for an invocation must be invocation_opened"
+            )
+        if existing_count > 0 and canonical.kind == "invocation_opened":
+            raise StoreValidationError("an invocation can have only one opening event")
+        event_seq = int(
+            connection.execute(
+                "SELECT COALESCE(MAX(event_seq), 0) + 1 FROM runtime_events WHERE invocation_id = ?",
+                (canonical.invocation_id,),
+            ).fetchone()[0]
+        )
+        ordinal = int(
+            connection.execute(
+                "SELECT COALESCE(MAX(ordinal), 0) + 1 FROM runtime_events"
+            ).fetchone()[0]
+        )
+        now = _utc_now()
+        connection.execute(
+            """
+            INSERT INTO runtime_events(
+                event_id, ordinal, event_seq, schema_version, session_id, turn_id, run_id,
+                invocation_id, parent_run_id, ts, partial, terminal, digest,
+                event_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                canonical.id, ordinal, event_seq, canonical.schema_version,
+                canonical.session_id, canonical.turn_id, canonical.run_id,
+                canonical.invocation_id, canonical.parent_run_id, canonical.ts,
+                int(canonical.partial), int(canonical.is_terminal), canonical.digest(),
+                canonical.canonical_bytes(), now,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO runtime_session_event_ordinals(session_id, high_water)
+            VALUES (?, ?)
+            ON CONFLICT(session_id) DO UPDATE SET high_water = excluded.high_water
+            """,
+            (canonical.session_id, ordinal),
+        )
+        if state is None:
+            connection.execute(
+                """
+                INSERT INTO runtime_run_state(
+                    run_id, session_id, invocation_id, parent_run_id, status,
+                    sealed, terminal_event_id, terminal_ordinal, high_water, last_event_seq
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    canonical.run_id, canonical.session_id, canonical.invocation_id,
+                    canonical.parent_run_id, canonical.status or "open",
+                    int(canonical.is_terminal), canonical.id if canonical.is_terminal else None,
+                    ordinal if canonical.is_terminal else None, ordinal, event_seq,
+                ),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE runtime_run_state
+                SET status = CASE WHEN ? THEN ? ELSE status END,
+                    sealed = CASE WHEN ? THEN 1 ELSE sealed END,
+                    terminal_event_id = CASE WHEN ? THEN ? ELSE terminal_event_id END,
+                    terminal_ordinal = CASE WHEN ? THEN ? ELSE terminal_ordinal END,
+                    high_water = ?, last_event_seq = ?
+                WHERE run_id = ?
+                """,
+                (
+                    int(canonical.is_terminal), canonical.status or "open",
+                    int(canonical.is_terminal), int(canonical.is_terminal), canonical.id,
+                    int(canonical.is_terminal), ordinal if canonical.is_terminal else None,
+                    ordinal, event_seq, canonical.run_id,
+                ),
+            )
+        self._apply_tool_operation(connection, canonical, ordinal=ordinal, created_at=now)
+        return AppendResult(
+            canonical, ordinal, canonical.digest(), event_seq=event_seq, idempotent=False
+        )
 
     @staticmethod
     def _apply_tool_operation(
@@ -818,6 +802,7 @@ class SQLiteRuntimeStore:
         invocation_id: str | None = None,
         upto_ordinal: int | None = None,
         high_water: int | None = None,
+        after_ordinal: int | None = None,
     ) -> list[RuntimeEvent]:
         try:
             return [event for _, event in self.read_event_records(
@@ -827,6 +812,7 @@ class SQLiteRuntimeStore:
                 invocation_id=invocation_id,
                 upto_ordinal=upto_ordinal,
                 high_water=high_water,
+                after_ordinal=after_ordinal,
             )]
         except CorruptionError:
             raise
@@ -942,12 +928,18 @@ class SQLiteRuntimeStore:
         invocation_id: str | None = None,
         upto_ordinal: int | None = None,
         high_water: int | None = None,
+        after_ordinal: int | None = None,
     ) -> list[tuple[int, RuntimeEvent]]:
         """Read ``(store ordinal, event)`` pairs without changing the store."""
 
         connection = self._ensure_open()
         self._fault("store.corrupt_read")
-        self._validate_event_sequences(connection)
+        # A suffix read is the normal warm-replay path.  Append transactions
+        # already enforce the per-invocation sequence, so scanning the entire
+        # ledger here would turn an incremental query back into O(history).
+        # Cold reads and explicit audit reads retain full validation.
+        if after_ordinal is None:
+            self._validate_event_sequences(connection)
         clauses: list[str] = []
         parameters: list[Any] = []
         for field, value in (
@@ -963,12 +955,31 @@ class SQLiteRuntimeStore:
             if bound is not None:
                 clauses.append("ordinal <= ?")
                 parameters.append(bound)
+        if after_ordinal is not None:
+            clauses.append("ordinal > ?")
+            parameters.append(after_ordinal)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         try:
             rows = connection.execute(
                 f"SELECT * FROM runtime_events{where} ORDER BY ordinal ASC", parameters
             ).fetchall()
             return [(int(row["ordinal"]), self._event_from_row(row)) for row in rows]
+        except CorruptionError:
+            raise
+        except sqlite3.Error as error:
+            self._raise_sqlite(error, operation="read")
+            raise AssertionError("unreachable")
+
+    def read_event(self, event_id: str) -> RuntimeEvent | None:
+        """Read one immutable event by identity without scanning the ledger."""
+
+        connection = self._ensure_open()
+        self._fault("store.corrupt_read")
+        try:
+            row = connection.execute(
+                "SELECT * FROM runtime_events WHERE event_id = ?", (event_id,)
+            ).fetchone()
+            return self._event_from_row(row) if row is not None else None
         except CorruptionError:
             raise
         except sqlite3.Error as error:
@@ -1402,6 +1413,110 @@ class SQLiteRuntimeStore:
             if connection.in_transaction:
                 connection.rollback()
             self._raise_sqlite(error, operation="compaction checkpoint")
+
+    def append_compaction_transition(
+        self,
+        checkpoint: Mapping[str, Any] | Any,
+        event: RuntimeEvent | Mapping[str, Any],
+    ) -> AppendResult:
+        """Atomically persist a checkpoint and its canonical activation event."""
+
+        value = checkpoint.to_dict() if hasattr(checkpoint, "to_dict") else dict(checkpoint)
+        try:
+            checkpoint_id = str(value["checkpoint_id"])
+            source_high_water = int(value["source_high_water"])
+            source_digest = str(value["source_digest"])
+            canonical_schema_version = int(value["canonical_schema_version"])
+            compaction_version = str(value["compaction_version"])
+            projection_version = str(value["projection_version"])
+            coverage = dict(value["coverage"])
+            canonical = event if isinstance(event, RuntimeEvent) else RuntimeEvent.from_dict(event)
+            canonical.validate()
+        except (KeyError, TypeError, ValueError, RuntimeEventError) as error:
+            raise StoreValidationError(
+                f"invalid compaction transition: {error}"
+            ) from error
+        if source_high_water < 0 or not checkpoint_id.strip() or not source_digest.strip():
+            raise StoreValidationError("invalid compaction transition identity")
+        if coverage.get("to_ordinal") != source_high_water:
+            raise StoreValidationError("compaction coverage does not reach source high-water")
+        if canonical_schema_version != RUNTIME_EVENT_SCHEMA_VERSION:
+            raise StoreValidationError("compaction canonical schema version is unsupported")
+        transition = (canonical.actions or {}).get("context_transition")
+        if not isinstance(transition, Mapping):
+            raise StoreValidationError("activation event lacks context_transition action")
+        try:
+            transition_high_water = int(transition.get("source_high_water", -1))
+        except (TypeError, ValueError) as error:
+            raise StoreValidationError(
+                "activation transition source high-water is invalid"
+            ) from error
+        if (
+            transition_high_water != source_high_water
+            or str(transition.get("source_digest", "")) != source_digest
+            or str(transition.get("projection_version", "")) != projection_version
+        ):
+            raise StoreValidationError("checkpoint and transition source metadata differ")
+        compaction = (canonical.actions or {}).get("compaction")
+        if isinstance(compaction, Mapping) and str(compaction.get("checkpoint_id")) != checkpoint_id:
+            raise StoreValidationError("compaction action references a different checkpoint")
+        if source_high_water > self.current_high_water:
+            raise StoreValidationError("compaction source high-water is not readable")
+        if self.read_immutable_prefix(high_water=source_high_water).digest != source_digest:
+            raise StoreValidationError("compaction source digest does not match canonical prefix")
+        encoded = canonical_json_bytes(value)
+        coverage_encoded = canonical_json_bytes(coverage)
+        self._ensure_open()
+        self._fault("store.compaction_checkpoint")
+        self._fault("store.append")
+        self._fault("store.corrupt_read")
+        connection = self.connection
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO runtime_compaction_checkpoints(
+                    checkpoint_id, source_high_water, source_digest,
+                    canonical_schema_version, compaction_version,
+                    projection_version, coverage_json, checkpoint_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(checkpoint_id) DO UPDATE SET
+                    checkpoint_json = excluded.checkpoint_json,
+                    coverage_json = excluded.coverage_json
+                """,
+                (
+                    checkpoint_id, source_high_water, source_digest,
+                    canonical_schema_version, compaction_version,
+                    projection_version, coverage_encoded, encoded,
+                    str(value.get("created_at") or _utc_now()),
+                ),
+            )
+            result = self._append_in_transaction(canonical, connection)
+            self._fault("store.commit")
+            connection.commit()
+            return result
+        except (SealedRunError, IdempotencyConflictError, StoreFaultError, RuntimeStoreError):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise StoreIOError(
+                f"SQLite compaction transition constraint failed: {error}"
+            ) from error
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            if "commit" in str(error).lower():
+                raise StoreCommitError(str(error)) from error
+            self._raise_sqlite(error, operation="compaction transition")
+        except Exception as error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise StoreIOError(
+                f"SQLite compaction transition failed: {error}"
+            ) from error
 
     def read_compaction_checkpoint(self, checkpoint_id: str) -> dict[str, Any] | None:
         self._ensure_open()

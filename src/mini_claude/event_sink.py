@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Callable, Protocol, runtime_checkable
 
+from .context_transition import (
+    ContextTransition,
+    ContextTransitionError,
+    replacement_digest,
+)
 from .redaction import RedactionPolicy, redact_event_dict
+from .projections.base import stable_digest
 from .runtime_event import RuntimeEvent, RuntimeEventError, RuntimeEventValidationError
 
 
@@ -49,6 +56,71 @@ def _as_event(event: RuntimeEvent | dict[str, Any]) -> RuntimeEvent:
         raise
     except Exception as error:
         raise RuntimeEventValidationError(str(error)) from error
+
+
+def _prepare_event(
+    event: RuntimeEvent | dict[str, Any], policy: RedactionPolicy
+) -> RuntimeEvent:
+    """Redact an event and finalize digest metadata for effective context."""
+
+    source = _as_event(event)
+    source_dict = source.to_dict()
+    raw_actions = source_dict.get("actions") or {}
+    raw_transition = raw_actions.get("context_transition") if isinstance(raw_actions, Mapping) else None
+    if isinstance(raw_transition, Mapping):
+        try:
+            # Validate the producer-supplied transition before redaction. This
+            # prevents the preparation boundary from accepting a tampered
+            # replacement digest and then silently repairing it.
+            parsed_transition = ContextTransition.from_value(raw_transition)
+            raw_compaction = raw_actions.get("compaction") if isinstance(raw_actions, Mapping) else None
+            expected_result = None
+            if parsed_transition.replacements:
+                expected_result = stable_digest(
+                    {"replacements": [item.to_dict() for item in parsed_transition.replacements]}
+                )
+            elif isinstance(raw_compaction, Mapping) and raw_compaction.get("reset_model_context"):
+                expected_result = stable_digest(raw_compaction.get("context_messages", []))
+            if expected_result is not None and parsed_transition.result_digest != expected_result:
+                raise ContextTransitionError("transition result digest mismatch")
+        except ContextTransitionError as error:
+            raise RuntimeEventValidationError(
+                str(error), field="actions.context_transition"
+            ) from error
+
+    clean, _ = redact_event_dict(source_dict, policy)
+    actions = clean.get("actions") or {}
+    transition_value = actions.get("context_transition") if isinstance(actions, Mapping) else None
+    if isinstance(transition_value, Mapping):
+        transition = dict(transition_value)
+        clean_replacements: list[dict[str, Any]] = []
+        for item in transition.get("replacements", []):
+            replacement = dict(item)
+            if "replacement" in replacement:
+                replacement["replacement_digest"] = replacement_digest(
+                    replacement["replacement"]
+                )
+            clean_replacements.append(replacement)
+        transition["replacements"] = clean_replacements
+        compaction = actions.get("compaction") if isinstance(actions, Mapping) else None
+        if clean_replacements:
+            transition["result_digest"] = stable_digest(
+                {"replacements": clean_replacements}
+            )
+        elif isinstance(compaction, Mapping) and compaction.get("reset_model_context"):
+            transition["result_digest"] = stable_digest(
+                compaction.get("context_messages", [])
+            )
+        actions = dict(actions)
+        actions["context_transition"] = transition
+        clean["actions"] = actions
+        try:
+            ContextTransition.from_value(transition)
+        except ContextTransitionError as error:
+            raise RuntimeEventValidationError(
+                str(error), field="actions.context_transition"
+            ) from error
+    return RuntimeEvent.from_dict(clean)
 
 
 class RecordingEventSink:
@@ -120,9 +192,7 @@ class CanonicalSink:
         self.redaction_policy = redaction_policy or RedactionPolicy()
 
     def prepare(self, event: RuntimeEvent | dict[str, Any]) -> RuntimeEvent:
-        source = _as_event(event)
-        clean, _ = redact_event_dict(source.to_dict(), self.redaction_policy)
-        return RuntimeEvent.from_dict(clean)
+        return _prepare_event(event, self.redaction_policy)
 
     def emit(self, event: RuntimeEvent | dict[str, Any]) -> RuntimeEvent:
         clean = self.prepare(event)
@@ -180,11 +250,12 @@ class RuntimeEventEmitter:
         self.redaction_policy = redaction_policy or RedactionPolicy()
 
     def emit(self, event: RuntimeEvent | dict[str, Any]) -> RuntimeEvent:
-        source = _as_event(event)
-        clean, _ = redact_event_dict(source.to_dict(), self.redaction_policy)
-        return self.sink.emit(RuntimeEvent.from_dict(clean))
+        return self.sink.emit(self.prepare(event))
 
     append = emit
+
+    def prepare(self, event: RuntimeEvent | dict[str, Any]) -> RuntimeEvent:
+        return _prepare_event(event, self.redaction_policy)
 
     def flush(self) -> None:
         self.sink.flush()

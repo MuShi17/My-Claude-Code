@@ -154,6 +154,20 @@ def test_redaction_and_bounded_reference_never_expose_secret():
     assert reference["sha256"].startswith("sha256:")
 
 
+def test_redaction_keeps_long_canonical_text_string_for_replay():
+    text = "reasoning " * 2_000
+    clean, report = redact_event_dict(
+        {
+            "content": {"kind": "thinking", "text": text},
+        },
+        RedactionPolicy(max_string_chars=10),
+    )
+
+    assert clean["content"]["text"] == text
+    assert isinstance(clean["content"]["text"], str)
+    assert "content.text" not in report.bounded_paths
+
+
 def test_emitter_redacts_before_canonical_sink():
     canonical = RecordingEventSink()
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -17,8 +18,10 @@ from .base import (
 
 def _phase(event: Any) -> str:
     kind = event.kind
-    if kind in {"invocation_opened", "text", "thinking", "function_call", "model_final", "usage"}:
+    if kind in {"invocation_opened", "text", "thinking", "context", "function_call", "model_final", "usage"}:
         return "model"
+    if kind in {"context_transition"}:
+        return "context"
     if kind in {"permission"}:
         return "permission"
     if kind in {"tool_dispatch"}:
@@ -96,6 +99,15 @@ class RunTraceProjection:
                     entry[action_name] = dict(actions[action_name])
             if error_type:
                 entry["error_type"] = error_type
+            if content.get("kind") == "context":
+                entry["context_type"] = content.get("context_type")
+                entry["sources"] = list(content.get("sources", []))
+                entry["content_digest"] = content.get("content_digest")
+            if "context_transition" in actions:
+                transition = actions["context_transition"]
+                if isinstance(transition, Mapping):
+                    entry["context_epoch"] = transition.get("context_epoch")
+                    entry["transition_reason"] = transition.get("reason")
             entries.append(entry)
         output = {"entries": entries}
         return RunTraceResult(

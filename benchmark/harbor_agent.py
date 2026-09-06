@@ -18,6 +18,7 @@ SOURCE_ROOT = PROJECT_ROOT / "src"
 REMOTE_ROOT = "/tmp/mini-claude-py"
 REMOTE_VENV = f"{REMOTE_ROOT}/.venv"
 REMOTE_PYTHON = f"{REMOTE_VENV}/bin/python"
+REMOTE_RUNTIME_DIR = "/logs/agent/runtime"
 DEFAULT_MODEL = "claude-sonnet-4-5"
 DEFAULT_TIMEOUT_SEC = 1800
 PRICE_PER_MILLION_TOKENS = {
@@ -26,14 +27,16 @@ PRICE_PER_MILLION_TOKENS = {
     "output": 0.66,
 }
 
-# The CLI persists the canonical event projection before exiting.  Read only
-# the derived metrics from the container instead of scraping human-readable
-# stdout or copying the whole session snapshot back to Harbor.
+# Canonical runtime data is redirected into Harbor's bind-mounted agent log
+# directory by _runtime_env().  This keeps already-committed events available
+# even when Harbor cancels the outer environment.exec call on timeout.
 REMOTE_METRICS_SCRIPT = r"""
 import json
+import os
 from pathlib import Path
 
-root = Path.home() / ".mini-claude" / "sessions"
+runtime_dir = os.environ.get("MINI_CLAUDE_RUNTIME_DIR")
+root = (Path(runtime_dir).expanduser() if runtime_dir else Path.home() / ".mini-claude") / "sessions"
 snapshots = [path for path in root.glob("*/session.v2.json") if path.is_file()]
 if not snapshots:
     print("{}")
@@ -156,6 +159,29 @@ class MiniClaudeHarborAgent(BaseAgent):
     def version(self) -> str | None:
         return "0.1.0"
 
+    def _environment_log_path(self, filename: str) -> str:
+        return shlex.quote(str(self.environment_logs_dir / filename))
+
+    def _logged_command(self, command: str, *, stdout_name: str, stderr_name: str) -> str:
+        """Run a command while appending output to Harbor's mounted log dir."""
+
+        log_dir = shlex.quote(str(self.environment_logs_dir))
+        stdout_path = self._environment_log_path(stdout_name)
+        stderr_path = self._environment_log_path(stderr_name)
+        return (
+            f"mkdir -p {log_dir} && "
+            f"({command}) >> {stdout_path} 2>> {stderr_path}"
+        )
+
+    def _local_log_text(self, filename: str) -> str:
+        """Read a live-mounted log for useful errors after exec returns."""
+
+        path = self.logs_dir / filename
+        try:
+            return path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError):
+            return ""
+
     async def setup(self, environment: BaseEnvironment) -> None:
         """Upload and install Mini Claude in the isolated task container."""
         await environment.upload_dir(SOURCE_ROOT, REMOTE_ROOT)
@@ -169,19 +195,44 @@ class MiniClaudeHarborAgent(BaseAgent):
             "fi && "
             f"python3 -m venv {shlex.quote(REMOTE_VENV)}"
         )
-        result = await environment.exec(bootstrap, timeout_sec=600)
-        if result.return_code != 0:
-            output = result.stderr or result.stdout or "no output"
-            raise RuntimeError(f"Python bootstrap failed: {output}")
-
         result = await environment.exec(
-            f"{shlex.quote(REMOTE_PYTHON)} -m pip install "
-            f"--disable-pip-version-check --no-cache-dir -e "
-            f"{shlex.quote(REMOTE_ROOT)}",
+            self._logged_command(
+                bootstrap,
+                stdout_name="setup.stdout.txt",
+                stderr_name="setup.stderr.txt",
+            ),
             timeout_sec=600,
         )
         if result.return_code != 0:
-            output = result.stderr or result.stdout or "no output"
+            output = (
+                result.stderr
+                or result.stdout
+                or self._local_log_text("setup.stderr.txt")
+                or self._local_log_text("setup.stdout.txt")
+                or "no output"
+            )
+            raise RuntimeError(f"Python bootstrap failed: {output}")
+
+        result = await environment.exec(
+            self._logged_command(
+                (
+                    f"{shlex.quote(REMOTE_PYTHON)} -m pip install "
+                    f"--disable-pip-version-check --no-cache-dir -e "
+                    f"{shlex.quote(REMOTE_ROOT)}"
+                ),
+                stdout_name="setup.stdout.txt",
+                stderr_name="setup.stderr.txt",
+            ),
+            timeout_sec=600,
+        )
+        if result.return_code != 0:
+            output = (
+                result.stderr
+                or result.stdout
+                or self._local_log_text("setup.stderr.txt")
+                or self._local_log_text("setup.stdout.txt")
+                or "no output"
+            )
             raise RuntimeError(f"Mini Claude setup failed: {output}")
 
     def _get_setting(self, key: str) -> str | None:
@@ -231,11 +282,16 @@ class MiniClaudeHarborAgent(BaseAgent):
             "MINI_CLAUDE_MODEL_ID",
             "MINI_CLAUDE_THINKING_EFFORT",
         )
-        return {
+        env = {
             key: value
             for key in keys
             if (value := self._get_setting(key))
         }
+        # This directory is bind-mounted by Harbor as /logs/agent.  Keep it
+        # separate from the task's HOME so task commands retain their normal
+        # user configuration while canonical runtime data remains durable.
+        env["MINI_CLAUDE_RUNTIME_DIR"] = REMOTE_RUNTIME_DIR
+        return env
 
     async def run(
         self,
@@ -251,24 +307,20 @@ class MiniClaudeHarborAgent(BaseAgent):
                 raise RuntimeError("Unable to determine the task work directory")
             workdir = pwd_result.stdout.strip().splitlines()[-1]
 
-        command = (
-            f"{shlex.quote(REMOTE_PYTHON)} -m mini_claude --yolo "
+        agent_command = (
+            f"{shlex.quote(REMOTE_PYTHON)} -u -m mini_claude --yolo "
             f"--model {shlex.quote(self._get_cli_model())} "
             f"{shlex.quote(instruction)} < /dev/null"
         )
         result = await environment.exec(
-            command,
+            self._logged_command(
+                agent_command,
+                stdout_name="stdout.txt",
+                stderr_name="stderr.txt",
+            ),
             cwd=workdir,
             env=self._runtime_env(),
             timeout_sec=DEFAULT_TIMEOUT_SEC,
-        )
-
-        self.logs_dir.mkdir(parents=True, exist_ok=True)
-        (self.logs_dir / "stdout.txt").write_text(
-            result.stdout or "", encoding="utf-8"
-        )
-        (self.logs_dir / "stderr.txt").write_text(
-            result.stderr or "", encoding="utf-8"
         )
 
         usage: dict[str, int] | None = None
@@ -320,7 +372,13 @@ class MiniClaudeHarborAgent(BaseAgent):
             context.metadata["usage_error"] = usage_error[:500]
 
         if result.return_code != 0:
-            output = result.stderr or result.stdout or "no output"
+            output = (
+                result.stderr
+                or result.stdout
+                or self._local_log_text("stderr.txt")
+                or self._local_log_text("stdout.txt")
+                or "no output"
+            )
             raise RuntimeError(
                 f"Mini Claude exited with code {result.return_code}: {output}"
             )

@@ -52,6 +52,11 @@ def test_projections_are_provider_neutral_and_rebuildable(tmp_path: Path):
         assert recovery and recovery[0].source_digest
 
 
+def test_runtime_data_dir_honors_explicit_override(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("MINI_CLAUDE_RUNTIME_DIR", str(tmp_path))
+    assert session_module.runtime_data_dir() == tmp_path
+
+
 def test_fault_matrix_is_fail_closed_without_canonical_rewrite(tmp_path: Path):
     event = _events()[0]
     with pytest.raises(RuntimeError, match="fixture fault at store.commit"):

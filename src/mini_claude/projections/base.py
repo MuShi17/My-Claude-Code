@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from ..runtime_event import RuntimeEvent
+from ..runtime_event import RuntimeEvent, canonical_json_bytes
 
 PROJECTION_VERSION = "projection-v1"
 
@@ -74,10 +73,7 @@ def source_digest(records: Iterable[EventRecord]) -> str:
 
 
 def stable_digest(value: Any) -> str:
-    encoded = json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
 def json_value(value: Any) -> Any:
