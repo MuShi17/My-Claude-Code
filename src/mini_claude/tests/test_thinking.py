@@ -37,7 +37,7 @@ def test_invalid_thinking_effort_is_rejected():
 
 
 def test_anthropic_request_uses_context_envelope_instead_of_fixed_output_cap():
-    assert _get_anthropic_request_max_tokens("deepseek-v4-flash") == 200000
+    assert _get_anthropic_request_max_tokens("deepseek-v4-flash") == 1_000_000
     assert _get_anthropic_request_max_tokens("claude-opus-4-6") == 200000
 
 

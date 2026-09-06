@@ -246,6 +246,8 @@ def _get_anthropic_request_max_tokens(model: str) -> int:
     作为协议层预算，不再根据模型名称把可见输出硬编码为 16K/32K/64K。
     模型和服务端仍会执行其自身的上下文及输出能力限制。
     """
+    if _is_deepseek_model(model):
+        return 1_000_000
     return max(_get_context_window(model), 1)
 
 
