@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import shlex
 from collections.abc import Mapping
@@ -40,13 +41,35 @@ from pathlib import Path
 
 runtime_dir = os.environ.get("MINI_CLAUDE_RUNTIME_DIR")
 root = (Path(runtime_dir).expanduser() if runtime_dir else Path.home() / ".mini-claude") / "sessions"
+
+# The SQLite ledger is the durable source of truth.  A timed-out agent may
+# still have many committed usage events but no final session.v2.json yet.
+databases = [path for path in root.glob("*/runtime.sqlite") if path.is_file()]
+if databases:
+    try:
+        from mini_claude.projections.metrics_projection import CanonicalMetricsProjection
+        from mini_claude.runtime_store import SQLiteRuntimeStore
+
+        database = max(databases, key=lambda path: path.stat().st_mtime_ns)
+        store = SQLiteRuntimeStore(database, timeout=10)
+        try:
+            metrics = CanonicalMetricsProjection().build(store).to_dict()
+        finally:
+            store.close()
+        print(json.dumps(metrics, separators=(",", ":")))
+        raise SystemExit
+    except Exception:
+        # Fall back to the disposable snapshot if the ledger is temporarily
+        # locked or the runtime package is unavailable.
+        pass
+
 snapshots = [path for path in root.glob("*/session.v2.json") if path.is_file()]
-if not snapshots:
-    print("{}")
-else:
+if snapshots:
     latest = max(snapshots, key=lambda path: path.stat().st_mtime_ns)
     snapshot = json.loads(latest.read_text(encoding="utf-8"))
     print(json.dumps(snapshot.get("metrics") or {}, separators=(",", ":")))
+else:
+    print("{}")
 """
 
 
@@ -184,6 +207,122 @@ class MiniClaudeHarborAgent(BaseAgent):
             return path.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
             return ""
+
+    def _local_canonical_metrics(self) -> Mapping[str, Any] | None:
+        """Rebuild metrics from Harbor's host-side runtime mount.
+
+        The agent log directory is bind-mounted for Docker environments.  This
+        fallback remains available when an outer Harbor timeout has already
+        made a final command inside the container unavailable.
+        """
+
+        runtime_root = self.logs_dir / "runtime" / "sessions"
+        databases = [
+            path for path in runtime_root.glob("*/runtime.sqlite") if path.is_file()
+        ]
+        if not databases:
+            return None
+
+        try:
+            from mini_claude.projections.metrics_projection import CanonicalMetricsProjection
+            from mini_claude.runtime_store import SQLiteRuntimeStore
+
+            database = max(databases, key=lambda path: path.stat().st_mtime_ns)
+            store = SQLiteRuntimeStore(database, timeout=10)
+            try:
+                metrics = CanonicalMetricsProjection().build(store).to_dict()
+            finally:
+                store.close()
+            return metrics
+        except Exception:
+            return None
+
+    @staticmethod
+    def _usage_from_metrics(
+        metrics: Mapping[str, Any] | None,
+    ) -> tuple[dict[str, int] | None, str | None]:
+        if metrics is None:
+            return None, "canonical metrics unavailable"
+        if not isinstance(metrics, Mapping):
+            return None, "canonical metrics payload is not an object"
+        usage = _summarize_canonical_metrics(metrics)
+        if usage is None:
+            return None, "no completed usage records in canonical metrics"
+        return usage, None
+
+    async def _collect_usage(
+        self,
+        environment: BaseEnvironment,
+        workdir: str,
+    ) -> tuple[dict[str, int] | None, str | None]:
+        """Collect usage from the remote ledger, then the local log mount."""
+
+        errors: list[str] = []
+        try:
+            metrics_result = await environment.exec(
+                f"{shlex.quote(REMOTE_PYTHON)} -c {shlex.quote(REMOTE_METRICS_SCRIPT)}",
+                cwd=workdir,
+                env=self._runtime_env(),
+                timeout_sec=30,
+            )
+            if metrics_result.return_code != 0:
+                errors.append(
+                    metrics_result.stderr or metrics_result.stdout or "remote metrics read failed"
+                )
+            else:
+                metrics = json.loads((metrics_result.stdout or "{}").strip() or "{}")
+                usage, usage_error = self._usage_from_metrics(metrics)
+                if usage is not None:
+                    return usage, None
+                if usage_error:
+                    errors.append(usage_error)
+        except (json.JSONDecodeError, TypeError, ValueError) as error:
+            errors.append(f"invalid canonical metrics: {error}")
+        except Exception as error:
+            errors.append(f"remote canonical metrics unavailable: {error}")
+
+        usage, usage_error = self._usage_from_metrics(self._local_canonical_metrics())
+        if usage is not None:
+            return usage, None
+        if usage_error:
+            errors.append(usage_error)
+        return None, "; ".join(errors)[:500] or "canonical metrics unavailable"
+
+    @staticmethod
+    def _record_usage(
+        context: AgentContext,
+        *,
+        workdir: str,
+        model: str,
+        return_code: int | None,
+        usage: dict[str, int] | None,
+        usage_error: str | None,
+    ) -> None:
+        """Write usage to the Harbor context before any agent error is raised."""
+
+        context.metadata = {
+            "workdir": workdir,
+            "model": model,
+            "return_code": return_code,
+            "usage_source": "canonical-session-v2-or-sqlite",
+            "usage_available": usage is not None,
+        }
+        if usage is not None:
+            context.n_input_tokens = usage["input_tokens"]
+            context.n_cache_tokens = usage["cache_read_tokens"]
+            context.n_output_tokens = usage["output_tokens"]
+            context.cost_usd = _calculate_cost_usd(usage)
+            context.metadata["cache_create_tokens"] = usage["cache_create_tokens"]
+            context.metadata["usage_pricing"] = {
+                "currency": "USD",
+                "per_million_tokens": dict(PRICE_PER_MILLION_TOKENS),
+                "uncached_input_tokens": max(
+                    usage["input_tokens"] - usage["cache_read_tokens"], 0
+                ),
+                "cost_usd": context.cost_usd,
+            }
+        elif usage_error:
+            context.metadata["usage_error"] = usage_error
 
     async def _prebuilt_runtime_ready(self, environment: BaseEnvironment) -> bool:
         """Check whether the task image already contains the agent runtime.
@@ -335,64 +474,53 @@ class MiniClaudeHarborAgent(BaseAgent):
             f"--model {shlex.quote(self._get_cli_model())} "
             f"{shlex.quote(instruction)} < /dev/null"
         )
-        result = await environment.exec(
-            self._logged_command(
-                agent_command,
-                stdout_name="stdout.txt",
-                stderr_name="stderr.txt",
-            ),
-            cwd=workdir,
-            env=self._runtime_env(),
-            timeout_sec=DEFAULT_TIMEOUT_SEC,
-        )
+        result = None
+        primary_error: BaseException | None = None
+        try:
+            result = await environment.exec(
+                self._logged_command(
+                    agent_command,
+                    stdout_name="stdout.txt",
+                    stderr_name="stderr.txt",
+                ),
+                cwd=workdir,
+                env=self._runtime_env(),
+                timeout_sec=DEFAULT_TIMEOUT_SEC,
+            )
+        except BaseException as error:
+            # Harbor wraps this method in wait_for().  Preserve the original
+            # cancellation/exception, but first harvest already committed
+            # usage from the durable runtime ledger.
+            primary_error = error
 
         usage: dict[str, int] | None = None
         usage_error: str | None = None
         try:
-            metrics_result = await environment.exec(
-                f"{shlex.quote(REMOTE_PYTHON)} -c {shlex.quote(REMOTE_METRICS_SCRIPT)}",
-                cwd=workdir,
-                env=self._runtime_env(),
-                timeout_sec=30,
+            # shield() lets this best-effort cleanup complete after the outer
+            # wait_for has delivered its cancellation.
+            usage, usage_error = await asyncio.shield(
+                self._collect_usage(environment, workdir)
             )
-            if metrics_result.return_code != 0:
-                usage_error = metrics_result.stderr or metrics_result.stdout or "metrics read failed"
-            else:
-                metrics = json.loads((metrics_result.stdout or "{}").strip() or "{}")
-                if not isinstance(metrics, Mapping):
-                    usage_error = "canonical metrics payload is not an object"
-                else:
-                    usage = _summarize_canonical_metrics(metrics)
-        except (json.JSONDecodeError, TypeError, ValueError) as error:
-            usage_error = f"invalid canonical metrics: {error}"
+        except asyncio.CancelledError as error:
+            usage_error = f"usage collection cancelled: {error}"
+            if primary_error is None:
+                primary_error = error
         except Exception as error:
-            # Usage collection is observational; it must not turn a successful
-            # benchmark trial into an agent failure.
             usage_error = f"canonical metrics unavailable: {error}"
 
-        context.metadata = {
-            "workdir": workdir,
-            "return_code": result.return_code,
-            "model": self._get_cli_model(),
-            "usage_source": "canonical-session-v2",
-            "usage_available": usage is not None,
-        }
-        if usage is not None:
-            context.n_input_tokens = usage["input_tokens"]
-            context.n_cache_tokens = usage["cache_read_tokens"]
-            context.n_output_tokens = usage["output_tokens"]
-            context.cost_usd = _calculate_cost_usd(usage)
-            context.metadata["cache_create_tokens"] = usage["cache_create_tokens"]
-            context.metadata["usage_pricing"] = {
-                "currency": "USD",
-                "per_million_tokens": dict(PRICE_PER_MILLION_TOKENS),
-                "uncached_input_tokens": max(
-                    usage["input_tokens"] - usage["cache_read_tokens"], 0
-                ),
-                "cost_usd": context.cost_usd,
-            }
-        elif usage_error:
-            context.metadata["usage_error"] = usage_error[:500]
+        self._record_usage(
+            context,
+            workdir=workdir,
+            model=self._get_cli_model(),
+            return_code=getattr(result, "return_code", None),
+            usage=usage,
+            usage_error=usage_error,
+        )
+
+        if primary_error is not None:
+            raise primary_error
+
+        assert result is not None
 
         if result.return_code != 0:
             output = (
