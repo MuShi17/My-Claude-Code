@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
+from copy import deepcopy
 from pathlib import Path
 
 from mini_claude.projections import (
     CanonicalMetricsProjection,
+    CanonicalModelContextAdapter,
     ModelReplayProjection,
     RunTraceProjection,
     SessionProjection,
@@ -103,8 +106,6 @@ def test_replay_rejects_response_before_call_and_adapters_use_provider_shapes():
         }
     )
     replay = ModelReplayProjection().build([events[0], RuntimeEvent.from_dict(thinking), events[1]])
-    from mini_claude.projections.provider_context import CanonicalModelContextAdapter
-
     anthropic = CanonicalModelContextAdapter().build([events[0], RuntimeEvent.from_dict(thinking)], provider="anthropic")
     assert anthropic.messages[0]["content"][0] == {
         "type": "thinking",
@@ -127,6 +128,99 @@ def test_replay_rejects_response_before_call_and_adapters_use_provider_shapes():
         for item in message.get("content", [])
         if isinstance(item, dict)
     )
+
+
+def test_anthropic_tool_result_serializes_structured_content_as_json_text():
+    events = _events("anthropic")
+    bounded_ref = {
+        "kind": "bounded_ref",
+        "ref": "artifact:sha256:abc123",
+        "sha256": "sha256:abc123",
+        "size_bytes": 24576,
+        "inline": "第一行\n第二行",
+        "truncated": True,
+    }
+    response = events[-1].to_dict()
+    response["content"]["result"] = bounded_ref
+
+    context = CanonicalModelContextAdapter().build(
+        [*events[:-1], RuntimeEvent.from_dict(response)], provider="anthropic"
+    )
+    tool_result = next(
+        block
+        for message in context.messages
+        if message.get("role") == "user"
+        for block in message.get("content", [])
+        if isinstance(block, dict) and block.get("type") == "tool_result"
+    )
+
+    assert isinstance(tool_result["content"], str)
+    assert json.loads(tool_result["content"]) == bounded_ref
+
+
+def test_replay_groups_same_invocation_tool_calls_and_anthropic_batches_results():
+    events = _events("anthropic")
+    second_call = deepcopy(events[2].to_dict())
+    second_call["id"] = "fixture-event-call-0002"
+    second_call["content"]["id"] = "fixture-call-0002"
+    second_call["content"]["args"] = {"file_path": "<WORKSPACE>/other.txt"}
+    second_call["refs"] = {"tool_call_id": "fixture-call-0002"}
+
+    second_response = deepcopy(events[-1].to_dict())
+    second_response["id"] = "fixture-event-response-0002"
+    second_response["content"]["id"] = "fixture-call-0002"
+    second_response["content"]["result"] = "gamma\ndelta\n"
+    second_response["refs"] = {
+        "tool_call_id": "fixture-call-0002",
+        "operation_id": "operation-fixture-call-0002",
+    }
+
+    records = [
+        *events[:3],
+        RuntimeEvent.from_dict(second_call),
+        *events[3:],
+        RuntimeEvent.from_dict(second_response),
+    ]
+    replay = ModelReplayProjection().build(records)
+    assistant_calls = [
+        message for message in replay.messages if message.get("tool_calls")
+    ]
+    assert len(assistant_calls) == 1
+    assert [call["id"] for call in assistant_calls[0]["tool_calls"]] == [
+        events[2].content["id"],
+        "fixture-call-0002",
+    ]
+
+    context = CanonicalModelContextAdapter().build(records, provider="anthropic")
+    assistant_messages = [
+        message
+        for message in context.messages
+        if message.get("role") == "assistant"
+        and any(
+            isinstance(block, dict) and block.get("type") == "tool_use"
+            for block in message.get("content", [])
+        )
+    ]
+    tool_result_messages = [
+        message
+        for message in context.messages
+        if message.get("role") == "user"
+        and isinstance(message.get("content"), list)
+        and all(
+            isinstance(block, dict) and block.get("type") == "tool_result"
+            for block in message["content"]
+        )
+    ]
+    assert len(assistant_messages) == 1
+    assert [block["id"] for block in assistant_messages[0]["content"]] == [
+        events[2].content["id"],
+        "fixture-call-0002",
+    ]
+    assert len(tool_result_messages) == 1
+    assert [block["tool_use_id"] for block in tool_result_messages[0]["content"]] == [
+        events[2].content["id"],
+        "fixture-call-0002",
+    ]
 
 
 def test_session_loader_is_canonical_derived_without_legacy_files(tmp_path: Path):

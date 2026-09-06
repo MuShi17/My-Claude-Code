@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import shlex
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 from harbor.agents.base import BaseAgent
 from harbor.environments.base import BaseEnvironment
@@ -17,6 +20,104 @@ REMOTE_VENV = f"{REMOTE_ROOT}/.venv"
 REMOTE_PYTHON = f"{REMOTE_VENV}/bin/python"
 DEFAULT_MODEL = "claude-sonnet-4-5"
 DEFAULT_TIMEOUT_SEC = 1800
+PRICE_PER_MILLION_TOKENS = {
+    "cache_read_input": 0.007,
+    "uncached_input": 0.22,
+    "output": 0.66,
+}
+
+# The CLI persists the canonical event projection before exiting.  Read only
+# the derived metrics from the container instead of scraping human-readable
+# stdout or copying the whole session snapshot back to Harbor.
+REMOTE_METRICS_SCRIPT = r"""
+import json
+from pathlib import Path
+
+root = Path.home() / ".mini-claude" / "sessions"
+snapshots = [path for path in root.glob("*/session.v2.json") if path.is_file()]
+if not snapshots:
+    print("{}")
+else:
+    latest = max(snapshots, key=lambda path: path.stat().st_mtime_ns)
+    snapshot = json.loads(latest.read_text(encoding="utf-8"))
+    print(json.dumps(snapshot.get("metrics") or {}, separators=(",", ":")))
+"""
+
+
+def _summarize_canonical_metrics(metrics: Mapping[str, Any]) -> dict[str, int] | None:
+    """Convert canonical per-run metrics into Harbor's usage shape.
+
+    Harbor defines ``n_input_tokens`` as total input, including cached input.
+    OpenAI-compatible usage already follows that convention, while Anthropic
+    reports uncached input, cache writes, and cache reads as separate fields.
+    """
+
+    runs = metrics.get("runs")
+    if not isinstance(runs, list):
+        return None
+
+    usage_runs = [
+        run
+        for run in runs
+        if isinstance(run, Mapping) and run.get("usage_available") is True
+    ]
+    if not usage_runs:
+        return None
+
+    def value(run: Mapping[str, Any], key: str) -> int:
+        try:
+            return max(int(run.get(key, 0) or 0), 0)
+        except (TypeError, ValueError):
+            return 0
+
+    cache_read_tokens = sum(value(run, "cache_read_tokens") for run in usage_runs)
+    cache_create_tokens = sum(value(run, "cache_create_tokens") for run in usage_runs)
+    output_tokens = sum(value(run, "output_tokens") for run in usage_runs)
+
+    input_tokens = 0
+    for run in usage_runs:
+        reported_input = value(run, "input_tokens")
+        provider = str(run.get("provider") or "").lower()
+        if provider == "anthropic":
+            # Anthropic exposes these as separate usage components.  Cache
+            # writes are still uncached input for the requested price model.
+            input_tokens += reported_input + value(run, "cache_read_tokens") + value(
+                run, "cache_create_tokens"
+            )
+        else:
+            # OpenAI prompt_tokens, and canonical data from other providers,
+            # already represent total input including any cached subset.
+            input_tokens += reported_input
+
+    return {
+        "input_tokens": input_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_create_tokens": cache_create_tokens,
+        "output_tokens": output_tokens,
+    }
+
+
+def _calculate_cost_usd(usage: Mapping[str, Any]) -> float:
+    """Calculate cost when input usage includes cached input tokens."""
+
+    input_tokens = max(int(usage.get("input_tokens", 0) or 0), 0)
+    cache_read_tokens = max(int(usage.get("cache_read_tokens", 0) or 0), 0)
+    output_tokens = max(int(usage.get("output_tokens", 0) or 0), 0)
+
+    # Harbor's n_input_tokens includes cached tokens.  A provider should never
+    # report more cached tokens than total input, but clamp malformed data so a
+    # bad response cannot produce negative uncached input or a negative price.
+    cache_read_tokens = min(cache_read_tokens, input_tokens)
+    uncached_input_tokens = input_tokens - cache_read_tokens
+    return round(
+        (
+            uncached_input_tokens * PRICE_PER_MILLION_TOKENS["uncached_input"]
+            + cache_read_tokens * PRICE_PER_MILLION_TOKENS["cache_read_input"]
+            + output_tokens * PRICE_PER_MILLION_TOKENS["output"]
+        )
+        / 1_000_000,
+        8,
+    )
 
 
 def _load_project_env() -> dict[str, str]:
@@ -169,11 +270,54 @@ class MiniClaudeHarborAgent(BaseAgent):
         (self.logs_dir / "stderr.txt").write_text(
             result.stderr or "", encoding="utf-8"
         )
+
+        usage: dict[str, int] | None = None
+        usage_error: str | None = None
+        try:
+            metrics_result = await environment.exec(
+                f"{shlex.quote(REMOTE_PYTHON)} -c {shlex.quote(REMOTE_METRICS_SCRIPT)}",
+                cwd=workdir,
+                env=self._runtime_env(),
+                timeout_sec=30,
+            )
+            if metrics_result.return_code != 0:
+                usage_error = metrics_result.stderr or metrics_result.stdout or "metrics read failed"
+            else:
+                metrics = json.loads((metrics_result.stdout or "{}").strip() or "{}")
+                if not isinstance(metrics, Mapping):
+                    usage_error = "canonical metrics payload is not an object"
+                else:
+                    usage = _summarize_canonical_metrics(metrics)
+        except (json.JSONDecodeError, TypeError, ValueError) as error:
+            usage_error = f"invalid canonical metrics: {error}"
+        except Exception as error:
+            # Usage collection is observational; it must not turn a successful
+            # benchmark trial into an agent failure.
+            usage_error = f"canonical metrics unavailable: {error}"
+
         context.metadata = {
             "workdir": workdir,
             "return_code": result.return_code,
             "model": self._get_cli_model(),
+            "usage_source": "canonical-session-v2",
+            "usage_available": usage is not None,
         }
+        if usage is not None:
+            context.n_input_tokens = usage["input_tokens"]
+            context.n_cache_tokens = usage["cache_read_tokens"]
+            context.n_output_tokens = usage["output_tokens"]
+            context.cost_usd = _calculate_cost_usd(usage)
+            context.metadata["cache_create_tokens"] = usage["cache_create_tokens"]
+            context.metadata["usage_pricing"] = {
+                "currency": "USD",
+                "per_million_tokens": dict(PRICE_PER_MILLION_TOKENS),
+                "uncached_input_tokens": max(
+                    usage["input_tokens"] - usage["cache_read_tokens"], 0
+                ),
+                "cost_usd": context.cost_usd,
+            }
+        elif usage_error:
+            context.metadata["usage_error"] = usage_error[:500]
 
         if result.return_code != 0:
             output = result.stderr or result.stdout or "no output"

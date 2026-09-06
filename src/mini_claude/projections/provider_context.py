@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -38,6 +39,14 @@ def _anthropic_thinking_block(item: Any) -> dict[str, Any] | None:
         "thinking": item.get("text", ""),
         "signature": signature,
     }
+
+
+def _tool_result_content(value: Any) -> str | list[Any]:
+    """Keep provider-valid text/block lists and encode structured values."""
+
+    if isinstance(value, str) or isinstance(value, list):
+        return value
+    return json.dumps(value, ensure_ascii=False)
 
 
 def _anthropic_messages(messages: tuple[dict[str, Any], ...]) -> tuple[dict[str, Any], ...]:
@@ -106,18 +115,20 @@ def _anthropic_messages(messages: tuple[dict[str, Any], ...]) -> tuple[dict[str,
             output.append({"role": "user", "content": message.get("content", "")})
         elif role == "tool":
             flush_thinking()
-            output.append(
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "tool_result",
-                            "tool_use_id": message.get("tool_call_id"),
-                            "content": message.get("content", ""),
-                        }
-                    ],
-                }
-            )
+            tool_result = {
+                "type": "tool_result",
+                "tool_use_id": message.get("tool_call_id"),
+                "content": _tool_result_content(message.get("content", "")),
+            }
+            if output and output[-1].get("role") == "user" and isinstance(
+                output[-1].get("content"), list
+            ) and all(
+                isinstance(item, dict) and item.get("type") == "tool_result"
+                for item in output[-1]["content"]
+            ):
+                output[-1]["content"].append(tool_result)
+            else:
+                output.append({"role": "user", "content": [tool_result]})
     flush_thinking()
     return tuple(output)
 

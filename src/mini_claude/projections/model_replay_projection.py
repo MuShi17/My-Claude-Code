@@ -53,6 +53,7 @@ class ModelReplayProjection:
         messages: list[dict[str, Any]] = []
         call_records = sorted(reducer.calls.items(), key=lambda item: item[1].ordinal)
         calls_by_event_id = {record.event.id: (key, record) for key, record in call_records}
+        tool_call_group_indices: dict[tuple[str, str], int] = {}
         response_event_ids = {
             response.event.id
             for values in reducer.responses.values()
@@ -102,17 +103,26 @@ class ModelReplayProjection:
                     # The call remains a diagnostic/unsettled fact and must
                     # not become an executable provider message.
                     continue
-                messages.append(
-                    {
+                call_message = None
+                group_key = (event.run_id, event.invocation_id)
+                group_index = tool_call_group_indices.get(group_key)
+                if group_index is not None:
+                    candidate = messages[group_index]
+                    if candidate.get("role") == "assistant" and candidate.get("tool_calls"):
+                        call_message = candidate
+                if call_message is None:
+                    call_message = {
                         "role": "assistant",
-                        "tool_calls": [
-                            {
-                                "id": content.get("id"),
-                                "name": content.get("name"),
-                                "arguments": json_value(content.get("args")),
-                            }
-                        ],
+                        "tool_calls": [],
                         "runtime_event_id": event.id,
+                    }
+                    messages.append(call_message)
+                    tool_call_group_indices[group_key] = len(messages) - 1
+                call_message["tool_calls"].append(
+                    {
+                        "id": content.get("id"),
+                        "name": content.get("name"),
+                        "arguments": json_value(content.get("args")),
                     }
                 )
             elif (
