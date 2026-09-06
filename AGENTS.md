@@ -41,6 +41,65 @@ npm start [-- --yolo --plan ...]
 
 API 配置：设置 `ANTHROPIC_API_KEY`（Anthropic 格式，推荐）或 `OPENAI_API_KEY` + `OPENAI_BASE_URL`（OpenAI 兼容格式）。两者均支持自定义 base URL。思考强度可通过 `MINI_CLAUDE_THINKING_EFFORT` 配置，默认值为 `max`，可选 `none`、`low`、`high`、`max`。
 
+## Terminal-Bench 2.1 / Harbor
+
+在 Windows PowerShell 中从仓库根目录运行。必须使用已安装 Harbor 的 Python 3.12+ 环境，并将仓库根目录加入 `PYTHONPATH`，否则 Harbor 无法导入自定义 Adapter `benchmark.harbor_agent:MiniClaudeHarborAgent`。
+
+```powershell
+conda activate py313
+$env:PYTHONPATH = (Get-Location).Path
+$runDir = "benchmark_runs/$(Get-Date -Format 'yyyy-MM-dd__HH-mm-ss')"
+
+& "$env:CONDA_PREFIX\Scripts\harbor.exe" run `
+  --agent benchmark.harbor_agent:MiniClaudeHarborAgent `
+  --model deepseek-v4-flash `
+  --dataset terminal-bench/terminal-bench-2-1 `
+  --task terminal-bench/vulnerable-secret `
+  --jobs-dir $runDir `
+  --n-concurrent 1 `
+  --env-file .env `
+  --yes
+```
+
+运行前确认 `.env` 已填写 `ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL`、`MINI_CLAUDE_MODEL` 和 `MINI_CLAUDE_THINKING_EFFORT`。DeepSeek Anthropic 配置示例：`ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic`、`MINI_CLAUDE_MODEL=deepseek-v4-flash`、`MINI_CLAUDE_THINKING_EFFORT=max`。
+
+`--dataset` 使用完整数据集标识，`--task` 使用完整任务标识；`--n-concurrent 1` 便于单任务调试和查看日志。结果保存在 `benchmark_runs/<时间戳>/`，其中 `result.json` 包含 Harbor 结果和 usage 信息。
+
+### 预构建 Mini Claude 运行时镜像
+
+Adapter 会先检查任务容器中的 `/tmp/mini-claude-py/.venv`。如果其中的 Python、`anthropic`、`openai`、`python-dotenv`、`rich` 和 `mini_claude` 都可导入，就跳过容器内的 apt/pip 安装；否则继续使用 fallback 安装流程。
+
+从仓库根目录构建通用运行时镜像：
+
+```powershell
+docker build `
+  -t mini-claude-agent:py313 `
+  -f benchmark/images/mini-claude.Dockerfile `
+  .
+
+docker run --rm mini-claude-agent:py313 `
+  /tmp/mini-claude-py/.venv/bin/python -c `
+  "import mini_claude; print('ready')"
+```
+
+Terminal-Bench 任务通常还需要各自原始镜像中的工具和依赖，因此生产 benchmark 不应直接用这个通用镜像替换所有任务环境；应以任务原始镜像为 `FROM` 构建派生镜像，再在任务的 `[environment].docker_image` 中指定派生镜像。构建完成后，Harbor 会直接使用预构建镜像，任务环境中不再重复安装 Mini Claude。
+
+如果不能直接修改 registry 任务的 `task.toml`，可以使用按任务选择镜像的自定义 Harbor environment。先复制 `benchmark/prebuilt-images.example.json` 为 `benchmark/prebuilt-images.json`，把任务短名改成实际的派生镜像 tag，然后运行：
+
+```powershell
+$env:MINI_CLAUDE_IMAGE_MAP = (Resolve-Path benchmark/prebuilt-images.json).Path
+& "$env:CONDA_PREFIX\Scripts\harbor.exe" run `
+  --env benchmark.prebuilt_environment:MiniClaudePrebuiltDockerEnvironment `
+  --agent benchmark.harbor_agent:MiniClaudeHarborAgent `
+  --dataset terminal-bench/terminal-bench-2-1 `
+  --task terminal-bench/vulnerable-secret `
+  --n-concurrent 1 `
+  --env-file .env `
+  --yes
+```
+
+映射只对列出的任务生效；没有映射的任务仍使用其原始 Dockerfile。派生镜像必须保留原任务镜像中的工具、文件和工作目录，并且不能使用 `--force-build`，否则 Harbor 会重新走 Dockerfile 构建流程。
+
 REPL 命令：`/clear`、`/plan`、`/cost`、`/compact`、`/memory`、`/skills`、`/<skill名称>`。
 
 ## 架构

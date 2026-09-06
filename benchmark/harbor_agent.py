@@ -19,6 +19,9 @@ REMOTE_ROOT = "/tmp/mini-claude-py"
 REMOTE_VENV = f"{REMOTE_ROOT}/.venv"
 REMOTE_PYTHON = f"{REMOTE_VENV}/bin/python"
 REMOTE_RUNTIME_DIR = "/logs/agent/runtime"
+PREBUILT_RUNTIME_IMPORT_CHECK = (
+    "import anthropic, openai, dotenv, rich, mini_claude"
+)
 DEFAULT_MODEL = "claude-sonnet-4-5"
 DEFAULT_TIMEOUT_SEC = 1800
 PRICE_PER_MILLION_TOKENS = {
@@ -182,9 +185,29 @@ class MiniClaudeHarborAgent(BaseAgent):
         except (OSError, UnicodeError):
             return ""
 
+    async def _prebuilt_runtime_ready(self, environment: BaseEnvironment) -> bool:
+        """Check whether the task image already contains the agent runtime.
+
+        The source tree is uploaded before this check, so an image can carry a
+        pre-created venv and editable install at ``REMOTE_ROOT`` while still
+        receiving the current working-tree source.  A failed check is treated
+        as a normal cache miss and falls back to the existing setup path.
+        """
+
+        result = await environment.exec(
+            f"test -x {shlex.quote(REMOTE_PYTHON)} && "
+            f"{shlex.quote(REMOTE_PYTHON)} -c "
+            f"{shlex.quote(PREBUILT_RUNTIME_IMPORT_CHECK)}",
+            timeout_sec=10,
+        )
+        return result.return_code == 0
+
     async def setup(self, environment: BaseEnvironment) -> None:
-        """Upload and install Mini Claude in the isolated task container."""
+        """Upload and prepare Mini Claude in the isolated task container."""
         await environment.upload_dir(SOURCE_ROOT, REMOTE_ROOT)
+
+        if await self._prebuilt_runtime_ready(environment):
+            return
 
         bootstrap = (
             "if ! (command -v python3 >/dev/null 2>&1 && "

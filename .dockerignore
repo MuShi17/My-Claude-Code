@@ -1,0 +1,10 @@
+.git
+.env
+.env.*
+.venv
+__pycache__
+*.pyc
+benchmark_runs
+node_modules
+dist
+.worktrees
