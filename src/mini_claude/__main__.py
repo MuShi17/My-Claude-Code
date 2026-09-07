@@ -258,6 +258,24 @@ async def run_repl(agent: Agent) -> None:
                 print_error(str(e))
 
 
+async def _run_repl_with_cleanup(agent: Agent) -> None:
+    """Run the REPL and close Agent-owned resources on every exit path."""
+
+    try:
+        await run_repl(agent)
+    finally:
+        await agent.aclose()
+
+
+async def _run_one_shot(agent: Agent, prompt: str) -> None:
+    """Run one prompt and close Agent-owned resources on success or failure."""
+
+    try:
+        await agent.chat(prompt)
+    finally:
+        await agent.aclose()
+
+
 def main() -> None:
     args = parse_args()
 
@@ -444,16 +462,22 @@ Examples:
 
     prompt = " ".join(args.prompt) if args.prompt else None
 
-    if prompt:
-        # One-shot mode
-        try:
-            asyncio.run(agent.chat(prompt))
-        except Exception as e:
-            print_error(str(e))
-            sys.exit(1)
-    else:
-        # Interactive REPL
-        asyncio.run(run_repl(agent))
+    try:
+        if prompt:
+            # One-shot mode
+            try:
+                asyncio.run(_run_one_shot(agent, prompt))
+            except Exception as e:
+                print_error(str(e))
+                sys.exit(1)
+        else:
+            # Interactive REPL
+            asyncio.run(_run_repl_with_cleanup(agent))
+    finally:
+        # A resumed Store is supplied by the CLI and remains caller-owned by
+        # the Agent. Close it only after Agent cleanup has finished.
+        if resume_store is not None:
+            resume_store.close()
 
 
 if __name__ == "__main__":

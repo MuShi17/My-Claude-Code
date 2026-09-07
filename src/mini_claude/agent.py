@@ -169,6 +169,18 @@ class CanonicalFinalizationError(RuntimeError):
     code = "canonical_finalization_failed"
 
 
+class AgentClosedError(RuntimeError):
+    """The Agent session resources have already been closed."""
+
+    code = "agent_closed"
+
+
+class RuntimeResourceMismatchError(RuntimeError):
+    """The canonical runtime facade has inconsistent resource identities."""
+
+    code = "runtime_resource_mismatch"
+
+
 class ProviderContentNormalizationError(ValueError):
     """A provider returned a text-bearing block with an unsafe value shape."""
 
@@ -396,6 +408,8 @@ class Agent:
         self._runtime_recorder: ModelCallRecorder | None = None
         self._runtime_boundary: DurableToolBoundary | None = None
         self._runtime_store_owned = False
+        self._runtime_closed = False
+        self._runtime_canonical_sink: EventSink | None = None
         self._runtime_parent_run_id = runtime_parent_run_id
         self._runtime_run_id = runtime_run_id
         self._runtime_context_id = runtime_context_id
@@ -405,6 +419,8 @@ class Agent:
         self._runtime_exit_status: str | None = None
         self._runtime_exit_reason: str | None = None
         self._artifact_archive = artifact_archive
+        self._artifact_archive_owned = artifact_archive is None
+        self._artifact_archive_store: SQLiteRuntimeStore | None = None
         self._llm_capture_policy = llm_capture_policy or LLMCapturePolicy()
         self._llm_capture_manager: LLMCaptureManager | None = None
         self.tools = custom_tools or tool_definitions
@@ -533,12 +549,12 @@ class Agent:
                 pass  # 观测错误不影响主流程
 
     def _setup_runtime_facade(self) -> None:
-        """Create the canonical facade for one canonical invocation."""
+        """Create session resources once and a fresh runtime scope per turn."""
 
-        if self._runtime_emitter is not None and not self._runtime_store_owned:
-            # A caller-owned sink/store remains available across asks.
-            pass
-        else:
+        if self._runtime_closed:
+            raise AgentClosedError("agent runtime is closed")
+
+        if self._runtime_emitter is None:
             if self._runtime_store is None and self._runtime_sink is None:
                 self._runtime_store = SQLiteRuntimeStore(
                     runtime_store_path(self.session_id)
@@ -552,12 +568,41 @@ class Agent:
                     runtime_data_dir() / "artifacts",
                     metadata_store=self._runtime_store,
                 )
+                self._artifact_archive_owned = True
+            if self._artifact_archive_owned:
+                self._artifact_archive_store = self._runtime_store
             self._llm_capture_manager = LLMCaptureManager(
                 policy=self._llm_capture_policy,
                 archive=self._artifact_archive,
                 runtime_store=self._runtime_store,
             )
+            self._runtime_canonical_sink = canonical
             self._runtime_emitter = RuntimeEventEmitter(canonical)
+        else:
+            canonical = self._runtime_store or self._runtime_sink
+            if (
+                canonical is None
+                or self._runtime_canonical_sink is not canonical
+                or self._runtime_emitter.sink is not canonical
+            ):
+                raise RuntimeResourceMismatchError(
+                    "runtime canonical sink changed while the Agent session is active"
+                )
+            if (
+                self._artifact_archive_owned
+                and self._artifact_archive_store is not self._runtime_store
+            ):
+                raise RuntimeResourceMismatchError(
+                    "automatically-created artifact archive is bound to a different runtime store"
+                )
+            if (
+                self._llm_capture_manager is None
+                or self._llm_capture_manager.archive is not self._artifact_archive
+                or self._llm_capture_manager.runtime_store is not self._runtime_store
+            ):
+                raise RuntimeResourceMismatchError(
+                    "LLM capture manager is bound to a different runtime resource"
+                )
 
         self._runtime_context = RunContext(
             session_id=self.session_id,
@@ -996,25 +1041,14 @@ class Agent:
                 finally:
                     if self._runtime_store_owned:
                         try:
-                            # The owned SQLite connection is closed below;
-                            # materialize the derived snapshot while the
-                            # canonical source is still readable.
+                            # Keep the owned SQLite connection alive for the
+                            # next user turn. It is closed by Agent.aclose().
                             self._auto_save()
                             snapshot_saved = True
                         except Exception as error:
                             canonical_failure = canonical_failure or error
                             self._runtime_exit_status = "failed"
                             self._runtime_exit_reason = f"canonical snapshot failed: {error}"
-                        try:
-                            self._runtime_emitter.close()
-                        except Exception as error:
-                            canonical_failure = canonical_failure or error
-                            self._runtime_exit_status = "failed"
-                            self._runtime_exit_reason = f"canonical close failed: {error}"
-                            print(f"[runtime] close failed: {error}", flush=True)
-                        self._runtime_emitter = None
-                        self._runtime_store = None
-                        self._runtime_store_owned = False
 
         if canonical_failure is not None:
             diagnostic = CanonicalFinalizationError(
@@ -1031,6 +1065,66 @@ class Agent:
             print_divider()
             if not snapshot_saved:
                 self._auto_save()
+
+    async def aclose(self) -> None:
+        """Close Agent-owned session resources exactly once.
+
+        A caller-owned Store or Sink is flushed but never closed here. The
+        Agent becomes terminal after this method and cannot start another chat.
+        """
+
+        if self._runtime_closed:
+            return
+        self._runtime_closed = True
+
+        failures: list[tuple[str, Exception]] = []
+        try:
+            await self._mcp_manager.disconnect_all()
+        except Exception as error:
+            failures.append(("mcp disconnect", error))
+
+        emitter = self._runtime_emitter
+        owned_store = self._runtime_store if self._runtime_store_owned else None
+        try:
+            if emitter is not None:
+                try:
+                    emitter.flush()
+                except Exception as error:
+                    failures.append(("runtime flush", error))
+            if owned_store is not None:
+                try:
+                    self._auto_save()
+                except Exception as error:
+                    failures.append(("runtime snapshot", error))
+        finally:
+            if owned_store is not None:
+                try:
+                    if emitter is not None:
+                        emitter.close()
+                    else:
+                        owned_store.close()
+                except Exception as error:
+                    failures.append(("runtime close", error))
+                    try:
+                        owned_store.close()
+                    except Exception:
+                        pass
+
+            self._runtime_emitter = None
+            self._runtime_store = None
+            self._runtime_store_owned = False
+            self._runtime_canonical_sink = None
+            self._artifact_archive = None
+            self._artifact_archive_store = None
+            self._llm_capture_manager = None
+            self._runtime_context = None
+            self._runtime_guard = None
+            self._runtime_recorder = None
+            self._runtime_boundary = None
+
+        if failures:
+            details = "; ".join(f"{name}: {error}" for name, error in failures)
+            raise CanonicalFinalizationError(f"agent close failed: {details}") from failures[0][1]
 
     # ─── Sub-Agent 入口 ──────────────────────────────────────
     # 子 Agent 通过 run_once 执行单次任务并返回结果，
