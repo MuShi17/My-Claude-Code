@@ -43,7 +43,9 @@ def print_tool_result(name: str, result: str) -> None:
     if len(result) > max_len:
         truncated = result[:max_len] + f"\n  ... ({len(result)} chars total)"
     lines = "\n".join("  " + l for l in truncated.split("\n"))
-    console.print(f"[dim]{lines}[/dim]")
+    # Tool results are data, not Rich markup.  In particular, structured
+    # errors such as ``Error [invalid_range]`` must keep their error code.
+    console.print(lines, style="dim", markup=False)
 
 
 def _print_file_change_result(_name: str, result: str) -> None:

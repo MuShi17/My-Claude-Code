@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from ..runtime_event import RuntimeEvent, canonical_json_bytes
+from ..tool_call_identity import equivalent_tool_call, is_final_tool_call
 
 PROJECTION_VERSION = "projection-v1"
 
@@ -117,6 +118,7 @@ class RuntimeEventReducer:
         self.records = records
         self.diagnostics: list[ProjectionDiagnostic] = []
         self.calls: dict[tuple[str, str], EventRecord] = {}
+        self.conflicted_calls: set[tuple[str, str]] = set()
         self.responses: dict[tuple[str, str], list[EventRecord]] = {}
         self.partial: list[EventRecord] = []
         self.errors: list[EventRecord] = []
@@ -132,15 +134,38 @@ class RuntimeEventReducer:
             content = event.content or {}
             content_kind = content.get("kind")
             lifecycle = (event.metadata or {}).get("lifecycle")
-            if content_kind == "function_call":
+            if content_kind == "function_call" and is_final_tool_call(event):
                 call_id = str(content.get("id", ""))
                 key = (event.run_id, call_id)
                 if not call_id:
                     self.diagnostics.append(ProjectionDiagnostic("missing_call_id", "function call has no call identity", "error", event.id, event.run_id))
                 elif key in self.calls:
-                    self.diagnostics.append(ProjectionDiagnostic("duplicate_call", "duplicate function call identity", "error", event.id, event.run_id, call_id))
+                    existing = self.calls[key]
+                    if not equivalent_tool_call(existing.event, event):
+                        self.conflicted_calls.add(key)
+                        self.diagnostics.append(
+                            ProjectionDiagnostic(
+                                "call_identity_conflict",
+                                "function call identity has conflicting payload",
+                                "error",
+                                event.id,
+                                event.run_id,
+                                call_id,
+                            )
+                        )
                 else:
                     self.calls[key] = record
+            elif content_kind == "function_call" and not event.partial:
+                self.diagnostics.append(
+                    ProjectionDiagnostic(
+                        "non_final_function_call",
+                        "non-final function call was ignored",
+                        "warning",
+                        event.id,
+                        event.run_id,
+                        str(content.get("id", "")) or None,
+                    )
+                )
             if content_kind == "function_response" and event.kind != "tool_outcome" and lifecycle != "tool_outcome":
                 call_id = str(content.get("id", ""))
                 key = (event.run_id, call_id)

@@ -13,6 +13,7 @@ from .context_transition import (
 from .redaction import RedactionPolicy, redact_event_dict
 from .projections.base import stable_digest
 from .runtime_event import RuntimeEvent, RuntimeEventError, RuntimeEventValidationError
+from .tool_call_identity import equivalent_tool_call, is_final_tool_call
 
 
 class EventSinkError(RuntimeError):
@@ -27,9 +28,15 @@ class SinkClosedError(EventSinkError):
     """A sink was used after close."""
 
 
-def _delegate_optional(sink: Any, name: str, *args: Any) -> Any:
+class CanonicalToolCallConflictError(CanonicalSinkError):
+    """A final tool-call identity was reused with a different payload."""
+
+    code = "call_identity_conflict"
+
+
+def _delegate_optional(sink: Any, name: str, *args: Any, **kwargs: Any) -> Any:
     method = getattr(sink, name, None)
-    return method(*args) if callable(method) else None
+    return method(*args, **kwargs) if callable(method) else None
 
 
 @runtime_checkable
@@ -233,6 +240,17 @@ class CanonicalSink:
             provider_tool_call_id,
         )
 
+    def read_tool_operation_for_run_call(self, run_id: str, provider_tool_call_id: str) -> Any:
+        return _delegate_optional(
+            self.downstream,
+            "read_tool_operation_for_run_call",
+            run_id,
+            provider_tool_call_id,
+        )
+
+    def read_event_records(self, **kwargs: Any) -> Any:
+        return _delegate_optional(self.downstream, "read_event_records", **kwargs)
+
 
 CanonicalEventSink = CanonicalSink
 
@@ -250,7 +268,16 @@ class RuntimeEventEmitter:
         self.redaction_policy = redaction_policy or RedactionPolicy()
 
     def emit(self, event: RuntimeEvent | dict[str, Any]) -> RuntimeEvent:
-        return self.sink.emit(self.prepare(event))
+        clean = self.prepare(event)
+        existing = self._existing_final_tool_call(clean)
+        if existing is not None:
+            if equivalent_tool_call(existing, clean):
+                return existing
+            call_id = str((clean.content or {}).get("id", "unknown-call"))
+            raise CanonicalToolCallConflictError(
+                f"call_identity_conflict for {clean.run_id}:{call_id}"
+            )
+        return self.sink.emit(clean)
 
     append = emit
 
@@ -274,6 +301,47 @@ class RuntimeEventEmitter:
             provider_tool_call_id,
         )
 
+    def read_tool_operation_for_run_call(self, run_id: str, provider_tool_call_id: str) -> Any:
+        return _delegate_optional(
+            self.sink,
+            "read_tool_operation_for_run_call",
+            run_id,
+            provider_tool_call_id,
+        )
+
+    def _existing_final_tool_call(self, event: RuntimeEvent) -> RuntimeEvent | None:
+        if not is_final_tool_call(event):
+            return None
+        call_id = str((event.content or {}).get("id", ""))
+        if not call_id:
+            return None
+        source = self.sink
+        downstream = getattr(source, "downstream", None)
+        if downstream is not None:
+            source = downstream
+        reader = getattr(source, "read_event_records", None)
+        if callable(reader):
+            try:
+                records = reader(run_id=event.run_id)
+            except TypeError:
+                records = reader()
+            for _ordinal, candidate in records or ():
+                if (
+                    candidate.run_id == event.run_id
+                    and str((candidate.content or {}).get("id", "")) == call_id
+                    and is_final_tool_call(candidate)
+                ):
+                    return candidate
+            return None
+        for candidate in getattr(source, "events", ()):
+            if (
+                candidate.run_id == event.run_id
+                and str((candidate.content or {}).get("id", "")) == call_id
+                and is_final_tool_call(candidate)
+            ):
+                return candidate
+        return None
+
 
 EventEmitter = RuntimeEventEmitter
 
@@ -282,6 +350,7 @@ __all__ = [
     "CanonicalSink",
     "CanonicalEventSink",
     "CanonicalSinkError",
+    "CanonicalToolCallConflictError",
     "EventEmitter",
     "EventSink",
     "EventSinkError",

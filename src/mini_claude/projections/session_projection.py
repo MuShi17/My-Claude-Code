@@ -14,6 +14,7 @@ from .base import (
     source_digest,
     stable_digest,
 )
+from ..tool_call_identity import is_final_tool_call
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +72,11 @@ class SessionProjection:
         runs: dict[str, dict[str, Any]] = {}
         errors: list[dict[str, Any]] = []
         terminals: list[dict[str, Any]] = []
+        canonical_call_event_ids = {
+            record.event.id
+            for key, record in reducer.calls.items()
+            if key not in reducer.conflicted_calls
+        }
         for record in records:
             event = record.event
             runs.setdefault(
@@ -117,7 +123,13 @@ class SessionProjection:
                     "sources": list(content.get("sources", [])),
                     "runtime": identity,
                 })
-            elif kind == "function_call":
+            elif (
+                kind == "function_call"
+                and is_final_tool_call(event)
+                and event.id in canonical_call_event_ids
+                and (event.run_id, str(content.get("id", "")))
+                not in reducer.conflicted_calls
+            ):
                 messages.append(
                     {
                         "role": "assistant",
@@ -132,6 +144,9 @@ class SessionProjection:
                     }
                 )
             elif kind == "function_response" and event.kind != "tool_outcome" and (event.metadata or {}).get("lifecycle") != "tool_outcome":
+                response_key = (event.run_id, str(content.get("id", "")))
+                if response_key in reducer.conflicted_calls:
+                    continue
                 messages.append(
                     {
                         "role": "tool",

@@ -23,6 +23,7 @@ from .base import (
     stable_digest,
 )
 from .model_replay_projection import ModelReplayResult
+from ..tool_call_identity import equivalent_tool_call, is_final_tool_call
 
 
 class IncrementalReplayError(RuntimeError):
@@ -41,6 +42,8 @@ class IncrementalModelReplayCursor:
         self._digest = hashlib.sha256(b"[")
         self._messages: list[dict[str, Any]] = []
         self._calls: dict[tuple[str, str], EventRecord] = {}
+        self._conflicted_call_keys: set[tuple[str, str]] = set()
+        self._record_by_event_id: dict[str, EventRecord] = {}
         self._responses: dict[tuple[str, str], list[EventRecord]] = {}
         self._calls_by_group: dict[
             tuple[str, str], list[tuple[tuple[str, str], EventRecord]]
@@ -125,7 +128,7 @@ class IncrementalModelReplayCursor:
             "prior_prefix_digest": self.source_digest,
             "context_epoch": self.context_epoch,
             "records_read": self.records_read,
-            "message_count": len(self._messages),
+            "message_count": len(self._visible_messages()),
             "pending_call_ids": pending,
             "diagnostics": [
                 item.to_dict() for item in self._diagnostics_with_unmatched()[-32:]
@@ -133,14 +136,15 @@ class IncrementalModelReplayCursor:
         }
 
     def result(self) -> ModelReplayResult:
-        output = {"messages": self._messages, "partial_count": self._partial_count}
+        messages = self._visible_messages()
+        output = {"messages": messages, "partial_count": self._partial_count}
         return ModelReplayResult(
             projection_version=self.projection_version,
             schema_version=1,
             high_water=self.high_water,
             source_digest=self.source_digest,
             digest=stable_digest(output),
-            messages=tuple(self._messages),
+            messages=tuple(messages),
             partial_count=self._partial_count,
             diagnostics=tuple(self._diagnostics_with_unmatched()),
             context_epoch=self._context_epoch,
@@ -155,6 +159,7 @@ class IncrementalModelReplayCursor:
             )
         source_digest_before = self.source_digest
         self._record_ids.add(event.id)
+        self._record_by_event_id[event.id] = record
         if self._records:
             self._digest.update(b",")
         self._digest.update(event.canonical_bytes())
@@ -172,7 +177,7 @@ class IncrementalModelReplayCursor:
         if event.partial:
             self._partial_count += 1
             return
-        if kind == "function_call":
+        if kind == "function_call" and is_final_tool_call(event):
             call_id = str(content.get("id", ""))
             key = (event.run_id, call_id)
             if not call_id:
@@ -186,16 +191,19 @@ class IncrementalModelReplayCursor:
                     )
                 )
             elif key in self._calls:
-                self._diagnostics.append(
-                    ProjectionDiagnostic(
-                        "duplicate_call",
-                        "duplicate function call identity",
-                        "error",
-                        event.id,
-                        event.run_id,
-                        call_id,
+                existing = self._calls[key]
+                if not equivalent_tool_call(existing.event, event):
+                    self._conflicted_call_keys.add(key)
+                    self._diagnostics.append(
+                        ProjectionDiagnostic(
+                            "call_identity_conflict",
+                            "function call identity has conflicting payload",
+                            "error",
+                            event.id,
+                            event.run_id,
+                            call_id,
+                        )
                     )
-                )
             else:
                 self._calls[key] = record
                 self._calls_by_group.setdefault(group_key, []).append((key, record))
@@ -216,6 +224,17 @@ class IncrementalModelReplayCursor:
                                 call_id,
                             )
                         )
+        elif kind == "function_call" and not event.partial:
+            self._diagnostics.append(
+                ProjectionDiagnostic(
+                    "non_final_function_call",
+                    "non-final function call was ignored",
+                    "warning",
+                    event.id,
+                    event.run_id,
+                    str(content.get("id", "")) or None,
+                )
+            )
         if (
             kind == "function_response"
             and event.kind != "tool_outcome"
@@ -441,7 +460,11 @@ class IncrementalModelReplayCursor:
             self._render_tool_group((call.event.run_id, call.event.invocation_id))
 
     def _render_tool_group(self, group_key: tuple[str, str]) -> None:
-        group_calls = self._calls_by_group.get(group_key, [])
+        group_calls = [
+            item
+            for item in self._calls_by_group.get(group_key, [])
+            if item[0] not in self._conflicted_call_keys
+        ]
         if not group_calls:
             return
         # Parallel results can arrive in completion order rather than model
@@ -514,6 +537,41 @@ class IncrementalModelReplayCursor:
                 )
             )
         return result
+
+    def _visible_messages(self) -> list[dict[str, Any]]:
+        """Hide executable messages whose call identity became conflicting."""
+
+        visible: list[dict[str, Any]] = []
+        for message in self._messages:
+            event = self._record_by_event_id.get(str(message.get("runtime_event_id")))
+            run_id = event.event.run_id if event is not None else None
+            if message.get("role") == "assistant" and isinstance(
+                message.get("tool_calls"), list
+            ):
+                calls = [
+                    call
+                    for call in message["tool_calls"]
+                    if not (
+                        run_id is not None
+                        and (run_id, str(call.get("id", "")))
+                        in self._conflicted_call_keys
+                    )
+                ]
+                if not calls and not message.get("content"):
+                    continue
+                copy = dict(message)
+                copy["tool_calls"] = calls
+                visible.append(copy)
+                continue
+            if message.get("role") == "tool":
+                call_id = str(message.get("tool_call_id", ""))
+                if (
+                    run_id is not None
+                    and (run_id, call_id) in self._conflicted_call_keys
+                ):
+                    continue
+            visible.append(dict(message))
+        return visible
 
 
 __all__ = ["IncrementalModelReplayCursor", "IncrementalReplayError"]

@@ -10,17 +10,18 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import inspect
-import json
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Mapping
 
+from .archive_capability import ToolResultArchiveCapability
 from .artifact_archive import ArtifactArchive, ArtifactArchiveError
 from .event_ids import IdentityFactory, RunContext
-from .event_sink import RuntimeEventEmitter
+from .event_sink import CanonicalToolCallConflictError, RuntimeEventEmitter
 from .redaction import RedactionPolicy, bound_payload, redact_payload
 from .runtime_event import RuntimeEvent, canonical_json_bytes
+from .tool_call_identity import decode_tool_arguments
 
 
 def _now_ms() -> int:
@@ -30,22 +31,6 @@ def _now_ms() -> int:
 def request_shape_hash(request: Mapping[str, Any], *, policy: RedactionPolicy | None = None) -> str:
     clean = redact_payload(dict(request), policy)
     return "sha256:" + hashlib.sha256(canonical_json_bytes(clean)).hexdigest()
-
-
-def decode_tool_arguments(raw: Mapping[str, Any] | str | Any) -> tuple[Any, str | None]:
-    """Decode a final provider tool payload without treating bad JSON as ``{}``."""
-
-    if isinstance(raw, Mapping):
-        return dict(raw), None
-    if isinstance(raw, str):
-        try:
-            value = json.loads(raw)
-        except json.JSONDecodeError as error:
-            return raw, f"invalid_json:{error.msg}"
-        if not isinstance(value, Mapping):
-            return value, "tool arguments must decode to an object"
-        return dict(value), None
-    return raw, "tool arguments must be an object or JSON object string"
 
 
 @dataclass(frozen=True, slots=True)
@@ -405,6 +390,7 @@ class DurableToolBoundary:
         redaction_policy: RedactionPolicy | None = None,
         max_result_bytes: int = 16_384,
         artifact_archive: ArtifactArchive | None = None,
+        archive_capability: ToolResultArchiveCapability | None = None,
     ) -> None:
         self.emitter = emitter
         self.context = context
@@ -412,6 +398,7 @@ class DurableToolBoundary:
         self.redaction_policy = redaction_policy or RedactionPolicy()
         self.max_result_bytes = max_result_bytes
         self.artifact_archive = artifact_archive
+        self.archive_capability = archive_capability
         self.execution_count = 0
 
     def _event(
@@ -441,8 +428,8 @@ class DurableToolBoundary:
             status=status,
             metadata=metadata,
         )
-        self.emitter.emit(event)
-        return event
+        persisted = self.emitter.emit(event)
+        return persisted if isinstance(persisted, RuntimeEvent) else event
 
     async def execute(
         self,
@@ -458,13 +445,16 @@ class DurableToolBoundary:
     ) -> ToolExecutionResult:
         decoded_arguments, argument_error = decode_tool_arguments(arguments)
         safe_arguments = redact_payload(decoded_arguments, self.redaction_policy)
-        self._event(
-            role="model",
-            author="agent",
-            content={"kind": "function_call", "id": call_id, "name": name, "args": safe_arguments},
-            call_id=call_id,
-            metadata={"lifecycle": "tool_call_final"},
-        )
+        try:
+            self._event(
+                role="model",
+                author="agent",
+                content={"kind": "function_call", "id": call_id, "name": name, "args": safe_arguments},
+                call_id=call_id,
+                metadata={"lifecycle": "tool_call_final"},
+            )
+        except CanonicalToolCallConflictError as error:
+            raise ToolOperationConflictError(str(error)) from error
         if argument_error:
             self._event(
                 role="system",
@@ -493,10 +483,18 @@ class DurableToolBoundary:
         operation_id = "op-" + hashlib.sha256(
             f"{self.context.invocation_id}\0{call_id}\0{args_digest}".encode("utf-8")
         ).hexdigest()[:32]
-        existing = self.emitter.read_tool_operation_for_call(self.context.invocation_id, call_id)
+        existing = self.emitter.read_tool_operation_for_run_call(
+            self.context.run_id, call_id
+        )
+        if existing is None:
+            existing = self.emitter.read_tool_operation_for_call(
+                self.context.invocation_id, call_id
+            )
         if existing is not None:
             if (
-                existing.operation_id != operation_id
+                existing.session_id != self.context.session_id
+                or existing.run_id != self.context.run_id
+                or existing.provider_tool_call_id != call_id
                 or existing.tool_name != name
                 or existing.canonical_args_hash != f"sha256:{args_digest}"
                 or existing.recovery_mode != recovery_mode
@@ -506,7 +504,7 @@ class DurableToolBoundary:
                 )
             if existing.state == "outcome_unknown":
                 raise UncertainToolOperationError(
-                    f"operation {operation_id} has an unknown outcome; explicit new invocation required"
+                    f"operation {existing.operation_id} has an unknown outcome; explicit new invocation required"
                 )
             if existing.state in {"completed", "failed", "denied", "cancelled"}:
                 return ToolExecutionResult(
@@ -517,7 +515,7 @@ class DurableToolBoundary:
                     bool(existing.executed),
                     existing.error_type,
                     denied=existing.state == "denied",
-                    operation_id=operation_id,
+                    operation_id=existing.operation_id,
                 )
         # This call is the durable barrier.  If it raises, executor is never
         # reached and the caller must classify the run as uncertain/failing.
@@ -626,15 +624,37 @@ class DurableToolBoundary:
                 "size_bytes": len(encoded),
                 "tool_name": name,
             }, ArtifactArchiveError("artifact archive is not configured")
+        if self.archive_capability is None:
+            return {
+                "kind": "archive_error",
+                "error_type": "ArchiveCapabilityUnavailable",
+                "message": "large tool result cannot be referenced without ArchiveRead capability",
+                "size_bytes": len(encoded),
+                "tool_name": name,
+            }, ArtifactArchiveError("archive read capability is not configured")
         try:
             archived = self.artifact_archive.archive(
                 value,
-                mime_type="text/plain" if isinstance(value, str) else "application/json",
+                mime_type=(
+                    "text/plain"
+                    if isinstance(value, str)
+                    else "application/octet-stream"
+                    if isinstance(value, bytes)
+                    else "application/json"
+                ),
                 encoding="utf-8" if isinstance(value, str) else "binary",
                 scope="tool-result",
                 redaction_policy=self.redaction_policy,
-                metadata={"call_id": call_id, "tool_name": name},
+                metadata={
+                    "call_id": call_id,
+                    "tool_name": name,
+                    "session_id": self.context.session_id,
+                    "run_id": self.context.run_id,
+                    "parent_run_id": self.context.parent_run_id,
+                },
             )
+            if self.archive_capability is not None:
+                self.archive_capability.register_ref(archived.ref)
             return archived.placeholder(), None
         except Exception as error:
             return {

@@ -155,7 +155,10 @@ def test_anthropic_tool_result_serializes_structured_content_as_json_text():
     )
 
     assert isinstance(tool_result["content"], str)
-    assert json.loads(tool_result["content"]) == bounded_ref
+    degraded = json.loads(tool_result["content"])
+    assert degraded["kind"] == "archive_read_error"
+    assert degraded["error_type"] == "capability_unavailable"
+    assert degraded["preview"] == bounded_ref["inline"]
 
 
 def test_replay_groups_same_invocation_tool_calls_and_anthropic_batches_results():
@@ -239,6 +242,16 @@ def test_metrics_projection_rebuilds_supported_facts_without_tracer_input():
     events = _events()
     partial = events[1].to_dict()
     partial.update({"id": "metrics-partial", "ts": events[0].ts + 10, "partial": True})
+    first_token = events[1].to_dict()
+    first_token.update({
+        "id": "metrics-first-token",
+        "role": "system",
+        "author": "agent",
+        "content": None,
+        "actions": {"first_token": {"is_thinking": False}},
+        "metadata": {"lifecycle": "first_token"},
+        "ts": events[0].ts + 10,
+    })
     usage = events[1].to_dict()
     usage.update({
         "id": "metrics-usage",
@@ -271,6 +284,7 @@ def test_metrics_projection_rebuilds_supported_facts_without_tracer_input():
     })
     canonical = events + [
         RuntimeEvent.from_dict(partial),
+        RuntimeEvent.from_dict(first_token),
         RuntimeEvent.from_dict(usage),
         RuntimeEvent.from_dict(finish),
         RuntimeEvent.from_dict(outcome),

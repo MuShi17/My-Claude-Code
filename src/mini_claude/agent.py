@@ -76,6 +76,8 @@ from .projections.model_replay_projection import ModelReplayProjection, ModelRep
 from .projections.incremental_replay import IncrementalModelReplayCursor, IncrementalReplayError
 from .projections.provider_context import CanonicalModelContextAdapter
 from .artifact_archive import ArtifactArchive
+from .archive_capability import ToolResultArchiveCapability
+from .archive_projection import format_terminal_tool_result, project_terminal_tool_result
 from .llm_capture import LLMCaptureManager, LLMCapturePolicy
 
 # ─── 指数退避重试 ──────────────────────────────────────────
@@ -123,6 +125,8 @@ MODEL_CONTEXT = {
     "gpt-4o": 128000,
     "gpt-4o-mini": 128000,
 }
+
+CONTEXT_WINDOW_USAGE_RATIO = 0.70
 
 
 def _get_context_window(model: str) -> int:
@@ -389,6 +393,7 @@ class Agent:
         runtime_context_id: str | None = None,
         runtime_parent_context_id: str | None = None,
         artifact_archive: ArtifactArchive | None = None,
+        archive_capability: ToolResultArchiveCapability | None = None,
         llm_capture_policy: LLMCapturePolicy | None = None,
     ):
         self.permission_mode = permission_mode
@@ -421,14 +426,17 @@ class Agent:
         self._artifact_archive = artifact_archive
         self._artifact_archive_owned = artifact_archive is None
         self._artifact_archive_store: SQLiteRuntimeStore | None = None
+        self._archive_capability = archive_capability
         self._llm_capture_policy = llm_capture_policy or LLMCapturePolicy()
         self._llm_capture_manager: LLMCaptureManager | None = None
         self.tools = custom_tools or tool_definitions
         self.max_cost_usd = max_cost_usd
         self.max_turns = max_turns
         self.confirm_fn = confirm_fn
-        # 有效上下文窗口 = 模型窗口 - 20K 留白（给 system prompt + output）
-        self.effective_window = _get_context_window(model) - 20000
+        # 有效上下文窗口 = 模型窗口的 70%，剩余 30% 留给 system prompt、output 和封装开销
+        self.effective_window = max(
+            0, int(_get_context_window(model) * CONTEXT_WINDOW_USAGE_RATIO)
+        )
         self.session_id = runtime_session_id or uuid.uuid4().hex[:8]
         if self._runtime_context_id is None:
             self._runtime_context_id = f"context:{self.session_id}"
@@ -576,6 +584,18 @@ class Agent:
                 archive=self._artifact_archive,
                 runtime_store=self._runtime_store,
             )
+            if self._archive_capability is None:
+                self._archive_capability = ToolResultArchiveCapability(
+                    self._artifact_archive,
+                    session_id=self.session_id,
+                )
+            elif (
+                self._archive_capability.archive is not self._artifact_archive
+                or self._archive_capability.session_id != self.session_id
+            ):
+                raise RuntimeResourceMismatchError(
+                    "ArchiveRead capability is bound to a different runtime archive or session"
+                )
             self._runtime_canonical_sink = canonical
             self._runtime_emitter = RuntimeEventEmitter(canonical)
         else:
@@ -603,6 +623,14 @@ class Agent:
                 raise RuntimeResourceMismatchError(
                     "LLM capture manager is bound to a different runtime resource"
                 )
+            if (
+                self._archive_capability is None
+                or self._archive_capability.archive is not self._artifact_archive
+                or self._archive_capability.session_id != self.session_id
+            ):
+                raise RuntimeResourceMismatchError(
+                    "ArchiveRead capability is bound to a different runtime resource"
+                )
 
         self._runtime_context = RunContext(
             session_id=self.session_id,
@@ -614,6 +642,11 @@ class Agent:
             parent_context_id=self._runtime_parent_context_id,
         )
         self._runtime_guard = RunStateGuard(self._runtime_context, self._runtime_emitter)
+        if self._archive_capability is not None:
+            self._archive_capability.grant_run(
+                self._runtime_context.run_id,
+                self._runtime_context.parent_run_id,
+            )
         self._runtime_guard.start()
         self._runtime_recorder = None
         self._runtime_boundary = None
@@ -644,6 +677,36 @@ class Agent:
             self._runtime_emitter,
             context,
             artifact_archive=self._artifact_archive,
+            archive_capability=self._archive_capability,
+        )
+
+    def _provider_budget_bytes(self) -> int:
+        """Return the conservative local byte budget for archive projection."""
+
+        return max(0, int(self.effective_window) * 4)
+
+    def _effective_tool_definitions(self) -> list[ToolDef]:
+        """Build request tools, binding ArchiveRead only to this capability."""
+
+        definitions = list(get_active_tool_definitions(self.tools))
+        if self._archive_capability is None:
+            return definitions
+        if any(item.get("name") == "ArchiveRead" for item in definitions):
+            raise RuntimeResourceMismatchError(
+                "custom tools cannot shadow the runtime ArchiveRead capability"
+            )
+        definitions.append(self._archive_capability.tool_definition)
+        return definitions
+
+    def _display_tool_result(self, value: Any, *, provider: str) -> str:
+        """Render the terminal view without changing Provider tool content."""
+
+        formatted = format_terminal_tool_result(value, self._archive_capability)
+        if formatted is not None:
+            return formatted
+        terminal_value = project_terminal_tool_result(value, self._archive_capability)
+        return display_tool_result(
+            materialize_tool_result(terminal_value, provider=provider)
         )
 
     def _record_runtime_model_error(self, error: BaseException) -> None:
@@ -1075,6 +1138,23 @@ class Agent:
 
         if self._runtime_closed:
             return
+
+        active_task = self._current_task
+        current_task = asyncio.current_task()
+        if (
+            active_task is not None
+            and active_task is not current_task
+            and not active_task.done()
+        ):
+            try:
+                # Provider calls and archive projections are part of the
+                # session's durable boundary. Let the active turn settle
+                # before closing an Agent-owned store underneath it.
+                await asyncio.shield(active_task)
+            except BaseException:
+                # The active turn records its own terminal failure. A close
+                # request must still release resources exactly once.
+                pass
         self._runtime_closed = True
 
         failures: list[tuple[str, Exception]] = []
@@ -1116,6 +1196,7 @@ class Agent:
             self._runtime_canonical_sink = None
             self._artifact_archive = None
             self._artifact_archive_store = None
+            self._archive_capability = None
             self._llm_capture_manager = None
             self._runtime_context = None
             self._runtime_guard = None
@@ -1356,6 +1437,8 @@ class Agent:
             result,
             provider="openai" if self.use_openai else "anthropic",
             system_prompt=self._system_prompt if self.use_openai else None,
+            archive_capability=self._archive_capability,
+            budget_bytes=self._provider_budget_bytes(),
         )
         errors = [
             diagnostic for diagnostic in context.diagnostics
@@ -1539,6 +1622,8 @@ class Agent:
             result,
             provider="openai" if self.use_openai else "anthropic",
             system_prompt=None,
+            archive_capability=self._archive_capability,
+            budget_bytes=self._provider_budget_bytes(),
         ).messages
 
     def _write_compaction_checkpoint(self, summary_text: str) -> CompactionCheckpoint | None:
@@ -1974,6 +2059,17 @@ class Agent:
     async def _execute_tool_call(self, name: str, inp: dict) -> str:
         if name in ("enter_plan_mode", "exit_plan_mode"):
             return await self._execute_plan_mode_tool(name)
+        if name == "ArchiveRead":
+            if self._archive_capability is None:
+                return json.dumps(
+                    {
+                        "kind": "archive_read_error",
+                        "error_type": "capability_unavailable",
+                        "message": "ArchiveRead capability is unavailable",
+                    },
+                    ensure_ascii=False,
+                )
+            return self._archive_capability.execute(inp)
         if name == "agent":
             return await self._execute_agent_tool(inp)
         if name == "skill":
@@ -2006,6 +2102,24 @@ class Agent:
                 prompt=(inp.get("args") or ""),
             )
             print_sub_agent_start("skill-fork", skill_name)
+            child_run_id = f"run-{self.session_id}-skill-{skill_name}-{uuid.uuid4().hex[:8]}"
+            child_session_id = (
+                self._runtime_context.session_id
+                if self._runtime_context is not None
+                else self.session_id
+            )
+            child_parent_run_id = (
+                self._runtime_context.run_id if self._runtime_context else None
+            )
+            child_archive_capability = (
+                self._archive_capability.derive(
+                    session_id=child_session_id,
+                    run_id=child_run_id,
+                    parent_run_id=child_parent_run_id,
+                )
+                if self._archive_capability is not None
+                else None
+            )
             sub_agent = Agent(
                 model=self.model,
                 api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
@@ -2016,13 +2130,9 @@ class Agent:
                 permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
                 runtime_store=self._runtime_store,
                 runtime_sink=self._runtime_sink,
-                runtime_parent_run_id=self._runtime_context.run_id if self._runtime_context else None,
-                runtime_run_id=f"run-{self.session_id}-skill-{skill_name}-{uuid.uuid4().hex[:8]}",
-                runtime_session_id=(
-                    self._runtime_context.session_id
-                    if self._runtime_context is not None
-                    else self.session_id
-                ),
+                runtime_parent_run_id=child_parent_run_id,
+                runtime_run_id=child_run_id,
+                runtime_session_id=child_session_id,
                 runtime_context_id=self._identity_factory.new("context"),
                 runtime_parent_context_id=(
                     self._runtime_context.context_id
@@ -2030,6 +2140,7 @@ class Agent:
                     else None
                 ),
                 artifact_archive=self._artifact_archive,
+                archive_capability=child_archive_capability,
                 llm_capture_policy=self._llm_capture_policy,
             )
             try:
@@ -2180,6 +2291,24 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         )
 
         config = get_sub_agent_config(agent_type)
+        child_run_id = f"run-{self.session_id}-{agent_type}-{uuid.uuid4().hex[:8]}"
+        child_session_id = (
+            self._runtime_context.session_id
+            if self._runtime_context is not None
+            else self.session_id
+        )
+        child_parent_run_id = (
+            self._runtime_context.run_id if self._runtime_context else None
+        )
+        child_archive_capability = (
+            self._archive_capability.derive(
+                session_id=child_session_id,
+                run_id=child_run_id,
+                parent_run_id=child_parent_run_id,
+            )
+            if self._archive_capability is not None
+            else None
+        )
         sub_agent = Agent(
             model=self.model,
             api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
@@ -2188,23 +2317,20 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             custom_tools=config["tools"],
             is_sub_agent=True,
             permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
-                runtime_store=self._runtime_store,
-                runtime_sink=self._runtime_sink,
-                runtime_parent_run_id=self._runtime_context.run_id if self._runtime_context else None,
-                runtime_run_id=f"run-{self.session_id}-{agent_type}-{uuid.uuid4().hex[:8]}",
-                runtime_session_id=(
-                    self._runtime_context.session_id
-                    if self._runtime_context is not None
-                    else self.session_id
-                ),
-                runtime_context_id=self._identity_factory.new("context"),
-                runtime_parent_context_id=(
-                    self._runtime_context.context_id
-                    if self._runtime_context is not None
-                    else None
-                ),
-                artifact_archive=self._artifact_archive,
-                llm_capture_policy=self._llm_capture_policy,
+            runtime_store=self._runtime_store,
+            runtime_sink=self._runtime_sink,
+            runtime_parent_run_id=child_parent_run_id,
+            runtime_run_id=child_run_id,
+            runtime_session_id=child_session_id,
+            runtime_context_id=self._identity_factory.new("context"),
+            runtime_parent_context_id=(
+                self._runtime_context.context_id
+                if self._runtime_context is not None
+                else None
+            ),
+            artifact_archive=self._artifact_archive,
+            archive_capability=child_archive_capability,
+            llm_capture_policy=self._llm_capture_policy,
         )
 
         try:
@@ -2237,10 +2363,9 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             if self._aborted:
                 break
 
-            self._refresh_provider_context_from_canonical()
-
             _pre_size = self._msg_char_count()
             self._run_compression_pipeline()
+            self._refresh_provider_context_from_canonical()
             _post_size = self._msg_char_count()
             if _post_size < _pre_size:
                 utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
@@ -2427,7 +2552,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     "result_length": len(materialized_content_bytes(res)) if res else 0,
                     "success": success,
                 })
-                print_tool_result(tu.name, display_tool_result(res))
+                print_tool_result(
+                    tu.name,
+                    self._display_tool_result(raw, provider="anthropic"),
+                )
 
                 # Plan Mode 'clear-and-execute' 后：直接追加工具结果并跳出
                 if self._context_cleared:
@@ -2508,7 +2636,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 "model": self.model,
                 "max_tokens": _get_anthropic_request_max_tokens(self.model),
                 "system": self._system_prompt,
-                "tools": get_active_tool_definitions(self.tools),
+                "tools": self._effective_tool_definitions(),
                 "messages": self._anthropic_messages,
             }
 
@@ -2624,10 +2752,9 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             if self._aborted:
                 break
 
-            self._refresh_provider_context_from_canonical()
-
             _pre_size = self._msg_char_count()
             self._run_compression_pipeline()
+            self._refresh_provider_context_from_canonical()
             _post_size = self._msg_char_count()
             if _post_size < _pre_size:
                 utilization = self.last_input_token_count / self.effective_window if self.effective_window else 0
@@ -2821,7 +2948,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     break
 
                 if batch["concurrent"]:
-                    async def _run_oai_safe(ct_item: dict) -> tuple[dict, str, bool]:
+                    async def _run_oai_safe(ct_item: dict) -> tuple[dict, str, bool, Any]:
                         raw, success, executed = await self._run_durable_tool(
                             request_id=request_id,
                             call_id=ct_item["tc"].get("id", f"tool-{ct_item['fn']}"),
@@ -2831,11 +2958,11 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                             permission={"decision": "allow", "reason": ct_item.get("reason", "")},
                         )
                         res = materialize_tool_result(raw, provider="openai")
-                        return ct_item, res, success
+                        return ct_item, res, success, raw
 
                     t0_batch = time.time()
                     results = await asyncio.gather(*[_run_oai_safe(ct) for ct in batch["items"]])
-                    for ct_item, res, success in results:
+                    for ct_item, res, success, raw in results:
                         tool_duration = int((time.time() - t0_batch) * 1000)
                         await self._emit("tool_end", {
                             "tool_name": ct_item["fn"],
@@ -2844,7 +2971,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                             "result_length": len(materialized_content_bytes(res)) if res else 0,
                             "success": success,
                         })
-                        print_tool_result(ct_item["fn"], display_tool_result(res))
+                        print_tool_result(
+                            ct_item["fn"],
+                            self._display_tool_result(raw, provider="openai"),
+                        )
                         self._openai_messages.append({"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
                 else:
                     for ct in batch["items"]:
@@ -2871,7 +3001,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         )
                         tool_duration = int((time.time() - t0) * 1000)
                         res = materialize_tool_result(raw, provider="openai")
-                        print_tool_result(ct["fn"], display_tool_result(res))
+                        print_tool_result(
+                            ct["fn"],
+                            self._display_tool_result(raw, provider="openai"),
+                        )
                         await self._emit("tool_end", {
                             "tool_name": ct["fn"],
                             "tool_input": ct["inp"],
@@ -2895,7 +3028,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         async def _do():
             create_params = {
                 "model": self.model,
-                "tools": _to_openai_tools(get_active_tool_definitions(self.tools)),
+                "tools": _to_openai_tools(self._effective_tool_definitions()),
                 "messages": self._openai_messages,
                 "stream": True,
                 "stream_options": {"include_usage": True},

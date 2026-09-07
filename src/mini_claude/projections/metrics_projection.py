@@ -5,7 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from .base import ProjectionDiagnostic, iter_event_records, source_digest, stable_digest
+from .base import (
+    ProjectionDiagnostic,
+    RuntimeEventReducer,
+    iter_event_records,
+    source_digest,
+    stable_digest,
+)
+from ..tool_call_identity import is_final_tool_call
 
 
 PROJECTION_VERSION = "canonical-metrics-v1"
@@ -60,8 +67,12 @@ class CanonicalMetricsProjection:
 
     def project(self, source: Any, *, high_water: int | None = None) -> MetricsProjectionResult:
         records = iter_event_records(source, high_water=high_water)
+        reducer = RuntimeEventReducer(records)
+        conflicted_call_keys = reducer.conflicted_calls
         runs: dict[str, dict[str, Any]] = {}
-        diagnostics: list[ProjectionDiagnostic] = []
+        diagnostics: list[ProjectionDiagnostic] = [
+            item for item in reducer.diagnostics if item.code == "call_identity_conflict"
+        ]
         for record in records:
             event = record.event
             run = runs.setdefault(
@@ -70,6 +81,7 @@ class CanonicalMetricsProjection:
                     "run_id": event.run_id,
                     "session_id": event.session_id,
                     "turns": {},
+                    "invocations": {},
                     "provider": "unknown",
                     "model": "unknown",
                     "started_at_ms": None,
@@ -96,18 +108,42 @@ class CanonicalMetricsProjection:
                 },
             )
             turn["last_ordinal"] = record.ordinal
+            invocation = run["invocations"].setdefault(
+                event.invocation_id,
+                {
+                    "invocation_id": event.invocation_id,
+                    "first_ordinal": record.ordinal,
+                    "last_ordinal": record.ordinal,
+                    "started_at_ms": None,
+                    "first_token_at_ms": None,
+                    "ended_at_ms": None,
+                },
+            )
+            invocation["last_ordinal"] = record.ordinal
             lifecycle = (event.metadata or {}).get("lifecycle")
             content = event.content or {}
             actions = event.actions or {}
 
             if lifecycle == "invocation_opened" or content.get("kind") == "invocation_opened":
-                run["started_at_ms"] = event.ts
+                if run["started_at_ms"] is None:
+                    run["started_at_ms"] = event.ts
+                if invocation["started_at_ms"] is None:
+                    invocation["started_at_ms"] = event.ts
                 route = content.get("route") if isinstance(content, Mapping) else None
                 if isinstance(route, Mapping):
                     run["provider"] = _label(route.get("provider"), run["provider"])
                     run["model"] = _label(route.get("model"), run["model"])
-            if (event.partial or "first_token" in actions) and run["first_token_at_ms"] is None:
-                run["first_token_at_ms"] = event.ts
+            if (
+                not event.partial
+                and ("first_token" in actions or lifecycle == "first_token")
+            ):
+                if run["first_token_at_ms"] is None:
+                    run["first_token_at_ms"] = event.ts
+                if invocation["first_token_at_ms"] is None:
+                    invocation["first_token_at_ms"] = event.ts
+            if "model_finish" in actions or lifecycle in {"provider_error", "budget"}:
+                if invocation["ended_at_ms"] is None:
+                    invocation["ended_at_ms"] = event.ts
             usage = actions.get("usage")
             if isinstance(usage, Mapping):
                 for key in (
@@ -126,7 +162,12 @@ class CanonicalMetricsProjection:
             if isinstance(permission, Mapping):
                 decision = _label(permission.get("decision"), "unknown").lower()
                 run["permission"][decision if decision in {"allow", "deny"} else "unknown"] += 1
-            if content.get("kind") == "function_call":
+            raw_call_id = content.get("id")
+            call_key = (
+                event.run_id,
+                str(raw_call_id) if raw_call_id else "unknown-call",
+            )
+            if is_final_tool_call(event) and call_key not in conflicted_call_keys:
                 call_id = _label(content.get("id"), "unknown-call")
                 run["tool_calls"].setdefault(
                     call_id,
@@ -155,8 +196,19 @@ class CanonicalMetricsProjection:
                     "failed" if tool["executed"] else "denied"
                 )
             if event.is_terminal:
-                run["ended_at_ms"] = event.ts
-                run["terminal_status"] = event.status or "completed"
+                if run["ended_at_ms"] is None:
+                    run["ended_at_ms"] = event.ts
+                    run["terminal_status"] = event.status or "completed"
+                else:
+                    diagnostics.append(
+                        ProjectionDiagnostic(
+                            "multiple_terminal_events",
+                            "run contains more than one terminal event; first terminal boundary wins",
+                            "error",
+                            event.id,
+                            event.run_id,
+                        )
+                    )
 
         operation_reader = getattr(source, "read_tool_operations", None)
         if callable(operation_reader):
@@ -171,7 +223,10 @@ class CanonicalMetricsProjection:
                     run = runs.get(operation.run_id)
                     if run is None:
                         continue
-                    call_id = _label(operation.provider_tool_call_id, "unknown-call")
+                    operation_call_id = str(operation.provider_tool_call_id or "unknown-call")
+                    if (operation.run_id, operation_call_id) in conflicted_call_keys:
+                        continue
+                    call_id = _label(operation_call_id, "unknown-call")
                     tool = run["tool_calls"].setdefault(
                         call_id,
                         {"tool_call_id": call_id, "tool_name": _label(operation.tool_name),
@@ -187,18 +242,41 @@ class CanonicalMetricsProjection:
         run_values: list[dict[str, Any]] = []
         for run in runs.values():
             turns = list(run.pop("turns").values())
+            invocations = []
+            for invocation in run.pop("invocations").values():
+                invocation_started = invocation["started_at_ms"]
+                invocation_first_token = invocation["first_token_at_ms"]
+                invocation_ended = invocation["ended_at_ms"]
+                invocation["first_token_ms"] = (
+                    max(0, invocation_first_token - invocation_started)
+                    if invocation_started is not None and invocation_first_token is not None
+                    else None
+                )
+                invocation["duration_ms"] = (
+                    max(0, invocation_ended - invocation_started)
+                    if invocation_started is not None and invocation_ended is not None
+                    else None
+                )
+                invocation.pop("first_token_at_ms")
+                invocations.append(invocation)
+            invocations.sort(key=lambda item: (item["first_ordinal"], item["invocation_id"]))
             tools = list(run.pop("tool_calls").values())
             started = run["started_at_ms"]
             ended = run["ended_at_ms"]
             run["first_token_ms"] = (
-                run["first_token_at_ms"] - started
+                max(0, run["first_token_at_ms"] - started)
                 if started is not None and run["first_token_at_ms"] is not None
                 else None
             )
-            run["duration_ms"] = ended - started if started is not None and ended is not None else None
+            run["duration_ms"] = (
+                max(0, ended - started)
+                if started is not None and ended is not None
+                else None
+            )
             run["first_token_available"] = run["first_token_at_ms"] is not None
             run.pop("first_token_at_ms")
             run["turns"] = turns
+            run["invocations"] = invocations
             run["tool_calls"] = len(tools)
             run["tools_succeeded"] = sum(1 for tool in tools if tool.get("success") is True)
             run["tools_failed"] = sum(1 for tool in tools if tool.get("success") is False)

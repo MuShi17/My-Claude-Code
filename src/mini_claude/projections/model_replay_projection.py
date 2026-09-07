@@ -64,7 +64,14 @@ class ModelReplayProjection:
         )
         reducer = RuntimeEventReducer(records)
         messages: list[dict[str, Any]] = []
-        call_records = sorted(reducer.calls.items(), key=lambda item: item[1].ordinal)
+        call_records = sorted(
+            (
+                item
+                for item in reducer.calls.items()
+                if item[0] not in reducer.conflicted_calls
+            ),
+            key=lambda item: item[1].ordinal,
+        )
         calls_by_event_id = {record.event.id: (key, record) for key, record in call_records}
         calls_by_group: dict[tuple[str, str], list[tuple[tuple[str, str], Any]]] = {}
         for key, record in call_records:
@@ -256,6 +263,8 @@ class ModelReplayProjection:
                 kind == "function_response"
                 and event.id in response_event_ids
                 and (event.run_id, str(content.get("id", ""))) in reducer.calls
+                and (event.run_id, str(content.get("id", "")))
+                not in reducer.conflicted_calls
                 and record.ordinal
                 > reducer.calls[(event.run_id, str(content.get("id", "")))].ordinal
                 and event.kind != "tool_outcome"

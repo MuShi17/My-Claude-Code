@@ -12,6 +12,7 @@ from openai import AsyncOpenAI
 
 import pytest
 
+from mini_claude.agent import Agent, CONTEXT_WINDOW_USAGE_RATIO, MODEL_CONTEXT
 from mini_claude.provider_content import (
     ProviderToolContentError,
     materialize_tool_result,
@@ -25,6 +26,18 @@ from mini_claude.runtime_event import RuntimeEvent
 from mini_claude.runtime_store import SQLiteRuntimeStore
 
 from runtime_fixtures import DeterministicIdFactory, build_scenario, scenario_events
+
+
+@pytest.mark.parametrize("model", ["claude-opus-4-6", "gpt-4o", "fixture-unknown"])
+def test_effective_window_uses_seventy_percent_of_model_context(model: str):
+    agent = Agent(api_key="fixture-key", model=model, thinking_effort="none")
+    try:
+        model_context = MODEL_CONTEXT.get(model, 200000)
+        expected_window = int(model_context * CONTEXT_WINDOW_USAGE_RATIO)
+        assert agent.effective_window == expected_window
+        assert agent._provider_budget_bytes() == expected_window * 4
+    finally:
+        asyncio.run(agent.aclose())
 
 
 def _events(provider: str = "anthropic") -> list[RuntimeEvent]:
@@ -84,7 +97,14 @@ def test_bounded_placeholder_has_identical_first_and_replayed_bytes(tmp_path: Pa
     response = deepcopy(events[-1].to_dict())
     response["content"]["result"] = bounded_ref
     response_event = RuntimeEvent.from_dict(response)
-    first = materialize_tool_result(bounded_ref, provider="anthropic")
+    safe_degradation = {
+        "kind": "archive_read_error",
+        "error_type": "capability_unavailable",
+        "message": "ArchiveRead capability is unavailable",
+        "preview": bounded_ref["inline"],
+        "ref": bounded_ref["ref"],
+    }
+    first = materialize_tool_result(safe_degradation, provider="anthropic")
     assert isinstance(first, str)
 
     database = tmp_path / "runtime.sqlite"
@@ -112,7 +132,7 @@ def test_bounded_placeholder_has_identical_first_and_replayed_bytes(tmp_path: Pa
             if block.get("type") == "tool_result"
         )
         assert materialized_content_bytes(tool_result["content"]) == first_bytes
-        assert json.loads(tool_result["content"]) == bounded_ref
+        assert json.loads(tool_result["content"]) == safe_degradation
 
 
 def _neutral_tool_result() -> ModelReplayResult:

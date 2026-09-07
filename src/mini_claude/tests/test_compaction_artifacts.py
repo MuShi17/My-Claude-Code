@@ -13,6 +13,7 @@ from mini_claude.artifact_archive import (
     ArtifactIntegrityError,
     ArtifactSizeLimitError,
 )
+from mini_claude.archive_capability import ToolResultArchiveCapability
 from mini_claude.compaction import (
     CheckpointSourceMismatchError,
     CompactionCheckpointBuilder,
@@ -106,11 +107,15 @@ def test_archive_fault_does_not_return_a_reference(tmp_path: Path, fault_point: 
 def test_durable_tool_archives_before_emitting_bounded_outcome(tmp_path: Path):
     sink = RecordingEventSink()
     archive = ArtifactArchive(tmp_path / "artifacts")
+    context = _context()
     boundary = DurableToolBoundary(
         RuntimeEventEmitter(sink),
-        _context(),
+        context,
         max_result_bytes=32,
         artifact_archive=archive,
+        archive_capability=ToolResultArchiveCapability(
+            archive, session_id=context.session_id, run_id=context.run_id
+        ),
     )
     result = asyncio.run(boundary.execute(
         call_id="call-large",
@@ -129,8 +134,15 @@ def test_durable_tool_archives_before_emitting_bounded_outcome(tmp_path: Path):
 def test_durable_tool_archive_failure_is_bounded_and_has_no_dangling_ref(tmp_path: Path):
     sink = RecordingEventSink()
     archive = ArtifactArchive(tmp_path / "artifacts", fault_hook=FaultInjector("artifact.write"))
+    context = _context()
     boundary = DurableToolBoundary(
-        RuntimeEventEmitter(sink), _context(), max_result_bytes=32, artifact_archive=archive
+        RuntimeEventEmitter(sink),
+        context,
+        max_result_bytes=32,
+        artifact_archive=archive,
+        archive_capability=ToolResultArchiveCapability(
+            archive, session_id=context.session_id, run_id=context.run_id
+        ),
     )
     result = asyncio.run(boundary.execute(
         call_id="call-fault",
@@ -142,6 +154,34 @@ def test_durable_tool_archive_failure_is_bounded_and_has_no_dangling_ref(tmp_pat
     assert result.success is False
     assert result.result["kind"] == "archive_error"
     assert "ref" not in result.result
+
+
+def test_durable_tool_without_archive_capability_fails_closed(tmp_path: Path):
+    sink = RecordingEventSink()
+    archive = ArtifactArchive(tmp_path / "artifacts")
+    context = _context()
+    boundary = DurableToolBoundary(
+        RuntimeEventEmitter(sink),
+        context,
+        max_result_bytes=32,
+        artifact_archive=archive,
+    )
+    result = asyncio.run(boundary.execute(
+        call_id="call-no-capability",
+        name="read_file",
+        arguments={},
+        permission="allow",
+        executor=lambda: "x" * 1000,
+    ))
+    assert result.success is False
+    assert result.result == {
+        "kind": "archive_error",
+        "error_type": "ArchiveCapabilityUnavailable",
+        "message": "large tool result cannot be referenced without ArchiveRead capability",
+        "size_bytes": 1000,
+        "tool_name": "read_file",
+    }
+    assert list((tmp_path / "artifacts").rglob("*")) == []
 
 
 def test_llm_capture_modes_and_redacted_body_bound(tmp_path: Path):

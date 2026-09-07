@@ -894,6 +894,20 @@ class SQLiteRuntimeStore:
         ).fetchone()
         return self._tool_operation_from_row(row) if row is not None else None
 
+    def read_tool_operation_for_run_call(
+        self, run_id: str, provider_tool_call_id: str
+    ) -> ToolOperationRecord | None:
+        """Find the first durable operation for a canonical run/call identity."""
+
+        self._ensure_open()
+        row = self.connection.execute(
+            "SELECT * FROM runtime_tool_operations "
+            "WHERE run_id = ? AND provider_tool_call_id = ? "
+            "ORDER BY created_at, operation_id LIMIT 1",
+            (run_id, provider_tool_call_id),
+        ).fetchone()
+        return self._tool_operation_from_row(row) if row is not None else None
+
     def read_tool_operations(
         self, *, run_id: str | None = None, invocation_id: str | None = None
     ) -> list[ToolOperationRecord]:

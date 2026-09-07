@@ -50,6 +50,7 @@ def test_owned_runtime_and_archive_survive_consecutive_large_result_turns(
             self._runtime_emitter,
             self._runtime_context,
             artifact_archive=self._artifact_archive,
+            archive_capability=self._archive_capability,
         )
         results.append(await boundary.execute(
             call_id="call-large-second",

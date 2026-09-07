@@ -28,12 +28,12 @@ from .frontmatter import parse_frontmatter
 PermissionMode = str  # "default" | "plan" | "acceptEdits" | "bypassPermissions" | "dontAsk"
 
 # 只读工具：在任何模式下都不需要用户确认
-READ_TOOLS = {"read_file", "list_files", "grep_search", "web_fetch"}
+READ_TOOLS = {"read_file", "list_files", "grep_search", "web_fetch", "ArchiveRead"}
 # 编辑工具：会修改文件系统的工具
 EDIT_TOOLS = {"write_file", "edit_file"}
 
 # 可并发执行的工具：无副作用，可以在同一轮中并行调用以加速响应
-CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files", "grep_search", "web_fetch"}
+CONCURRENCY_SAFE_TOOLS = {"read_file", "list_files", "grep_search", "web_fetch", "ArchiveRead"}
 
 IS_WIN = sys.platform == "win32"
 

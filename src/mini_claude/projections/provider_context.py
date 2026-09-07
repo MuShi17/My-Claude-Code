@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from ..archive_capability import ToolResultArchiveCapability
+from ..archive_projection import project_archived_tool_results
 from .model_replay_projection import ModelReplayProjection, ModelReplayResult
 from ..provider_content import materialize_tool_result
 from ..runtime_event import canonical_json_bytes
@@ -299,9 +302,17 @@ class CanonicalModelContextAdapter:
         provider: str,
         high_water: int | None = None,
         system_prompt: str | None = None,
+        archive_capability: ToolResultArchiveCapability | None = None,
+        budget_bytes: int | None = None,
     ) -> ProviderContext:
         result: ModelReplayResult = self.projection.build(source, high_water=high_water)
-        return self.build_result(result, provider=provider, system_prompt=system_prompt)
+        return self.build_result(
+            result,
+            provider=provider,
+            system_prompt=system_prompt,
+            archive_capability=archive_capability,
+            budget_bytes=budget_bytes,
+        )
 
     def build_result(
         self,
@@ -309,15 +320,33 @@ class CanonicalModelContextAdapter:
         *,
         provider: str,
         system_prompt: str | None = None,
+        archive_capability: ToolResultArchiveCapability | None = None,
+        budget_bytes: int | None = None,
     ) -> ProviderContext:
         """Adapt an already materialized neutral result without rereading it."""
 
-        if provider == "anthropic":
-            messages = _anthropic_messages(result.messages)
-        elif provider == "openai":
-            messages = _openai_messages(result.messages, system_prompt=system_prompt)
-        else:
+        def convert(
+            neutral_messages: tuple[dict[str, Any], ...],
+        ) -> tuple[dict[str, Any], ...]:
+            if provider == "anthropic":
+                return _anthropic_messages(neutral_messages)
+            if provider == "openai":
+                return _openai_messages(neutral_messages, system_prompt=system_prompt)
             raise ValueError(f"unsupported provider {provider!r}")
+
+        def final_message_size(
+            neutral_messages: Sequence[Mapping[str, Any]],
+        ) -> int:
+            converted = convert(tuple(dict(message) for message in neutral_messages))
+            return len(canonical_json_bytes(list(converted)))
+
+        neutral_messages = project_archived_tool_results(
+            result.messages,
+            archive_capability,
+            budget_bytes=budget_bytes,
+            size_fn=final_message_size,
+        )
+        messages = convert(neutral_messages)
         return ProviderContext(
             provider=provider,
             high_water=result.high_water,

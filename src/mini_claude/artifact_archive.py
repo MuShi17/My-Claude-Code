@@ -135,6 +135,36 @@ class ArtifactDiagnostic:
         return result
 
 
+@dataclass(frozen=True, slots=True)
+class ArtifactPage:
+    """One bounded, integrity-checked page from an archived artifact."""
+
+    artifact: ArtifactRef
+    page: bytes | str
+    offset: int
+    next_offset: int
+    total_units: int
+    unit: str
+    has_more: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ref": self.artifact.ref,
+            "sha256": self.artifact.sha256,
+            "size_bytes": self.artifact.size_bytes,
+            "mime_type": self.artifact.mime_type,
+            "encoding": self.artifact.encoding,
+            "scope": self.artifact.scope,
+            "redaction_version": self.artifact.redaction_version,
+            "page": self.page,
+            "offset": self.offset,
+            "next_offset": self.next_offset,
+            "total_units": self.total_units,
+            "unit": self.unit,
+            "has_more": self.has_more,
+        }
+
+
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
@@ -413,10 +443,92 @@ class ArtifactArchive:
 
     read_bounded = read
 
+    def read_page(
+        self,
+        ref: ArtifactRef | Mapping[str, Any] | str,
+        *,
+        offset: int = 0,
+        limit: int | None = None,
+        allowed_scopes: Iterable[str] | None = None,
+    ) -> ArtifactPage:
+        """Read one bounded page without changing the full-read contract.
+
+        Text offsets are Unicode character offsets after decoding. Binary
+        offsets are byte offsets. Integrity is checked against the complete
+        content before a page is returned so a truncated page can never mask
+        a corrupted artifact.
+        """
+
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ArtifactSizeLimitError("offset must be a non-negative integer")
+        item, path = self._resolve(ref)
+        if allowed_scopes is not None and item.scope not in set(allowed_scopes):
+            raise ArtifactAccessError(f"scope {item.scope!r} is not allowed")
+        payload = self._verify_content(item, path)
+        if limit is None:
+            limit = self.max_read_bytes
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ArtifactSizeLimitError("limit must be a positive integer")
+
+        is_text = item.encoding != "binary" or item.mime_type.startswith("text/")
+        if is_text:
+            text = payload.decode(
+                item.encoding if item.encoding != "binary" else "utf-8",
+                errors="replace",
+            )
+            total_units = len(text)
+            if offset > total_units:
+                raise ArtifactSizeLimitError(
+                    f"offset {offset} is beyond artifact length {total_units}"
+                )
+            page: bytes | str = text[offset : offset + limit]
+            unit = "chars"
+        else:
+            total_units = len(payload)
+            if offset > total_units:
+                raise ArtifactSizeLimitError(
+                    f"offset {offset} is beyond artifact length {total_units}"
+                )
+            page = payload[offset : offset + limit]
+            unit = "bytes"
+        next_offset = min(offset + len(page), total_units)
+        return ArtifactPage(
+            artifact=item,
+            page=page,
+            offset=offset,
+            next_offset=next_offset,
+            total_units=total_units,
+            unit=unit,
+            has_more=next_offset < total_units,
+        )
+
     def inspect(self, ref: ArtifactRef | Mapping[str, Any] | str) -> ArtifactRef:
         item, path = self._resolve(ref)
         self._verify_content(item, path)
         return item
+
+    def metadata(
+        self,
+        ref: ArtifactRef | Mapping[str, Any] | str,
+        *,
+        allowed_scopes: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
+        """Return validated on-disk metadata for capability authorization."""
+
+        item, content_path = self._resolve(ref)
+        if allowed_scopes is not None and item.scope not in set(allowed_scopes):
+            raise ArtifactAccessError(f"scope {item.scope!r} is not allowed")
+        self._verify_content(item, content_path)
+        metadata_path = self._paths(item.digest)[1]
+        try:
+            value = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except FileNotFoundError as error:
+            raise ArtifactNotFoundError(item.ref) from error
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ArtifactIntegrityError(f"invalid artifact metadata for {item.ref}") from error
+        if not isinstance(value, dict):
+            raise ArtifactIntegrityError(f"artifact metadata is not an object for {item.ref}")
+        return value
 
     def diagnose(self, ref: str | None = None) -> list[ArtifactDiagnostic]:
         if ref is not None:
@@ -494,6 +606,7 @@ __all__ = [
     "ArtifactIntegrityError",
     "ArtifactMetadataError",
     "ArtifactNotFoundError",
+    "ArtifactPage",
     "ArtifactRef",
     "ArtifactSizeLimitError",
 ]

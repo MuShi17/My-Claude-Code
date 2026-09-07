@@ -578,7 +578,15 @@ def test_real_agent_compaction_writes_checkpoint_and_replays_compacted_context(
             ("model", "agent", {"kind": "function_call", "id": "call-1", "name": "read_file", "args": {}}),
             ("tool", "tool", {"kind": "function_response", "id": "call-1", "name": "read_file", "result": "old result"}),
         ):
-            store.append(RuntimeEvent.create(context, role=role, author=author, content=content))
+            store.append(RuntimeEvent.create(
+                context,
+                role=role,
+                author=author,
+                content=content,
+                metadata={"lifecycle": "tool_call_final"}
+                if content.get("kind") == "function_call"
+                else None,
+            ))
         agent._openai_client = SimpleNamespace(
             chat=SimpleNamespace(completions=FakeCompletions())
         )

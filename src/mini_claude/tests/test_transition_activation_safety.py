@@ -415,6 +415,7 @@ def test_agent_restores_previous_provider_context_when_transition_source_races(
                     "name": "read_file",
                     "args": {},
                 },
+                metadata={"lifecycle": "tool_call_final"},
             )
         )
         store.append(
