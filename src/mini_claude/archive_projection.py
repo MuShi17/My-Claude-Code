@@ -20,6 +20,7 @@ from .archive_capability import (
     ToolResultArchiveCapability,
 )
 from .artifact_archive import ArtifactArchiveError, is_artifact_ref
+from .provider_capacity import ProviderCapacityError
 from .runtime_event import canonical_json_bytes
 
 
@@ -35,13 +36,23 @@ def _capacity_error(
     ref: str,
     *,
     message: str = "tool result does not fit the current Provider capacity",
+    capability: ToolResultArchiveCapability | None = None,
+    offset: int = 0,
+    limit: int | None = None,
 ) -> dict[str, Any]:
-    return {
+    result: dict[str, Any] = {
         "kind": "archive_read_error",
         "error_type": "capacity_exhausted",
         "message": message,
         "ref": ref,
     }
+    if capability is not None and is_artifact_ref(ref):
+        result["read_instructions"] = capability.read_instructions(
+            ref,
+            offset=offset,
+            limit=limit,
+        )
+    return result
 
 
 def _archive_error(ref: str, error: BaseException) -> dict[str, Any]:
@@ -113,6 +124,28 @@ def _structured_value(value: Any) -> Mapping[str, Any] | None:
     return candidate if isinstance(candidate, Mapping) else None
 
 
+def _artifact_ref_from_value(value: Any) -> str | None:
+    structured = _structured_value(value)
+    if structured is None:
+        return None
+    ref = structured.get("ref")
+    return ref if is_artifact_ref(ref) else None
+
+
+def _ensure_read_instructions(
+    value: Mapping[str, Any],
+    capability: ToolResultArchiveCapability,
+    ref: str,
+) -> dict[str, Any]:
+    """Preserve a historical placeholder, filling only a missing hint."""
+
+    result = dict(value)
+    instructions = result.get("read_instructions")
+    if not isinstance(instructions, str) or not instructions:
+        result["read_instructions"] = capability.read_instructions(ref)
+    return result
+
+
 def _tool_names_by_call_id(
     messages: Sequence[Mapping[str, Any]],
 ) -> dict[str, str]:
@@ -151,7 +184,10 @@ def _tool_names_by_call_id(
     return names
 
 
-def _archive_read_capacity_error(value: Any) -> dict[str, Any]:
+def _archive_read_capacity_error(
+    value: Any,
+    capability: ToolResultArchiveCapability | None = None,
+) -> dict[str, Any]:
     """Return a bounded, non-recursive error for an oversized ArchiveRead page."""
 
     structured = _structured_value(value)
@@ -160,12 +196,32 @@ def _archive_read_capacity_error(value: Any) -> dict[str, Any]:
         candidate_ref = structured.get("ref")
         if is_artifact_ref(candidate_ref):
             ref = candidate_ref
+    offset = 0
+    limit: int | None = None
+    if structured is not None:
+        candidate_offset = structured.get("offset")
+        if (
+            isinstance(candidate_offset, int)
+            and not isinstance(candidate_offset, bool)
+            and candidate_offset >= 0
+        ):
+            offset = candidate_offset
+        candidate_limit = structured.get("limit")
+        if (
+            isinstance(candidate_limit, int)
+            and not isinstance(candidate_limit, bool)
+            and candidate_limit > 0
+        ):
+            limit = candidate_limit
     result = _capacity_error(
         ref,
         message=(
             "ArchiveRead result does not fit the current Provider capacity; "
             "retry with a smaller limit"
         ),
+        capability=capability,
+        offset=offset,
+        limit=limit,
     )
     if structured is not None:
         operation = structured.get("operation")
@@ -186,6 +242,7 @@ def _project_archive_read_result(
     value: Any,
     capability: ToolResultArchiveCapability | None,
     *,
+    first_use: bool,
     budget_bytes: int | None,
     size_fn: Callable[[Sequence[Mapping[str, Any]]], int] | None,
 ) -> Any:
@@ -208,9 +265,25 @@ def _project_archive_read_result(
         except (ArtifactArchiveError, RuntimeError, ValueError, TypeError) as error:
             return _archive_error(ref, error)
 
+        if not first_use:
+            return _ensure_read_instructions(parsed, capability, ref)
+
+    if not first_use:
+        # Historical ArchiveRead pages are already tool results.  Keep their
+        # exact content stable; only the active request may negotiate a
+        # smaller page against the aggregate budget.
+        return value
+
     if _fits(projected, index, value, budget_bytes, size_fn):
         return value
-    return _archive_read_capacity_error(value)
+    return _capacity_fallback_if_fit(
+        projected,
+        index,
+        _archive_read_capacity_error(value, capability),
+        ref=_artifact_ref_from_value(value),
+        budget_bytes=budget_bytes,
+        size_fn=size_fn,
+    )
 
 
 def _value_size(value: Any) -> int:
@@ -308,6 +381,22 @@ def _fits(
     return measured <= budget_bytes
 
 
+def _capacity_fallback_if_fit(
+    projected: list[dict[str, Any]],
+    index: int,
+    fallback: dict[str, Any],
+    *,
+    ref: str | None,
+    budget_bytes: int | None,
+    size_fn: Callable[[Sequence[Mapping[str, Any]]], int] | None,
+) -> dict[str, Any]:
+    """Return a capacity error only when the complete fallback can fit."""
+
+    if _fits(projected, index, fallback, budget_bytes, size_fn):
+        return fallback
+    raise ProviderCapacityError(ref=ref or None)
+
+
 def _capacity_rescue(
     capability: ToolResultArchiveCapability,
     ref: str,
@@ -362,6 +451,18 @@ def _minimal_placeholder(
     return capability.placeholder(ref, include_metadata=False)
 
 
+def _stable_placeholder(
+    capability: ToolResultArchiveCapability,
+    ref: str,
+    existing: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Reuse an established placeholder, adding only a missing hint."""
+
+    if existing is not None:
+        return _ensure_read_instructions(existing, capability, ref)
+    return _minimal_placeholder(capability, ref)
+
+
 def _project_archived_ref(
     projected: list[dict[str, Any]],
     index: int,
@@ -369,6 +470,7 @@ def _project_archived_ref(
     capability: ToolResultArchiveCapability,
     *,
     first_use: bool,
+    existing: Mapping[str, Any] | None = None,
     budget_bytes: int | None,
     preview_chars: int,
     size_fn: Callable[[Sequence[Mapping[str, Any]]], int] | None,
@@ -378,12 +480,10 @@ def _project_archived_ref(
     capability.register_ref(ref)
     metadata = capability.inspect(ref)
     if not first_use:
-        placeholder = _minimal_placeholder(capability, ref)
-        return (
-            placeholder
-            if _fits(projected, index, placeholder, budget_bytes, size_fn)
-            else _capacity_error(ref)
-        )
+        # A valid placeholder is an established Provider-visible state.  It
+        # must not be rewritten based on the aggregate message budget after a
+        # later suffix is appended; the final request gate owns that verdict.
+        return _stable_placeholder(capability, ref, existing)
 
     artifact_size = int(metadata.get("size_bytes", 0))
     if budget_bytes is None or artifact_size <= max(0, budget_bytes):
@@ -434,7 +534,14 @@ def _project_archived_ref(
                 )
             if _fits(projected, index, candidate, budget_bytes, size_fn):
                 return candidate
-    return _capacity_error(ref)
+    return _capacity_fallback_if_fit(
+        projected,
+        index,
+        _capacity_error(ref, capability=capability),
+        ref=ref,
+        budget_bytes=budget_bytes,
+        size_fn=size_fn,
+    )
 
 
 def project_archived_tool_results(
@@ -475,6 +582,7 @@ def project_archived_tool_results(
                     index,
                     message.get("content"),
                     None,
+                    first_use=message.get("tool_call_id") in first_use_ids,
                     budget_bytes=budget_bytes,
                     size_fn=size_fn,
                 )
@@ -489,23 +597,10 @@ def project_archived_tool_results(
                 preview = parsed.get("preview", parsed.get("inline"))
                 if isinstance(preview, str):
                     replacement["preview"] = preview[:preview_chars]
-                if _fits(projected, index, replacement, budget_bytes, size_fn):
-                    projected[index]["content"] = replacement
-                    continue
-                if isinstance(preview, str):
-                    for length in (2_000, 1_000, 512, 256, 128, 64, 0):
-                        candidate = dict(replacement)
-                        if length:
-                            candidate["preview"] = preview[:length]
-                        else:
-                            candidate.pop("preview", None)
-                        if _fits(projected, index, candidate, budget_bytes, size_fn):
-                            projected[index]["content"] = candidate
-                            break
-                    else:
-                        projected[index]["content"] = _capacity_error(ref)
-                else:
-                    projected[index]["content"] = _capacity_error(ref)
+                # Without a capability this is a deterministic degradation,
+                # not an aggregate-capacity negotiation.  The final request
+                # gate decides whether even this diagnostic can be sent.
+                projected[index]["content"] = replacement
                 continue
             if message.get("tool_call_id") not in first_use_ids:
                 projected[index]["content"] = _capability_unavailable()
@@ -527,6 +622,7 @@ def project_archived_tool_results(
                 index,
                 message.get("content"),
                 capability,
+                first_use=first_use,
                 budget_bytes=budget_bytes,
                 size_fn=size_fn,
             )
@@ -541,10 +637,13 @@ def project_archived_tool_results(
                     ref,
                     capability,
                     first_use=first_use,
+                    existing=parsed,
                     budget_bytes=budget_bytes,
                     preview_chars=preview_chars,
                     size_fn=size_fn,
                 )
+            except ProviderCapacityError:
+                raise
             except (ArtifactArchiveError, RuntimeError, ValueError, TypeError) as error:
                 projected[index]["content"] = _archive_error(ref, error)
             continue
@@ -580,6 +679,8 @@ def project_archived_tool_results(
                 preview_chars=preview_chars,
                 size_fn=size_fn,
             )
+        except ProviderCapacityError:
+            raise
         except (ArtifactArchiveError, RuntimeError, ValueError, TypeError) as error:
             projected[index]["content"] = (
                 _archive_error(ref, error) if ref else _capability_unavailable()

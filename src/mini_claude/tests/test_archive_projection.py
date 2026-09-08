@@ -11,14 +11,19 @@ import pytest
 
 from mini_claude.archive_capability import ToolResultArchiveCapability
 from mini_claude.archive_projection import (
+    _archive_read_capacity_error,
     project_archived_tool_results,
     project_terminal_tool_result,
 )
 from mini_claude.agent import Agent
 from mini_claude.artifact_archive import ArtifactArchive
-from mini_claude.projections.provider_context import CanonicalModelContextAdapter
+from mini_claude.projections.provider_context import (
+    CanonicalModelContextAdapter,
+    ProviderCapacityError,
+)
 from mini_claude.projections.model_replay_projection import ModelReplayResult
 from mini_claude.runtime_lifecycle import DurableToolBoundary
+from mini_claude.runtime_event import canonical_json_bytes
 from mini_claude.runtime_store import SQLiteRuntimeStore
 
 
@@ -119,6 +124,26 @@ def test_capacity_rescue_and_stale_projection_are_actionable(tmp_path: Path, pro
     assert "preview" not in stale_content
     assert "ArchiveRead" in stale_content["read_instructions"]
 
+    # Once a stale placeholder has been established, a later suffix must not
+    # make it compete with the aggregate request budget again.
+    critical = project_archived_tool_results(
+        stale_messages,
+        capability,
+        budget_bytes=1,
+    )
+    expanded_stale_messages = (
+        *stale_messages,
+        {"role": "user", "content": "suffix " * 2_000},
+    )
+    critical_after_suffix = project_archived_tool_results(
+        expanded_stale_messages,
+        capability,
+        budget_bytes=1,
+    )
+    assert critical[1]["content"]["kind"] == "bounded_ref"
+    assert critical_after_suffix[1]["content"] == critical[1]["content"]
+    assert "ArchiveRead" in critical_after_suffix[1]["content"]["read_instructions"]
+
     context = CanonicalModelContextAdapter().build_result(
         _result(stale_messages),
         provider=provider,
@@ -130,11 +155,9 @@ def test_capacity_rescue_and_stale_projection_are_actionable(tmp_path: Path, pro
     assert ref.ref in wire
     assert "ArchiveRead" in wire
 
-    blocked = project_archived_tool_results(messages, capability, budget_bytes=1)
-    blocked_content = blocked[1]["content"]
-    assert blocked_content["kind"] == "archive_read_error"
-    assert blocked_content["error_type"] == "capacity_exhausted"
-    assert ref.ref in blocked_content["ref"]
+    with pytest.raises(ProviderCapacityError) as blocked:
+        project_archived_tool_results(messages, capability, budget_bytes=1)
+    assert blocked.value.ref == ref.ref
 
 
 def test_complete_canonical_result_is_archived_only_when_projection_needs_it(
@@ -365,17 +388,55 @@ def test_archive_read_capacity_error_does_not_archive_page(tmp_path: Path):
     )
     before = len(list((tmp_path / "artifacts").rglob("*.bin")))
 
+    with pytest.raises(ProviderCapacityError) as error:
+        project_archived_tool_results(
+            messages,
+            capability,
+            budget_bytes=1_000,
+        )
+    assert error.value.ref == ref.ref
+    assert len(list((tmp_path / "artifacts").rglob("*.bin"))) == before
+
+
+def test_archive_read_capacity_error_is_returned_at_exact_fit(tmp_path: Path):
+    archive = ArtifactArchive(tmp_path / "artifacts")
+    ref = archive.archive(
+        bytes(range(256)) * 80,
+        mime_type="application/octet-stream",
+        encoding="binary",
+        scope="tool-result",
+        metadata={"session_id": "session-a", "run_id": "run-a"},
+    )
+    capability = ToolResultArchiveCapability(
+        archive,
+        session_id="session-a",
+        run_id="run-a",
+    )
+    page = capability.execute(
+        {
+            "operation": "read",
+            "ref": ref.ref,
+            "offset": 0,
+            "limit": 7_500,
+        }
+    )
+    messages = _archive_read_messages(page)
+    fallback = _archive_read_capacity_error(page, capability)
+    fallback_messages = [dict(message) for message in messages]
+    fallback_messages[-1]["content"] = fallback
+    exact_budget = len(canonical_json_bytes(fallback_messages))
+
     projected = project_archived_tool_results(
         messages,
         capability,
-        budget_bytes=1_000,
+        budget_bytes=exact_budget,
     )
-    error = projected[-1]["content"]
-    assert error["kind"] == "archive_read_error"
-    assert error["error_type"] == "capacity_exhausted"
-    assert error["ref"] == ref.ref
-    assert "smaller limit" in error["message"]
-    assert len(list((tmp_path / "artifacts").rglob("*.bin"))) == before
+
+    assert len(canonical_json_bytes(list(messages))) > exact_budget
+    assert projected[-1]["content"] == fallback
+    assert projected[-1]["content"]["error_type"] == "capacity_exhausted"
+    assert "ArchiveRead" in projected[-1]["content"]["read_instructions"]
+    assert len(list((tmp_path / "artifacts").rglob("*.bin"))) == 1
 
 
 def test_historical_archive_read_bounded_ref_is_not_rearchived(tmp_path: Path):
@@ -393,7 +454,7 @@ def test_historical_archive_read_bounded_ref_is_not_rearchived(tmp_path: Path):
         run_id="run-a",
     )
     placeholder = ref.placeholder()
-    messages = _archive_read_messages(placeholder)
+    messages = (*_archive_read_messages(placeholder), {"role": "user", "content": "next"})
     before = len(list((tmp_path / "artifacts").rglob("*.bin")))
 
     projected = project_archived_tool_results(messages, capability, budget_bytes=200_000)
@@ -402,9 +463,134 @@ def test_historical_archive_read_bounded_ref_is_not_rearchived(tmp_path: Path):
         capability,
         budget_bytes=200_000,
     )
-    assert projected[1]["content"] == placeholder
-    assert repeated[1]["content"] == placeholder
+    assert projected[1]["content"] == repeated[1]["content"]
+    assert "ArchiveRead" in projected[1]["content"]["read_instructions"]
     assert len(list((tmp_path / "artifacts").rglob("*.bin"))) == before
+
+
+def test_historical_archive_read_bounded_ref_fills_missing_read_hint(tmp_path: Path):
+    archive = ArtifactArchive(tmp_path / "artifacts")
+    capability = ToolResultArchiveCapability(
+        archive,
+        session_id="session-a",
+        run_id="run-a",
+    )
+    ref = capability.archive_result("historical body\n" * 20, call_id="call-source")
+    placeholder = ref.placeholder()
+    placeholder.pop("read_instructions", None)
+    messages = (
+        *_archive_read_messages(placeholder),
+        {"role": "user", "content": "next"},
+    )
+
+    projected = project_archived_tool_results(messages, capability, budget_bytes=1)
+
+    repaired = projected[1]["content"]
+    assert repaired["ref"] == ref.ref
+    assert "ArchiveRead" in repaired["read_instructions"]
+
+
+def test_stale_projection_reuses_existing_placeholder_shape(tmp_path: Path):
+    _archive, ref, capability, messages, _content = _fixture(tmp_path)
+    existing = dict(messages[1]["content"])
+    existing.update(
+        {
+            "preview": "continuation preview",
+            "preview_chars": 19,
+            "offset": 512,
+            "next_offset": 531,
+            "read_instructions": capability.read_instructions(
+                ref.ref,
+                offset=531,
+                limit=64,
+            ),
+        }
+    )
+    stale_messages = (
+        {**messages[0]},
+        {**messages[1], "content": existing},
+        {"role": "user", "content": "next"},
+    )
+
+    projected = project_archived_tool_results(
+        stale_messages,
+        capability,
+        budget_bytes=1,
+    )
+
+    assert projected[1]["content"] == existing
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_provider_adapter_keeps_stale_placeholder_stable_when_suffix_grows(
+    tmp_path: Path, provider: str
+):
+    _archive, ref, capability, messages, _content = _fixture(tmp_path)
+    existing = dict(messages[1]["content"])
+    stale_messages = (
+        {**messages[0]},
+        {**messages[1], "content": existing},
+        {"role": "user", "content": "next"},
+    )
+    expanded_messages = (*stale_messages, {"role": "user", "content": "suffix " * 2_000})
+    provider_tools = [
+        {
+            "name": "fixture_tool",
+            "description": "A fixture tool.",
+            "input_schema": {"type": "object", "properties": {}},
+        }
+    ]
+    adapter = CanonicalModelContextAdapter()
+
+    before = adapter.build_result(
+        _result(stale_messages),
+        provider=provider,
+        system_prompt="system",
+        provider_tools=provider_tools,
+        archive_capability=capability,
+        budget_bytes=1,
+    )
+    after = adapter.build_result(
+        _result(expanded_messages),
+        provider=provider,
+        system_prompt="system",
+        provider_tools=provider_tools,
+        archive_capability=capability,
+        budget_bytes=1,
+    )
+
+    if provider == "anthropic":
+        before_content = next(
+            block["content"]
+            for message in before.messages
+            if message.get("role") == "user"
+            for block in message.get("content", [])
+            if block.get("type") == "tool_result"
+        )
+        after_content = next(
+            block["content"]
+            for message in after.messages
+            if message.get("role") == "user"
+            for block in message.get("content", [])
+            if block.get("type") == "tool_result"
+        )
+    else:
+        before_content = next(
+            message["content"]
+            for message in before.messages
+            if message.get("role") == "tool"
+        )
+        after_content = next(
+            message["content"]
+            for message in after.messages
+            if message.get("role") == "tool"
+        )
+
+    assert before_content == after_content
+    assert ref.ref in before_content
+    assert "capacity_exhausted" not in before_content
+    assert before.request_fits is False
+    assert after.request_fits is False
 
 
 @pytest.mark.parametrize("provider", ["anthropic", "openai"])
@@ -657,7 +843,9 @@ def test_real_agent_replay_reaches_fake_provider_with_archive_projection(
         assert replay is not None
         assert replay.messages[-1]["content"] == result.result
 
-        agent.effective_window = 400
+        # Keep enough room for the real system/tools envelope while forcing
+        # the large tool result through the capacity-rescue path.
+        agent.effective_window = 2_000
         rescue_context = agent._refresh_provider_context_from_canonical()
         rescue_wire = (
             next(

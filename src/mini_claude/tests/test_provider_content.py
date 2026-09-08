@@ -22,7 +22,7 @@ from mini_claude.projections import CanonicalModelContextAdapter
 from mini_claude.projections.base import EventRecord
 from mini_claude.projections.incremental_replay import IncrementalModelReplayCursor
 from mini_claude.projections.model_replay_projection import ModelReplayResult
-from mini_claude.runtime_event import RuntimeEvent
+from mini_claude.runtime_event import RuntimeEvent, canonical_json_bytes
 from mini_claude.runtime_store import SQLiteRuntimeStore
 
 from runtime_fixtures import DeterministicIdFactory, build_scenario, scenario_events
@@ -206,6 +206,54 @@ def test_openai_adapter_emits_strict_function_wire_shape_and_hides_runtime_ids()
     }
     assert all("runtime_event_id" not in message for message in context.messages)
     assert context.messages[2]["content"] == '{"a":true,"z":[2,1]}'
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_provider_context_budget_includes_system_messages_and_tools(provider: str):
+    # Keep the fixture free of tool results so a tight budget cannot trigger a
+    # separate archive decision; this isolates the request-envelope measure.
+    result = ModelReplayResult(
+        projection_version="projection-v1",
+        schema_version=1,
+        high_water=1,
+        source_digest="source",
+        digest="digest",
+        messages=(({"role": "user", "content": "hello"},)),
+        partial_count=0,
+        diagnostics=(),
+    )
+    provider_tools = [
+        {
+            "name": "fixture_tool",
+            "description": "A fixture tool with a stable schema.",
+            "input_schema": {
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+            },
+        }
+    ]
+    adapter = CanonicalModelContextAdapter()
+    context = adapter.build_result(
+        result,
+        provider=provider,
+        system_prompt="system fixture",
+        provider_tools=provider_tools,
+    )
+    message_only_bytes = len(canonical_json_bytes(list(context.messages)))
+    assert context.request_size_bytes > message_only_bytes
+    assert context.request_fits is True
+
+    tight = adapter.build_result(
+        result,
+        provider=provider,
+        system_prompt="system fixture",
+        provider_tools=provider_tools,
+        budget_bytes=message_only_bytes,
+    )
+    assert tight.messages == context.messages
+    assert tight.request_size_bytes == context.request_size_bytes
+    assert tight.request_budget_bytes == message_only_bytes
+    assert tight.request_fits is False
 
 
 def test_openai_sdk_transport_receives_provider_wire_shape():

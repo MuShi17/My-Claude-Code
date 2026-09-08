@@ -18,12 +18,17 @@
 8. canonical tool-result serialization boundary 改为对规范化后的最终 JSON UTF-8 字节数执行公共 `16 MiB`（16,777,216 字节）上限；二进制先规范化为 Base64 envelope 后再计数。
 9. artifact 内容、逻辑 metadata 和 runtime-store mirror 的发布失败必须回滚或明确进入 recovery-required，不能向 canonical event 或 Provider 投放不可读的成功 ref。
 
+本次推进额外纳入 Provider projection 的 P1 完整性边界：
+
+10. stale/历史 `bounded_ref` 一旦建立 Provider 可见 placeholder，后续追加消息不得仅因为整体预算变化而把它改写为 `capacity_exhausted`；其 ArchiveRead 指引和 ref 必须保持稳定。
+11. Provider 容量判断拆为“候选结果 fit”和 projection 完成后的最终 request gate。最终 gate 必须覆盖 Provider system、messages、tools 和既有输出预留；无法容纳时不得向 SDK 发送超预算请求。
+
 “真实本地消费者”至少包括两个层次：
 
 - 最终 SDK 边界：通过本地 fake Anthropic/OpenAI SDK 或 loopback transport 接收实际 Agent 发送的最终 request，断言 wire content，而不是直接调用 projection helper。
 - CLI 新进程：启动实际 `mini-claude-py`/`python -m mini_claude` 子进程，使用本地协议 stub，不访问外部 Provider，断言 stdout、session 持久化和 resume。
 
-测试夹具、fake/stub、redacted capture 和临时 session 只能证明本地行为；不能写成外部 Provider、部署或 Git 交付证据。P1 的父子 Agent 完整 close barrier、跨进程 capability 传递和更广泛历史兼容继续列在任务清单中，但不阻塞本批次 P0 结果。
+测试夹具、fake/stub、redacted capture 和临时 session 只能证明本地行为；不能写成外部 Provider、部署或 Git 交付证据。P1 的父子 Agent 完整 close barrier、跨进程 capability 传递和更广泛历史兼容继续列在任务清单中；本次只推进 Provider projection 的单调性和最终容量 gate。
 
 ## What Changes
 
@@ -35,6 +40,8 @@
 - 增加 P0 reducer、Session/Model Replay、ArchiveRead、双 Provider 最终 SDK 边界、CLI 新进程、resume、terminal、metrics 和 immutability 回归测试；记录真实本地消费者证据，不保存 secrets/raw body。
 - 修复工具结果的公共序列化边界：所有内置工具、MCP、子 Agent、特殊工具和 durable boundary 共享同一套“先规范化、再按最终 UTF-8 JSON 字节计数”的 16 MiB（16,777,216 字节）契约，并补充二进制膨胀、Unicode 和不可序列化值测试。
 - 为工具结果归档增加 session/run/parent-lineage/event/call/tool/body-digest/rewrite-version 派生的逻辑 artifact identity；底层 content blob 可按 sha256 去重，但每个逻辑 ref 的 metadata 独立授权，并在 metadata/mirror 失败时撤销未完成发布。
+- 将 stale archive placeholder 与整体 Provider capacity 解耦：已有 placeholder 经过授权校验后保持稳定，不因后续 suffix 增长而改写为 `capacity_exhausted`；候选 preview/error 的 fit 仍由最终 Provider context envelope 判定。
+- 在 Provider projection 完成后增加独立 final capacity gate，按 Provider 实际可见的 system/messages/tools 计算上下文字节；gate 失败时阻止 SDK dispatch，并保留 canonical/history 的原始事实和稳定 placeholder。
 
 ## Capabilities
 
@@ -52,3 +59,29 @@
 - 影响 `src/mini_claude/tests/` 的回归测试、最终本地 fake SDK/loopback consumer、CLI 子进程夹具和临时 session 输出。
 - 不改变 `D:/workspace/maka`，不扩大普通子 Agent allowlist；将公共工具结果安全上限统一为 16 MiB（16,777,216）canonical JSON UTF-8 字节，但不把它当作 Provider 容量方案；不删除或重写历史 artifact/event，旧 `artifact:sha256:*` ref 保持只读兼容。
 - 本批次不执行 commit、push、MR、merge、release、deployment 或真实外部 Provider 调用。
+
+## Execution routing
+
+- `issue_gate=reuse`：沿用本 change 作为唯一 OpenSpec 任务源；不新建竞争性 change。
+- `profile=high-risk`、`bugfix_path=compact-high-risk-bugfix`、`execution_mode=A`：由主 Agent 作为唯一写入者实施，保留独立 Test Strategy 和实现后 Gap Closure。
+- `writer_owner=main-agent`；允许修改范围仅为 Provider projection、Provider context、Agent dispatch gate 及其定向测试和本 change 工件；禁止修改 Maka、artifact store、普通 child allowlist、无关压缩策略和 Git 交付状态。
+
+```yaml
+artifact_plan:
+  schema_version: 1
+  live_task_ledger: required
+  conceptual_model: omitted
+  openspec: required
+  execution_package: omitted
+  test_strategy: required
+  independent_review: inline
+  project_work: omitted
+  stable_knowledge: omitted
+  additional_artifacts:
+    - artifact_type: implementation_validation
+      state: required
+      reason: Provider projection and final local consumer evidence have an independent acceptance boundary
+  reasons:
+    openspec: Existing change already owns the canonical/provider projection contract
+    test_strategy: High-risk runtime behavior requires an independent pre-check and post-implementation gap closure
+```

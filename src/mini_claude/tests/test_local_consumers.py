@@ -32,6 +32,7 @@ from mini_claude.runtime_event import canonical_json_bytes
 from mini_claude.runtime_lifecycle import DurableToolBoundary
 from mini_claude.runtime_store import SQLiteRuntimeStore
 from mini_claude.tool_result import MAX_TOOL_RESULT_BYTES
+from mini_claude.projections.provider_context import ProviderCapacityError
 
 
 LARGE_CONTENT = "内容🙂\n" * 4_500
@@ -209,6 +210,16 @@ def _provider_tool_content(provider: str, messages: list[dict[str, Any]]) -> Any
     return next(message["content"] for message in messages if message.get("role") == "tool")
 
 
+def _provider_context_bytes(provider: str, payload: dict[str, Any]) -> int:
+    context = {
+        "messages": payload["messages"],
+        "tools": payload.get("tools", []),
+    }
+    if provider == "anthropic":
+        context["system"] = payload.get("system")
+    return len(canonical_json_bytes(context))
+
+
 def _provider_client(
     provider: str,
     captured: list[dict[str, Any]],
@@ -380,8 +391,10 @@ def test_actual_agent_sdk_receives_full_or_capacity_rescue_projection(
         )
         try:
             if capacity_rescue:
-                agent.effective_window = 400
-            agent._refresh_provider_context_from_canonical()
+                # The budget must include the real tools envelope; 400 tokens
+                # cannot even carry the active tool definitions.
+                agent.effective_window = 2_000
+            context = agent._refresh_provider_context_from_canonical()
             captured: list[dict[str, Any]] = []
             client = _provider_client(provider, captured)
             try:
@@ -407,10 +420,10 @@ def test_actual_agent_sdk_receives_full_or_capacity_rescue_projection(
                 await client.close()
 
             assert len(captured) == 1
-            assert (
-                len(canonical_json_bytes(captured[0]["messages"]))
-                <= agent._provider_budget_bytes()
-            )
+            assert context.request_fits is True
+            assert context.request_size_bytes <= context.request_budget_bytes
+            assert _provider_context_bytes(provider, captured[0]) == context.request_size_bytes
+            assert _provider_context_bytes(provider, captured[0]) <= agent._provider_budget_bytes()
             wire_content = _provider_tool_content(provider, captured[0]["messages"])
             if capacity_rescue:
                 rescue = json.loads(wire_content)
@@ -437,6 +450,80 @@ def test_actual_agent_sdk_receives_full_or_capacity_rescue_projection(
 
 
 @pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_actual_agent_capacity_gate_blocks_sdk_dispatch(
+    tmp_path: Path, provider: str
+):
+    async def scenario() -> None:
+        store, _archive, agent, _result = await _build_agent_with_large_result(
+            tmp_path, provider
+        )
+        captured: list[dict[str, Any]] = []
+        client = _provider_client(provider, captured)
+        try:
+            agent.effective_window = 400
+            if provider == "anthropic":
+                agent._anthropic_client = client
+            else:
+                agent._openai_client = client
+            with pytest.raises(ProviderCapacityError):
+                if provider == "anthropic":
+                    await agent._chat_anthropic("capacity check")
+                else:
+                    await agent._chat_openai("capacity check")
+            assert captured == []
+
+            # The SDK helper itself also owns a final guard, so a caller that
+            # bypasses the replay refresh cannot dispatch an over-budget body.
+            with pytest.raises(ProviderCapacityError):
+                if provider == "anthropic":
+                    await agent._call_anthropic_stream()
+                else:
+                    await agent._call_openai_stream()
+            assert captured == []
+        finally:
+            await client.close()
+            await agent.aclose()
+            store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_final_capacity_gate_rejects_suffix_added_after_projection(
+    tmp_path: Path, provider: str
+):
+    async def scenario() -> None:
+        store, _archive, agent, _result = await _build_agent_with_binary_result(
+            tmp_path, provider
+        )
+        captured: list[dict[str, Any]] = []
+        client = _provider_client(provider, captured)
+        try:
+            agent.effective_window = 2_000
+            context = agent._refresh_provider_context_from_canonical()
+            assert context.request_fits is True
+            messages = agent._anthropic_messages if provider == "anthropic" else agent._openai_messages
+            messages.append({"role": "user", "content": "late suffix " * 5_000})
+            if provider == "anthropic":
+                agent._anthropic_client = client
+            else:
+                agent._openai_client = client
+
+            with pytest.raises(ProviderCapacityError):
+                if provider == "anthropic":
+                    await agent._call_anthropic_stream()
+                else:
+                    await agent._call_openai_stream()
+            assert captured == []
+        finally:
+            await client.close()
+            await agent.aclose()
+            store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
 def test_actual_agent_sdk_binary_rescue_preserves_byte_continuation(
     tmp_path: Path, provider: str
 ):
@@ -445,8 +532,8 @@ def test_actual_agent_sdk_binary_rescue_preserves_byte_continuation(
             tmp_path, provider
         )
         try:
-            agent.effective_window = 400
-            agent._refresh_provider_context_from_canonical()
+            agent.effective_window = 2_000
+            context = agent._refresh_provider_context_from_canonical()
             captured: list[dict[str, Any]] = []
             client = _provider_client(provider, captured)
             try:
@@ -470,10 +557,10 @@ def test_actual_agent_sdk_binary_rescue_preserves_byte_continuation(
                 await client.close()
 
             assert len(captured) == 1
-            assert (
-                len(canonical_json_bytes(captured[0]["messages"]))
-                <= agent._provider_budget_bytes()
-            )
+            assert context.request_fits is True
+            assert context.request_size_bytes <= context.request_budget_bytes
+            assert _provider_context_bytes(provider, captured[0]) == context.request_size_bytes
+            assert _provider_context_bytes(provider, captured[0]) <= agent._provider_budget_bytes()
             wire_content = _provider_tool_content(provider, captured[0]["messages"])
             rescue = json.loads(wire_content)
             assert rescue["kind"] == "bounded_ref"
@@ -504,7 +591,7 @@ def test_actual_agent_sdk_receives_stale_and_archive_page_without_terminal_subst
             assert agent._runtime_emitter is not None
             assert agent._runtime_context is not None
             agent._emit_canonical_user_event("next step")
-            agent._refresh_provider_context_from_canonical()
+            context = agent._refresh_provider_context_from_canonical()
             stale_content = _provider_tool_content(
                 provider,
                 agent._anthropic_messages
@@ -543,7 +630,7 @@ def test_actual_agent_sdk_receives_stale_and_archive_page_without_terminal_subst
                 ),
             )
             assert page.success is True
-            agent._refresh_provider_context_from_canonical()
+            context = agent._refresh_provider_context_from_canonical()
             captured: list[dict[str, Any]] = []
             client = _provider_client(provider, captured)
             if provider == "anthropic":
@@ -563,10 +650,10 @@ def test_actual_agent_sdk_receives_stale_and_archive_page_without_terminal_subst
             else:
                 await agent._call_openai_stream()
             assert len(captured) == 1
-            assert (
-                len(canonical_json_bytes(captured[0]["messages"]))
-                <= agent._provider_budget_bytes()
-            )
+            assert context.request_fits is True
+            assert context.request_size_bytes <= context.request_budget_bytes
+            assert _provider_context_bytes(provider, captured[0]) == context.request_size_bytes
+            assert _provider_context_bytes(provider, captured[0]) <= agent._provider_budget_bytes()
             wire = json.dumps(captured[0]["messages"], ensure_ascii=False)
             assert "内容🙂" in wire
             assert '"tool_use"' in wire if provider == "anthropic" else '"tool_calls"' in wire
@@ -591,8 +678,8 @@ def test_actual_agent_sdk_without_archive_capability_fails_closed(
         )
         try:
             agent._archive_capability = None
-            agent.effective_window = 400
-            agent._refresh_provider_context_from_canonical()
+            agent.effective_window = 2_000
+            context = agent._refresh_provider_context_from_canonical()
             captured: list[dict[str, Any]] = []
             client = _provider_client(provider, captured)
             try:
@@ -616,6 +703,8 @@ def test_actual_agent_sdk_without_archive_capability_fails_closed(
                 await client.close()
 
             assert len(captured) == 1
+            assert context.request_fits is True
+            assert context.request_size_bytes <= context.request_budget_bytes
             wire_content = _provider_tool_content(provider, captured[0]["messages"])
             error = json.loads(wire_content)
             assert error["kind"] == "archive_read_error"
@@ -671,10 +760,7 @@ def test_public_agent_tool_loop_reaches_second_provider_request(
 
         assert len(captured) == 2
         second_request = captured[1]
-        assert (
-            len(canonical_json_bytes(second_request["messages"]))
-            <= agent._provider_budget_bytes()
-        )
+        assert _provider_context_bytes(provider, second_request) <= agent._provider_budget_bytes()
         wire_content = _provider_tool_content(provider, second_request["messages"])
         rescue = json.loads(wire_content)
         assert rescue["kind"] == "bounded_ref"
@@ -772,8 +858,8 @@ def test_archive_and_canonical_bytes_are_unchanged_by_all_local_projections(
             agent._refresh_provider_context_from_canonical()
             provider_messages_before = deepcopy(agent._openai_messages)
             assert format_terminal_tool_result(result.result, agent._archive_capability) is None
-            agent.effective_window = 400
-            agent._refresh_provider_context_from_canonical()
+            agent.effective_window = 2_000
+            context = agent._refresh_provider_context_from_canonical()
             rescue = _provider_tool_content("openai", agent._openai_messages)
             rescue_value = json.loads(rescue)
             assert rescue_value["kind"] == "bounded_ref"

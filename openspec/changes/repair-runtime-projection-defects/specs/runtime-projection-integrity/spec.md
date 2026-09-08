@@ -80,7 +80,7 @@ Session, Model Replay, resume, metrics and other canonical-derived projections S
 
 ### Requirement: Provider archive projection SHALL be recoverable and separate from terminal projection
 
-Provider request projection SHALL preserve the Maka-aligned lifecycle: a newly completed safe result SHALL be materialized when the first Provider-specific projected wire message list can contain it; capacity rescue SHALL use a bounded prefix preview with its actual continuation offset, ref and callable `ArchiveRead` instruction; stale results SHALL use an actionable placeholder. The fit decision SHALL use the complete final Provider message list (including OpenAI system messages and Provider-specific tool-result shapes) and the frozen local formula `effective_window=int(model_context_window*0.70)`, `budget_bytes=max(0, effective_window*4)` with `len(canonical_json_bytes(messages)) <= budget_bytes`. Binary previews MAY be base64 on the wire, but their continuation offset SHALL remain a byte offset. A result SHALL NOT become a successful opaque reference when the current Agent has no scoped capability that can read it.
+Provider request projection SHALL preserve the Maka-aligned lifecycle: a newly completed safe result SHALL be materialized when the first Provider-specific projected request context can contain it; capacity rescue SHALL use a bounded prefix preview with its actual continuation offset, ref and callable `ArchiveRead` instruction; stale results SHALL use an actionable stable placeholder. The fit decision SHALL use the complete final Provider context envelope (system, messages, Provider-specific tools and tool-result shapes) and the frozen local formula `effective_window=int(model_context_window*0.70)`, `budget_bytes=max(0, effective_window*4)`. Binary previews MAY be base64 on the wire, but their continuation offset SHALL remain a byte offset. A result SHALL NOT become a successful opaque reference when the current Agent has no scoped capability that can read it.
 
 #### Scenario: The first Provider request has sufficient capacity
 
@@ -95,12 +95,17 @@ Provider request projection SHALL preserve the Maka-aligned lifecycle: a newly c
 #### Scenario: Capacity rescue is measured against the complete request
 
 - **WHEN** the surrounding system, assistant calls and other tool results consume most of the budget
-- **THEN** the projection reduces preview units until the complete final Provider message list fits or returns a bounded failure, and it does not decide only from artifact size or the neutral projection size
+- **THEN** the projection reduces preview units until the complete final Provider context envelope fits or returns a bounded failure, and it does not decide only from artifact size or the neutral projection size
 
 #### Scenario: A stale result is projected after a later step
 
 - **WHEN** a result is no longer the latest completed step
 - **THEN** the final Provider request contains a bounded placeholder with ref and ArchiveRead instructions, and the full stale body is not silently re-inlined
+
+#### Scenario: A stale placeholder remains stable as a suffix grows
+
+- **WHEN** a valid stale `bounded_ref` has already been projected and a later request appends user, memory, or other non-tool context while the aggregate budget becomes tighter
+- **THEN** the existing placeholder content, ref and ArchiveRead instructions remain unchanged; it is not rewritten to `capacity_exhausted` solely because the complete messages list no longer fits that placeholder candidate
 
 #### Scenario: An Agent has no archive capability
 
@@ -110,7 +115,17 @@ Provider request projection SHALL preserve the Maka-aligned lifecycle: a newly c
 #### Scenario: The ArchiveRead envelope cannot fit the remaining budget
 
 - **WHEN** the full projected message list cannot fit even after reducing the preview to the smallest actionable envelope
-- **THEN** the Provider receives a bounded `archive_read_error` with `error_type=capacity_exhausted`, not a successful opaque reference
+- **THEN** the final capacity gate prevents an over-budget SDK dispatch and emits a bounded capacity verdict; it does not rewrite multiple historical placeholders into tool-level errors. A tool-level `capacity_exhausted` is allowed only when the complete error envelope itself fits.
+
+#### Scenario: The final capacity gate covers system, messages and tools
+
+- **WHEN** the projected messages fit the local byte budget in isolation but the actual Provider request also contains system prompt or active tool definitions that exceed the same budget
+- **THEN** the final capacity gate marks the request as exhausted, preserves the projected history, and does not call the Provider SDK with an over-budget context
+
+#### Scenario: A capacity fallback is validated before dispatch
+
+- **WHEN** a first-use full/preview candidate does not fit and the generated bounded error envelope also cannot fit after replacement
+- **THEN** projection returns a bounded top-level capacity verdict instead of a tool-level error, the runtime does not send an over-budget error as a tool result, and canonical facts, artifacts and historical placeholders remain unchanged
 
 #### Scenario: Final local consumers receive Provider content, not terminal status
 

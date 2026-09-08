@@ -11,6 +11,7 @@ from ..archive_capability import ToolResultArchiveCapability
 from ..archive_projection import project_archived_tool_results
 from .model_replay_projection import ModelReplayProjection, ModelReplayResult
 from ..provider_content import materialize_tool_result
+from ..provider_capacity import ProviderCapacityError
 from ..runtime_event import canonical_json_bytes
 
 
@@ -23,6 +24,9 @@ class ProviderContext:
     messages: tuple[dict[str, Any], ...]
     diagnostics: tuple[Any, ...]
     context_epoch: str
+    request_size_bytes: int = 0
+    request_budget_bytes: int | None = None
+    request_fits: bool = True
 
 
 def _without_runtime_id(message: dict[str, Any]) -> dict[str, Any]:
@@ -78,6 +82,79 @@ def _openai_tool_call(call: Any) -> dict[str, Any]:
             "arguments": _openai_arguments(call.get("arguments", {})),
         },
     }
+
+
+def _provider_tool_definitions(
+    provider: str,
+    provider_tools: Sequence[Mapping[str, Any]] | None,
+) -> list[dict[str, Any]] | None:
+    """Convert the raw tool definitions to the exact Provider wire shape."""
+
+    if provider_tools is None:
+        return None
+    if provider == "anthropic":
+        return [dict(tool) for tool in provider_tools]
+    if provider == "openai":
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "parameters": tool["input_schema"],
+                },
+            }
+            for tool in provider_tools
+        ]
+    raise ValueError(f"unsupported provider {provider!r}")
+
+
+def _provider_request_payload(
+    provider: str,
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    system_prompt: str | None = None,
+    provider_tools: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Build the bounded context envelope used by projection fit checks.
+
+    This deliberately measures only the stable context-bearing request fields.
+    Model/stream/options fields are left to the existing 30% output and
+    unmodeled-overhead reserve.
+    """
+
+    if provider not in {"anthropic", "openai"}:
+        raise ValueError(f"unsupported provider {provider!r}")
+    payload: dict[str, Any] = {
+        "messages": [dict(message) for message in messages],
+    }
+    if provider == "anthropic" and system_prompt is not None:
+        payload["system"] = system_prompt
+    wire_tools = _provider_tool_definitions(provider, provider_tools)
+    if wire_tools is not None:
+        payload["tools"] = wire_tools
+    return payload
+
+
+def provider_request_size_bytes(
+    provider: str,
+    messages: Sequence[Mapping[str, Any]],
+    *,
+    system_prompt: str | None = None,
+    provider_tools: Sequence[Mapping[str, Any]] | None = None,
+) -> int:
+    """Return canonical UTF-8 bytes for a final Provider context envelope."""
+
+    return len(
+        canonical_json_bytes(
+            _provider_request_payload(
+                provider,
+                messages,
+                system_prompt=system_prompt,
+                provider_tools=provider_tools,
+            )
+        )
+    )
 
 
 def _openai_user_content(value: Any) -> str | list[Any]:
@@ -302,6 +379,7 @@ class CanonicalModelContextAdapter:
         provider: str,
         high_water: int | None = None,
         system_prompt: str | None = None,
+        provider_tools: Sequence[Mapping[str, Any]] | None = None,
         archive_capability: ToolResultArchiveCapability | None = None,
         budget_bytes: int | None = None,
     ) -> ProviderContext:
@@ -310,6 +388,7 @@ class CanonicalModelContextAdapter:
             result,
             provider=provider,
             system_prompt=system_prompt,
+            provider_tools=provider_tools,
             archive_capability=archive_capability,
             budget_bytes=budget_bytes,
         )
@@ -320,10 +399,17 @@ class CanonicalModelContextAdapter:
         *,
         provider: str,
         system_prompt: str | None = None,
+        provider_tools: Sequence[Mapping[str, Any]] | None = None,
         archive_capability: ToolResultArchiveCapability | None = None,
         budget_bytes: int | None = None,
     ) -> ProviderContext:
         """Adapt an already materialized neutral result without rereading it."""
+
+        frozen_tools = (
+            tuple(dict(tool) for tool in provider_tools)
+            if provider_tools is not None
+            else None
+        )
 
         def convert(
             neutral_messages: tuple[dict[str, Any], ...],
@@ -338,7 +424,12 @@ class CanonicalModelContextAdapter:
             neutral_messages: Sequence[Mapping[str, Any]],
         ) -> int:
             converted = convert(tuple(dict(message) for message in neutral_messages))
-            return len(canonical_json_bytes(list(converted)))
+            return provider_request_size_bytes(
+                provider,
+                converted,
+                system_prompt=system_prompt,
+                provider_tools=frozen_tools,
+            )
 
         neutral_messages = project_archived_tool_results(
             result.messages,
@@ -347,6 +438,13 @@ class CanonicalModelContextAdapter:
             size_fn=final_message_size,
         )
         messages = convert(neutral_messages)
+        request_size_bytes = provider_request_size_bytes(
+            provider,
+            messages,
+            system_prompt=system_prompt,
+            provider_tools=frozen_tools,
+        )
+        request_fits = budget_bytes is None or request_size_bytes <= budget_bytes
         return ProviderContext(
             provider=provider,
             high_water=result.high_water,
@@ -355,7 +453,15 @@ class CanonicalModelContextAdapter:
             messages=messages,
             diagnostics=result.diagnostics,
             context_epoch=result.context_epoch,
+            request_size_bytes=request_size_bytes,
+            request_budget_bytes=budget_bytes,
+            request_fits=request_fits,
         )
 
 
-__all__ = ["CanonicalModelContextAdapter", "ProviderContext"]
+__all__ = [
+    "CanonicalModelContextAdapter",
+    "ProviderCapacityError",
+    "ProviderContext",
+    "provider_request_size_bytes",
+]

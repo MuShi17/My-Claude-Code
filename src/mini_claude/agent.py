@@ -75,7 +75,11 @@ from .compaction import CompactionCheckpoint, CompactionCheckpointBuilder, Compa
 from .projections.base import EventRecord
 from .projections.model_replay_projection import ModelReplayProjection, ModelReplayResult
 from .projections.incremental_replay import IncrementalModelReplayCursor, IncrementalReplayError
-from .projections.provider_context import CanonicalModelContextAdapter
+from .projections.provider_context import (
+    CanonicalModelContextAdapter,
+    ProviderCapacityError,
+    provider_request_size_bytes,
+)
 from .artifact_archive import ArtifactArchive
 from .archive_capability import ToolResultArchiveCapability
 from .archive_projection import format_terminal_tool_result, project_terminal_tool_result
@@ -685,6 +689,27 @@ class Agent:
         """Return the conservative local byte budget for archive projection."""
 
         return max(0, int(self.effective_window) * 4)
+
+    def _assert_provider_request_fits(
+        self,
+        provider: str,
+        messages: list[dict[str, Any]],
+    ) -> None:
+        """Fail closed immediately before any Provider SDK dispatch."""
+
+        budget = self._provider_budget_bytes()
+        request_size = provider_request_size_bytes(
+            provider,
+            messages,
+            system_prompt=self._system_prompt,
+            provider_tools=self._effective_tool_definitions(),
+        )
+        if request_size > budget:
+            raise ProviderCapacityError(
+                provider=provider,
+                request_size_bytes=request_size,
+                request_budget_bytes=budget,
+            )
 
     def _effective_tool_definitions(self) -> list[ToolDef]:
         """Build request tools, binding ArchiveRead only to this capability."""
@@ -1436,10 +1461,12 @@ class Agent:
             self._replay_last_mode = "cold"
 
         result = cursor.result()
+        provider = "openai" if self.use_openai else "anthropic"
         context = CanonicalModelContextAdapter().build_result(
             result,
-            provider="openai" if self.use_openai else "anthropic",
-            system_prompt=self._system_prompt if self.use_openai else None,
+            provider=provider,
+            system_prompt=self._system_prompt,
+            provider_tools=self._effective_tool_definitions(),
             archive_capability=self._archive_capability,
             budget_bytes=self._provider_budget_bytes(),
         )
@@ -1460,6 +1487,14 @@ class Agent:
         self._replay_last_source_digest = result.source_digest
         self._replay_last_projection_digest = result.digest
         self._context_epoch = context.context_epoch
+        if not context.request_fits:
+            raise ProviderCapacityError(
+                provider=context.provider,
+                request_size_bytes=context.request_size_bytes,
+                request_budget_bytes=context.request_budget_bytes
+                if context.request_budget_bytes is not None
+                else 0,
+            )
         messages = [dict(message) for message in context.messages]
         if self.use_openai:
             self._openai_messages = messages
@@ -2644,6 +2679,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     async def _call_anthropic_stream(self, on_tool_block_complete=None):
         """流式解析 Anthropic 响应；只记录 partial，不提前执行工具。"""
         async def _do():
+            self._assert_provider_request_fits("anthropic", self._anthropic_messages)
             create_params: dict[str, Any] = {
                 "model": self.model,
                 "max_tokens": _get_anthropic_request_max_tokens(self.model),
@@ -3038,6 +3074,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         """流式调用 OpenAI API，实时输出文本，收集 tool_calls 增量。
         返回与 OpenAI API 兼容的响应格式以便统一处理。"""
         async def _do():
+            self._assert_provider_request_fits("openai", self._openai_messages)
             create_params = {
                 "model": self.model,
                 "tools": _to_openai_tools(self._effective_tool_definitions()),

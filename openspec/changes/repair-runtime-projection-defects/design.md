@@ -15,7 +15,7 @@
 
 - 对每个 `run_id + call_id` 建立唯一、稳定、可重建的 canonical **final** function-call 事实，并保持完整工具生命周期和一次执行语义。
 - 让 `ArchiveRead` 对字符/字节 offset、limit、EOF 和越界请求给出确定且有界的语义。
-- 让 Provider 在首请求能容纳时使用完整安全结果；只有最终 message-list fit 失败时才使用前缀 preview + ref + 可调用 `ArchiveRead`；stale 和无 capability 都可行动且不制造不可恢复成功态。
+- 让 Provider 在首请求能容纳时使用完整安全结果；只有最终 request envelope fit 失败时才使用前缀 preview + ref + 可调用 `ArchiveRead`；stale placeholder 不因后续 suffix 或整体预算变化而反复变形，且无 capability 时不制造不可恢复成功态。
 - 让 canonical tool-result boundary 在所有入口统一先完成值规范化，再按最终 canonical JSON 的 UTF-8 字节数执行公共 16 MiB（16,777,216 字节）上限；不让原始 bytes 的字符替换计数绕过 Base64/JSON 膨胀。
 - 让新工具结果归档的逻辑 identity 与内容完整性 digest 分离，支持相同 blob 的安全去重而不复用跨 session 的授权 metadata。
 - 让 artifact 发布在本地内容、逻辑 metadata 和 runtime-store mirror 任一阶段失败时不返回成功 ref，并清理本次创建的文件或留下明确 recovery-required 诊断。
@@ -66,21 +66,30 @@ Provider projection 的预算是“本地投影预算”，不是 Provider SDK �
 ```text
 effective_window = int(model_context_window * 0.70)
 budget_bytes = max(0, int(effective_window) * 4)
-fits(messages) := len(canonical_json_bytes(messages)) <= budget_bytes
+fits_request(provider, system, tools, messages)
+  := len(canonical_json_bytes(provider_request_context)) <= budget_bytes
 ```
 
-`effective_window` 预留模型上下文窗口的 30% 给 system prompt、模型输出和 Provider 侧未建模的封装开销；`*4` 仍是本地 token-to-byte envelope 的保守估算，不是 tokenizer 换算或 Provider API 保证。
+`provider_request_context` 至少包含该 Provider 实际发送的 system（Anthropic 为独立字段）、messages 和 provider-specific tools；OpenAI 的 system 已位于 messages 中，不能重复计算。`effective_window` 仍预留模型上下文窗口的 30% 给模型输出和未建模开销；`*4` 仍是本地 token-to-byte envelope 的保守估算，不是 tokenizer 换算或 Provider API 保证。
 
-`fits` 必须在替换目标 tool content 后，对经当前 Provider adapter 转换后的完整 projected message list 计算；不能只比较 artifact bytes、预览长度、中性消息列表或 terminal 文本长度。OpenAI-compatible adapter 的 message list 包含 system message，Anthropic adapter 的 message list使用其最终 user/tool-result block shape；两个 adapter 共享 archive decision，但各自以最终 wire message shape 做 fit。
+候选 full/preview 的 `fits_request` 必须在替换目标 tool content 后，对经当前 Provider adapter 转换并加入 system/tools 的完整 context envelope 计算；不能只比较 artifact bytes、预览长度、中性消息列表或 terminal 文本长度。两个 adapter 共享 archive decision，但各自以最终 wire message shape 和 tool schema 做 fit。
 
 结果状态固定如下：
 
 1. 首次使用且完整 safe result 通过 `fits`：内联完整结果。
 2. 首次使用但完整结果不通过 `fits`：按 artifact 的 unit 取前缀 preview（文本为前 N Unicode 字符，二进制为前 N bytes；二进制在 Provider wire 中可用 bounded base64 表示，但 continuation 仍按 byte 计），设置 `truncated=true`，`next_offset` 等于实际 preview 单位数，并附带 ref、metadata 和可实际调用的 `ArchiveRead` 指引。preview 预算使用现有 4,000 单位上限和递减 rescue，直到最终 Provider message envelope fit；不保证固定 N 一定能 fit。
-3. 非首次/stale：不重新内联全文，保留 ref、可读状态和 ArchiveRead 指引。
+3. 非首次/stale：不重新内联全文，保留经过授权校验的稳定 placeholder、ref 和 ArchiveRead 指引；不因当前完整 messages 的剩余 budget 不足而改写为 `capacity_exhausted`。
 4. 当前 Agent 没有 scoped `ToolResultArchiveCapability`：不能发布只靠 `ArchiveRead` 才能恢复的成功 placeholder；只能保留已安全内联的结果或返回 bounded non-recoverable diagnostic。
 
-所有 rescue 都必须验证最终 message list fit；若连 ref/instruction envelope 都不能放入，则返回 `archive_read_error`/`capacity_exhausted` bounded failure，不假装成功。Provider projection 不读取 terminal renderer 的字符串，也不修改 canonical facts/artifact。
+projection 完成后必须再执行一次独立 final capacity gate。若完整 request context 仍超限，gate 必须阻止 SDK dispatch，并返回 bounded capacity verdict；不能把多个历史 placeholder 改成错误消息后继续发送。候选 `capacity_exhausted` 只有在替换后的完整 request context 自身 fit 时才可作为 Provider tool content 返回；否则不得构造一个仍超预算的错误 envelope。Provider projection 不读取 terminal renderer 的字符串，也不修改 canonical facts/artifact。
+
+### D11：stale placeholder 单调性与容量职责分离
+
+`bounded_ref` 是一个已建立的 Provider 可见状态，而不是每轮重新参与 aggregate capacity 竞争的原始结果。对非 first-use 的合法 ref，projection 只做 capability/session/scope/integrity 校验，并返回同一稳定 placeholder；如果历史形状缺少 `read_instructions`，仅按 ref/默认 limit 补齐一次可行动指引。该路径不得调用依赖完整 messages 的 `_fits()`，不得因为追加用户消息、记忆后缀或其他历史内容而产生 `capacity_exhausted`。
+
+`_fits()`（或等价候选判断）仍可用于 first-use 完整结果、preview rescue 和当前 ArchiveRead page 的候选选择，但它不是 stale placeholder 的生命周期控制器。所有候选替换完成后，Provider context adapter 计算一次包含 system/messages/tools 的最终 context envelope，并将 `request_size_bytes`、`request_budget_bytes` 和 `request_fits` 交给 Agent 的 final capacity gate。gate 失败只产生顶层 bounded diagnostic/终止本次 dispatch，不回写 canonical、不变形已有 placeholder，也不伪造新的 archive ref。
+
+如果 first-use 的 preview、最小 placeholder 和 `capacity_exhausted` fallback 均不能通过同一个候选 `size_fn`，projection 不把超预算的 tool-level error 放入 messages，而是直接以 bounded `ProviderCapacityError` 终止本次 Provider projection；若 fallback 自身 fit，则仍由 projection 返回它，最终 aggregate request fit 继续由 adapter/Agent gate 判定。
 
 ### D4：terminal typed projection
 
@@ -148,7 +157,9 @@ redacted capture 只保留 provider、route、message kind、长度、hash 和�
 - [identity signature 不稳定] → 历史 dedup 可能误合并。复用 `decode_tool_arguments` 和 canonical JSON；冲突永不覆盖。
 - [offset 校验破坏调用方] → 保留 `offset==total_units` 合法 EOF，并为越界提供稳定 `invalid_range`。
 - [terminal 输出改变脚本] → 只对已知 envelope 改为 typed formatting，未知工具保持通用路径，并增加真实 stdout 断言。
-- [预算计算与实际 SDK tokenizer 有差异] → 明确它是保守本地 message-list byte envelope；最终 SDK boundary 测试验证发送形状，不能推导外部 Provider 的可用上下文。
+- [预算计算与实际 SDK tokenizer 有差异] → 明确它是包含 system/messages/tools 的保守本地 context envelope；最终 SDK boundary 测试验证实际发送形状，不能推导外部 Provider 的可用上下文。
+- [stale placeholder 随 suffix 变形] → 非 first-use placeholder 路径不参与 aggregate fit；final capacity gate 在 projection 后独立阻止超预算 dispatch，并用追加 suffix 的临界预算回归测试锁定单调性。
+- [capacity fallback 自身超预算] → 所有 tool-level fallback 经过最终 context fit；若错误 envelope 也放不下，则返回顶层 bounded capacity verdict，不把超预算错误发给模型。
 - [redacted capture 泄漏] → 只允许字段级 redaction，测试产物不写 raw body、key、路径或 traceback。
 - [历史重复事实无法删除] → 通过派生 projection 兼容，保留 source digest；回滚旧版本可能重新产生重复，因此只能作为短期诊断。
 
@@ -156,7 +167,7 @@ redacted capture 只保留 provider、route、message kind、长度、hash 和�
 
 1. 先更新本 change 的 proposal/design/spec/tasks，冻结 P0 文件范围、事件 identity、ArchiveRead 边界、预算公式和真实消费者验收方式。
 2. 先加入失败回归测试和真实本地消费者夹具，再实现 D1、D2、D5 的低层修复与 D4 terminal formatting；同时实现 D8-D10 的 artifact identity、字节边界和回滚契约；旧 artifact ref/digest 保持兼容。
-3. 实现 Provider 双后端最终 SDK boundary 验证，确认首请求、capacity rescue、Unicode/bytes preview、stale、ArchiveRead page、无 capability 和 capacity_exhausted 的最终 wire content；fit 断言必须在 SDK 送出的 message list 上完成。
+3. 实现 Provider 双后端最终 SDK boundary 验证，确认首请求、capacity rescue、Unicode/bytes preview、stale、ArchiveRead page、无 capability 和 capacity gate 的最终 wire content；fit 断言必须覆盖 SDK 送出的 system/messages/tools context envelope，并验证 gate 失败时不 dispatch。
 4. 运行 focused tests、fresh-process resume、CLI subprocess、全量 Python tests、compileall 和 `git diff --check`；分别报告 local/fake/real-local/external evidence，并记录任何缺少真实依赖的阻断。
 5. P1 父子 Agent close/capability 场景只在有额外范围授权后推进；本批次不因 P1 未完成而修改普通 child allowlist。
 6. 主 Agent 复核 frozen diff、P0 acceptance 和残余风险后，另行决定是否授权 Git 交付；本 change 不包含提交或发布动作。

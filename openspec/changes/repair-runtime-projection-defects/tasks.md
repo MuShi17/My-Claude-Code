@@ -53,7 +53,7 @@
 
 ## Implementation and validation record
 
-本 change 的 P0 实现和验证已完成，P1 follow-up 不在本批次闭合范围。主要实现落点：
+本 change 的 P0 实现和验证已完成；8.1–8.3、10.1–10.3 仍是后续 P1，Provider projection 的 11.1–11.5 已在本批次闭合。主要实现落点：
 
 - `src/mini_claude/tool_call_identity.py`、`event_sink.py`、`runtime_lifecycle.py`：统一 final-call identity，按 `(run_id, call_id)` 幂等去重和跨 invocation operation 复用。
 - `src/mini_claude/artifact_archive.py`、`archive_capability.py`、`archive_projection.py`：固定 Unicode/bytes range、合法 EOF、越界错误、容量救援和 `capacity_exhausted`，并分离 Provider/terminal projection。
@@ -92,13 +92,22 @@
 验证记录（2026-09-08）：
 
 - P0 focused tests：`python -m pytest src\\mini_claude\\tests\\test_tool_result_boundary.py src\\mini_claude\\tests\\test_archive_capability.py src\\mini_claude\\tests\\test_archive_projection.py src\\mini_claude\\tests\\test_compaction_artifacts.py -q --disable-warnings --tb=short`，64 passed。
-- fresh-process/local consumer 回归及全量 Python tests：`python -m pytest src\\mini_claude\\tests -q --disable-warnings --tb=short`，286 passed。
-- `python -m compileall -q src\\mini_claude` 通过；两个 change 均通过 `openspec validate ... --type change --strict --no-interactive`；`git diff --check` 通过（仅有 Git 的换行符提示）。
+- 本轮 Provider projection focused tests：`python -m pytest src\\mini_claude\\tests\\test_archive_projection.py src\\mini_claude\\tests\\test_provider_content.py src\\mini_claude\\tests\\test_local_consumers.py -q --disable-warnings --tb=short`，63 passed。
+- fresh-process/local consumer 回归及全量 Python tests：`python -m pytest src\\mini_claude\\tests -q --disable-warnings --tb=short`，297 passed，2 个既有 warning。
+- `python -m compileall -q src\\mini_claude` 通过；本 change 通过 `openspec validate repair-runtime-projection-defects --type change --strict --no-interactive`；`git diff --check` 通过（仅有 Git 的换行符提示）。
 - 根目录 `python -m pytest -q` 未作为通过证据：benchmark 测试收集阶段缺少可选依赖 `harbor`（`ModuleNotFoundError`），与本次 Python 包实现无关。
-- 仍保留的 P1 边界：8.1–8.3 和 10.1–10.3 未在本批次实现；包括完整 Provider request envelope 容量校准、真正的增量/range 读取，以及 ArchiveRead 最终 JSON envelope 的完整响应字节预算。
+- 仍保留的 P1 边界：8.1–8.3、10.1–10.3；包括父子 Agent close barrier、更多历史版本兼容、真正的增量/range 读取，以及 ArchiveRead 最终 JSON envelope 的完整响应字节预算。本轮 11.x 的 Provider projection 单调性和最终容量 gate 已实现，独立 Gap Closure 证据见 `implementation-validation.md`。
 
 ## 10. Deferred P1 scope
 
 - [ ] 10.1 将完整 Provider request envelope（system/tools/output reserve）纳入独立容量校准，而不是只统计 message list
 - [ ] 10.2 评估 workspace `read_file` 的真正增量读取和 ArchiveRead 的 range read，避免分页时重复加载/校验完整 payload
 - [ ] 10.3 对 ArchiveRead 最终 JSON envelope 做完整响应字节上限控制，必要时按 page 内容动态缩短
+
+## 11. P1 Provider projection monotonicity and final capacity gate
+
+- [x] 11.1 对非 first-use 的合法 `bounded_ref` 移除 aggregate `_fits()` 决策，保持 ref、placeholder metadata 和 `ArchiveRead` 指引在 suffix 增长后的 Provider projection 中稳定；兼容缺少 `read_instructions` 的历史形状
+- [x] 11.2 让 Provider context adapter 接受当前 Provider 的 system/tools 形状，计算完整 context envelope 的字节数，并保留 `effective_window=int(model_context_window*0.70)`、`budget_bytes=max(0,effective_window*4)` 约定
+- [x] 11.3 让 first-use tool-level fallback 先通过完整候选 `size_fn`；fallback 自身不 fit 时返回 bounded `ProviderCapacityError`，projection 完成后再由 final capacity gate 阻止 aggregate 超限 SDK dispatch，不把已有 placeholder 改成 `capacity_exhausted`，不回写 canonical
+- [x] 11.4 补齐 G-STR-01～G-STR-04：suffix 临界预算单调性、fallback/error exact-fit 与 impossible-fit、system/messages/tools 完整预算、first-use prune 后 final verdict 顺序；覆盖 Anthropic/OpenAI adapter
+- [x] 11.5 通过实际 Agent -> 本地 fake SDK/loopback consumer 验证完整 context envelope 与 no-dispatch，并回写 implementation validation、Gap Closure 和残余风险；不执行 Git 交付
