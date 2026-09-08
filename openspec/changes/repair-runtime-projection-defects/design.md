@@ -16,6 +16,9 @@
 - 对每个 `run_id + call_id` 建立唯一、稳定、可重建的 canonical **final** function-call 事实，并保持完整工具生命周期和一次执行语义。
 - 让 `ArchiveRead` 对字符/字节 offset、limit、EOF 和越界请求给出确定且有界的语义。
 - 让 Provider 在首请求能容纳时使用完整安全结果；只有最终 message-list fit 失败时才使用前缀 preview + ref + 可调用 `ArchiveRead`；stale 和无 capability 都可行动且不制造不可恢复成功态。
+- 让 canonical tool-result boundary 在所有入口统一先完成值规范化，再按最终 canonical JSON 的 UTF-8 字节数执行公共 16 MiB（16,777,216 字节）上限；不让原始 bytes 的字符替换计数绕过 Base64/JSON 膨胀。
+- 让新工具结果归档的逻辑 identity 与内容完整性 digest 分离，支持相同 blob 的安全去重而不复用跨 session 的授权 metadata。
+- 让 artifact 发布在本地内容、逻辑 metadata 和 runtime-store mirror 任一阶段失败时不返回成功 ref，并清理本次创建的文件或留下明确 recovery-required 诊断。
 - 让 terminal 对 bounded reference、ArchiveRead page 和 ArchiveRead error 单独做正文优先的有界格式化。
 - 修复 run/invocation metrics 的时间边界，并增加多 invocation 单调性不变量。
 - 以最终本地 SDK 调用边界和实际 CLI 新进程验证 Provider/terminal/resume 行为；把外部 Provider、部署和 Git 交付明确排除。
@@ -23,9 +26,10 @@
 **Non-Goals:**
 
 - 不改变 Maka 参考项目，不引入外部依赖或新的持久化协议。
-- 不把所有归档结果全文内联，不通过提高全局工具结果阈值规避投影预算。
+- 不把所有归档结果全文内联，不把统一为 16 MiB 的公共结果上限当作规避 Provider 投影预算的手段。
 - 不删除、重写或迁移历史 canonical event/artifact，不清理无关 legacy 日志。
 - 不把 `ArchiveRead` 注入普通 child allowlist，不扩大 Agent 权限或递归能力。
+- 不把旧内容哈希 ref 重新解释为新的 session-scoped identity；旧 ref 只按其已有 metadata 做兼容读取。
 - 不修复与本 change 无关的 Windows asyncio transport warning、MCP、记忆、前端或部署问题。
 - 不执行 commit、push、MR、merge、release、deployment，也不调用真实外部 Provider。
 
@@ -112,9 +116,35 @@ P0 证据分四层记录：
 
 redacted capture 只保留 provider、route、message kind、长度、hash 和必要的 bounded fields，默认不保存 raw body 或 secret。P1 父子 Agent 完整 close barrier、跨进程 capability 传递和广泛历史样本单独记录，不把缺失的 P1 证据冒充 P0 完成。
 
+### D8：逻辑 artifact identity 与内容完整性分离
+
+新工具结果归档使用独立的逻辑 artifact identity。identity 的稳定输入为 `session_id`、`run_id`、`parent_run_id`、可用的 `runtime_event_id`、`tool_call_id`、`tool_name`、发布后内容的 `body_sha256` 和 `rewrite_version`；当没有 runtime event id 时，run id 仍提供同一 session 内的隔离。其派生结果只用于生成新的逻辑 ref。内容文件仍按 `sha256` 存储并可跨逻辑 artifact 去重。
+
+新的逻辑 ref 使用独立前缀并在 metadata 中同时保存 `artifact_id`、`sha256` 和 `size_bytes`。capability 授权以逻辑 ref 的 metadata 为准，因此同一内容在 session A/B 中会得到不同 ref；A 的 ref 不能因为内容相同而读取 B 的 metadata。旧 `artifact:sha256:<digest>` ref 不迁移、不重写，仅保留原有只读解析路径。
+
+### D9：canonical serialization boundary 使用最终 UTF-8 字节数
+
+公共工具结果边界固定为 `MAX_TOOL_RESULT_BYTES = 16 * 1024 * 1024`（16,777,216 字节）。计数流程必须是：
+
+1. 将 `bytes` 规范化为 JSON-safe 的 Base64 binary envelope；
+2. 对规范化值使用与 canonical event 相同的紧凑、排序、`ensure_ascii=false` JSON 表示；
+3. 对最终 JSON 表示的 UTF-8 编码计算字节数（JSON string 的引号和转义也计入）；
+4. `actual_bytes <= 16,777,216` 才允许通过，超过或无法序列化则返回稳定的 bounded error。
+
+`DurableToolBoundary`、普通工具、MCP/特殊工具出口和 `archive_result` 必须调用同一个 helper，不能分别按字符、原始 bytes 或 `str(value)` 计量。Agent 主路径把各 adapter 的 raw value 交给 DurableToolBoundary，使同一结果只做一次规范化和计数；`execute_tool`、`McpConnection.call_tool` 等独立 public wrapper 可以保留，但不得在 Agent 已完成该边界后再次包装/计数。历史导入代码可以保留旧常量名称作为兼容别名，但其不能继续表达字符上限。
+
+### D10：artifact 发布必须可回滚
+
+发布顺序为唯一临时内容文件、内容 fsync/原子发布、逻辑 metadata 原子发布、runtime-store mirror。实现必须跟踪本次调用新建的每个本地文件；后续 metadata 或 mirror 失败时删除本次新建文件，清理失败则报告 recovery-required，且任何失败路径都不返回可被 canonical event 使用的成功 ref。已存在且经完整校验的共享 blob 不得因另一个逻辑 metadata 发布失败而被删除。
+
+孤儿修复仍是显式诊断/运维动作；未知内容不得自动伪造 session/call metadata 后暴露给工具结果 capability。新逻辑 ref 必须在其 metadata 和内容均可读、完整性匹配后才注册到 capability。
+
 ## Risks / Trade-offs
 
 - [Provider owner 选择不当] → 非 Provider 入口可能缺少 final fact。统一 `ensure_final_call` 覆盖非 Provider path，并测试 Provider/boundary 同 call 和多工具调用。
+- [canonical boundary 低估最终表示] → 统一在规范化和 JSON UTF-8 序列化之后计数，并覆盖 Base64、Unicode、转义和不可序列化值。
+- [逻辑 ref 与内容 digest 混用] → 新逻辑 ref 使用独立 metadata 记录和 session-scoped identity；旧 hash-only ref 只走兼容路径。
+- [发布失败留下孤儿或错误 ref] → 跟踪新建文件并回滚；共享内容只在本调用新建且没有其他逻辑引用时清理，清理失败输出 recovery-required。
 - [identity signature 不稳定] → 历史 dedup 可能误合并。复用 `decode_tool_arguments` 和 canonical JSON；冲突永不覆盖。
 - [offset 校验破坏调用方] → 保留 `offset==total_units` 合法 EOF，并为越界提供稳定 `invalid_range`。
 - [terminal 输出改变脚本] → 只对已知 envelope 改为 typed formatting，未知工具保持通用路径，并增加真实 stdout 断言。
@@ -125,7 +155,7 @@ redacted capture 只保留 provider、route、message kind、长度、hash 和�
 ## Migration Plan
 
 1. 先更新本 change 的 proposal/design/spec/tasks，冻结 P0 文件范围、事件 identity、ArchiveRead 边界、预算公式和真实消费者验收方式。
-2. 先加入失败回归测试和真实本地消费者夹具，再实现 D1、D2、D5 的低层修复与 D4 terminal formatting；不改 artifact ref/digest。
+2. 先加入失败回归测试和真实本地消费者夹具，再实现 D1、D2、D5 的低层修复与 D4 terminal formatting；同时实现 D8-D10 的 artifact identity、字节边界和回滚契约；旧 artifact ref/digest 保持兼容。
 3. 实现 Provider 双后端最终 SDK boundary 验证，确认首请求、capacity rescue、Unicode/bytes preview、stale、ArchiveRead page、无 capability 和 capacity_exhausted 的最终 wire content；fit 断言必须在 SDK 送出的 message list 上完成。
 4. 运行 focused tests、fresh-process resume、CLI subprocess、全量 Python tests、compileall 和 `git diff --check`；分别报告 local/fake/real-local/external evidence，并记录任何缺少真实依赖的阻断。
 5. P1 父子 Agent close/capability 场景只在有额外范围授权后推进；本批次不因 P1 未完成而修改普通 child allowlist。

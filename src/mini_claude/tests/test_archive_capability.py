@@ -13,6 +13,7 @@ from mini_claude.archive_capability import (
 from mini_claude.artifact_archive import (
     ArtifactArchive,
     ArtifactIntegrityError,
+    ArtifactMetadataError,
 )
 from mini_claude.runtime_store import SQLiteRuntimeStore
 
@@ -97,6 +98,24 @@ def test_capability_bounds_limits_and_reports_metadata(tmp_path: Path) -> None:
     assert value["fields"] == {"ref": ref.ref, "size_bytes": 32}
 
 
+def test_capability_default_and_maximum_page_sizes_are_bounded(tmp_path: Path) -> None:
+    archive = ArtifactArchive(tmp_path / "artifacts")
+    value = "x" * 10_000
+    ref = archive.archive(value, mime_type="text/plain", encoding="utf-8", scope="tool-result")
+    capability = ToolResultArchiveCapability(archive, session_id="session-a")
+    capability.register_ref(ref)
+
+    default_page = capability.read(ref.ref)
+    assert len(default_page["page"]) == 6_000
+    assert default_page["unit"] == "chars"
+    assert default_page["next_offset"] == 6_000
+
+    maximum_page = capability.read(ref.ref, offset=6_000, limit=7_500)
+    assert len(maximum_page["page"]) == 4_000
+    assert maximum_page["unit"] == "chars"
+    assert maximum_page["next_offset"] == 10_000
+
+
 def test_capability_fails_closed_on_integrity_and_closed_store(tmp_path: Path) -> None:
     database = tmp_path / "runtime.sqlite"
     store = SQLiteRuntimeStore(database)
@@ -139,3 +158,143 @@ def test_derived_capability_keeps_parent_ref_grant_without_ownership_transfer(
     assert child.archive is archive
     assert parent.inspect(ref.ref)["ref"] == ref.ref
 
+
+def test_projection_archive_writer_separates_logical_identity_from_content_digest(
+    tmp_path: Path,
+) -> None:
+    archive = ArtifactArchive(tmp_path / "artifacts")
+    capability = ToolResultArchiveCapability(
+        archive,
+        session_id="session-a",
+        run_id="run-a",
+        parent_run_id="parent-a",
+    )
+    value = {"text": "正文🙂" * 5_000}
+
+    first = capability.archive_result(value, call_id="call-a", tool_name="read_file")
+    second = capability.archive_result(value, call_id="call-b", tool_name="read_file")
+
+    assert first.ref != second.ref
+    assert first.artifact_id != second.artifact_id
+    assert first.sha256 == second.sha256
+    assert first.ref.startswith("artifact:tool-result:")
+    retry = capability.archive_result(value, call_id="call-a", tool_name="read_file")
+    assert retry.ref == first.ref
+    metadata = capability.inspect(first.ref)
+    assert metadata["scope"] == "tool-result"
+    assert metadata["metadata"]["session_id"] == "session-a"
+    assert metadata["metadata"]["run_id"] == "run-a"
+    assert capability.materialize(first.ref) == value
+    assert capability.read(first.ref, offset=0, limit=32)["unit"] == "bytes"
+
+    child = capability.derive(run_id="child-a", parent_run_id="run-a")
+    assert child.inspect(first.ref)["ref"] == first.ref
+
+
+def test_identical_tool_result_in_two_sessions_has_independent_authorization(
+    tmp_path: Path,
+) -> None:
+    archive = ArtifactArchive(tmp_path / "artifacts")
+    first = ToolResultArchiveCapability(archive, session_id="session-a", run_id="run-a")
+    second = ToolResultArchiveCapability(archive, session_id="session-b", run_id="run-b")
+    value = {"same": "body🙂"}
+
+    a_ref = first.archive_result(
+        value,
+        call_id="call-a",
+        tool_name="fixture",
+        runtime_event_id="event-a",
+    )
+    b_ref = second.archive_result(
+        value,
+        call_id="call-a",
+        tool_name="fixture",
+        runtime_event_id="event-a",
+    )
+
+    assert a_ref.ref != b_ref.ref
+    assert a_ref.sha256 == b_ref.sha256
+    assert first.materialize(a_ref.ref) == value
+    assert second.materialize(b_ref.ref) == value
+    assert json.loads(second.execute({"operation": "inspect", "ref": a_ref.ref}))["error_type"] == "session_mismatch"
+    assert json.loads(first.execute({"operation": "inspect", "ref": b_ref.ref}))["error_type"] == "session_mismatch"
+    assert len(list((tmp_path / "artifacts" / "sha256").rglob("*.bin"))) == 1
+    assert len(list((tmp_path / "artifacts" / "refs").glob("*.json"))) == 2
+    assert archive.diagnose() == []
+
+
+@pytest.mark.parametrize("fault_point", ["artifact.metadata", "store.artifact_metadata"])
+def test_logical_archive_publication_rolls_back_on_metadata_failure(
+    tmp_path: Path,
+    fault_point: str,
+) -> None:
+    class Fault:
+        def check(self, point: str) -> None:
+            if point == fault_point:
+                raise RuntimeError("injected publication failure")
+
+    store = SQLiteRuntimeStore(tmp_path / "runtime.sqlite", fault_hook=Fault()) if fault_point.startswith("store.") else None
+    archive = ArtifactArchive(
+        tmp_path / "artifacts",
+        metadata_store=store,
+        fault_hook=Fault() if fault_point.startswith("artifact.") else None,
+    )
+    capability = ToolResultArchiveCapability(archive, session_id="session-a", run_id="run-a")
+
+    with pytest.raises(ArtifactMetadataError):
+        capability.archive_result("new logical body", call_id="call-a", tool_name="fixture")
+
+    assert not list((tmp_path / "artifacts").rglob("*.bin"))
+    assert not list((tmp_path / "artifacts" / "refs").glob("*.json"))
+    if store is not None:
+        assert store.list_artifact_metadata() == []
+        store.close()
+
+
+def test_logical_metadata_failure_does_not_delete_shared_content_blob(tmp_path: Path) -> None:
+    class Fault:
+        def check(self, point: str) -> None:
+            if point == "store.artifact_metadata":
+                raise RuntimeError("injected mirror failure")
+
+    store = SQLiteRuntimeStore(tmp_path / "runtime.sqlite")
+    archive = ArtifactArchive(tmp_path / "artifacts", metadata_store=store)
+    capability = ToolResultArchiveCapability(archive, session_id="session-a", run_id="run-a")
+    first = capability.archive_result("shared body", call_id="call-a", tool_name="fixture")
+    store.fault_hook = Fault()
+
+    with pytest.raises(ArtifactMetadataError):
+        capability.archive_result("shared body", call_id="call-b", tool_name="fixture")
+
+    assert list((tmp_path / "artifacts" / "sha256").rglob("*.bin"))
+    assert len(list((tmp_path / "artifacts" / "refs").glob("*.json"))) == 1
+    assert capability.materialize(first.ref) == "shared body"
+    store.close()
+
+
+def test_logical_metadata_digest_or_size_mismatch_fails_closed(tmp_path: Path) -> None:
+    archive = ArtifactArchive(tmp_path / "artifacts")
+    capability = ToolResultArchiveCapability(archive, session_id="session-a", run_id="run-a")
+    ref = capability.archive_result("immutable body", call_id="call-a", tool_name="fixture")
+    metadata_path = archive._logical_metadata_path(ref.artifact_id or "")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["size_bytes"] += 1
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(ArtifactIntegrityError):
+        capability.inspect(ref.ref)
+
+
+def test_logical_archive_rejects_conflicting_scope_metadata(tmp_path: Path) -> None:
+    archive = ArtifactArchive(tmp_path / "artifacts")
+    capability = ToolResultArchiveCapability(archive, session_id="session-a", run_id="run-a")
+
+    with pytest.raises(ValueError, match="session_id"):
+        capability.archive_result(
+            "body",
+            call_id="call-a",
+            tool_name="fixture",
+            metadata={"session_id": "session-b"},
+        )
+
+    assert not list((tmp_path / "artifacts").rglob("*.bin"))

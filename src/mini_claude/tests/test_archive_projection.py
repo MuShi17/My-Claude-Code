@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -136,6 +137,403 @@ def test_capacity_rescue_and_stale_projection_are_actionable(tmp_path: Path, pro
     assert ref.ref in blocked_content["ref"]
 
 
+def test_complete_canonical_result_is_archived_only_when_projection_needs_it(
+    tmp_path: Path,
+):
+    archive = ArtifactArchive(tmp_path / "artifacts")
+    capability = ToolResultArchiveCapability(
+        archive,
+        session_id="session-a",
+        run_id="run-a",
+    )
+    content = "完整 canonical 正文🙂\n" * 2_000
+    messages = (
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call-full", "name": "read_file", "arguments": {"file_path": "x"}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-full", "content": content},
+    )
+
+    fit = project_archived_tool_results(messages, capability, budget_bytes=200_000)
+    assert fit[1]["content"] == content
+    assert not list((tmp_path / "artifacts").rglob("*.bin"))
+    assert messages[1]["content"] == content
+
+    rescue = project_archived_tool_results(messages, capability, budget_bytes=2_000)
+    envelope = rescue[1]["content"]
+    assert envelope["kind"] == "bounded_ref"
+    assert envelope["preview"] == content[: envelope["preview_chars"]]
+    assert envelope["next_offset"] == envelope["preview_chars"]
+    assert archive.inspect(envelope["ref"]).size_bytes > 16_384
+    assert messages[1]["content"] == content
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_only_latest_completed_provider_step_is_first_use(
+    tmp_path: Path, provider: str
+):
+    archive = ArtifactArchive(tmp_path / "artifacts")
+    capability = ToolResultArchiveCapability(
+        archive,
+        session_id="session-a",
+        run_id="run-a",
+    )
+    first = "first step 🙂\n" * 800
+    second = "latest step 🚀\n" * 800
+    messages = (
+        {"role": "user", "content": "inspect"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call-first", "name": "read_file", "arguments": {}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-first", "content": first},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call-latest", "name": "read_file", "arguments": {}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-latest", "content": second},
+    )
+
+    projected = project_archived_tool_results(
+        messages,
+        capability,
+        budget_bytes=200_000,
+    )
+    assert projected[2]["content"]["kind"] == "bounded_ref"
+    assert projected[4]["content"] == second
+    assert len(list((tmp_path / "artifacts").rglob("*.bin"))) == 1
+
+    context = CanonicalModelContextAdapter().build_result(
+        _result(tuple(projected)),
+        provider=provider,
+        system_prompt="system" if provider == "openai" else None,
+        archive_capability=capability,
+        budget_bytes=200_000,
+    )
+    if provider == "anthropic":
+        wire = next(
+            block["content"]
+            for message in context.messages
+            if message.get("role") == "user"
+            for block in message.get("content", [])
+            if isinstance(block, dict)
+            and block.get("type") == "tool_result"
+            and block.get("tool_use_id") == "call-latest"
+        )
+    else:
+        wire = next(
+            message["content"]
+            for message in context.messages
+            if message.get("role") == "tool"
+            and message.get("tool_call_id") == "call-latest"
+        )
+    assert wire == second
+
+
+def _archive_read_messages(content: object) -> tuple[dict, ...]:
+    return (
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-archive-read",
+                    "name": "ArchiveRead",
+                    "arguments": {
+                        "operation": "read",
+                        "ref": "artifact:sha256:" + "a" * 64,
+                        "offset": 0,
+                        "limit": 64,
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-archive-read",
+            "content": content,
+        },
+    )
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_archive_read_page_is_non_recursive_for_both_providers(
+    tmp_path: Path, provider: str
+):
+    archive = ArtifactArchive(tmp_path / "artifacts")
+    ref = archive.archive(
+        "archive source 🙂\n" * 200,
+        mime_type="text/plain",
+        encoding="utf-8",
+        scope="tool-result",
+        metadata={"session_id": "session-a", "run_id": "run-a"},
+    )
+    capability = ToolResultArchiveCapability(
+        archive,
+        session_id="session-a",
+        run_id="run-a",
+    )
+    page = capability.execute(
+        {
+            "operation": "read",
+            "ref": ref.ref,
+            "offset": 0,
+            "limit": 64,
+        }
+    )
+    before = len(list((tmp_path / "artifacts").rglob("*.bin")))
+    messages = _archive_read_messages(page)
+
+    projected = project_archived_tool_results(
+        messages,
+        capability,
+        budget_bytes=200_000,
+    )
+    assert projected[1]["content"] == page
+    assert len(list((tmp_path / "artifacts").rglob("*.bin"))) == before
+
+    context = CanonicalModelContextAdapter().build_result(
+        _result(projected),
+        provider=provider,
+        system_prompt="system" if provider == "openai" else None,
+        archive_capability=capability,
+        budget_bytes=200_000,
+    )
+    if provider == "anthropic":
+        wire = next(
+            block["content"]
+            for message in context.messages
+            if message.get("role") == "user"
+            for block in message.get("content", [])
+            if block.get("type") == "tool_result"
+        )
+    else:
+        wire = next(
+            message["content"]
+            for message in context.messages
+            if message.get("role") == "tool"
+        )
+    wire_value = json.loads(wire) if isinstance(wire, str) else wire
+    assert wire_value["kind"] == "archive_page"
+    assert wire_value["ref"] == ref.ref
+    assert str(wire_value["ref"]).count("artifact:sha256:") == 1
+
+    repeated = project_archived_tool_results(
+        messages,
+        capability,
+        budget_bytes=200_000,
+    )
+    assert repeated[1]["content"] == page
+    assert len(list((tmp_path / "artifacts").rglob("*.bin"))) == before
+
+
+def test_archive_read_capacity_error_does_not_archive_page(tmp_path: Path):
+    archive = ArtifactArchive(tmp_path / "artifacts")
+    ref = archive.archive(
+        "archive source\n" * 200,
+        mime_type="text/plain",
+        encoding="utf-8",
+        scope="tool-result",
+        metadata={"session_id": "session-a", "run_id": "run-a"},
+    )
+    capability = ToolResultArchiveCapability(
+        archive,
+        session_id="session-a",
+        run_id="run-a",
+    )
+    page = capability.execute(
+        {
+            "operation": "read",
+            "ref": ref.ref,
+            "offset": 0,
+            "limit": 64,
+        }
+    )
+    messages = (
+        {"role": "user", "content": "context " * 2_000},
+        *_archive_read_messages(page),
+    )
+    before = len(list((tmp_path / "artifacts").rglob("*.bin")))
+
+    projected = project_archived_tool_results(
+        messages,
+        capability,
+        budget_bytes=1_000,
+    )
+    error = projected[-1]["content"]
+    assert error["kind"] == "archive_read_error"
+    assert error["error_type"] == "capacity_exhausted"
+    assert error["ref"] == ref.ref
+    assert "smaller limit" in error["message"]
+    assert len(list((tmp_path / "artifacts").rglob("*.bin"))) == before
+
+
+def test_historical_archive_read_bounded_ref_is_not_rearchived(tmp_path: Path):
+    archive = ArtifactArchive(tmp_path / "artifacts")
+    ref = archive.archive(
+        "historical page\n" * 100,
+        mime_type="text/plain",
+        encoding="utf-8",
+        scope="tool-result",
+        metadata={"session_id": "session-a", "run_id": "run-a"},
+    )
+    capability = ToolResultArchiveCapability(
+        archive,
+        session_id="session-a",
+        run_id="run-a",
+    )
+    placeholder = ref.placeholder()
+    messages = _archive_read_messages(placeholder)
+    before = len(list((tmp_path / "artifacts").rglob("*.bin")))
+
+    projected = project_archived_tool_results(messages, capability, budget_bytes=200_000)
+    repeated = project_archived_tool_results(
+        messages,
+        capability,
+        budget_bytes=200_000,
+    )
+    assert projected[1]["content"] == placeholder
+    assert repeated[1]["content"] == placeholder
+    assert len(list((tmp_path / "artifacts").rglob("*.bin"))) == before
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_archive_aware_live_pipeline_skips_legacy_result_rewriters(
+    provider: str, monkeypatch: pytest.MonkeyPatch
+):
+    agent = Agent(
+        api_base="https://fake-provider.invalid/v1" if provider == "openai" else None,
+        api_key="fixture-key",
+        is_sub_agent=True,
+    )
+    called: list[str] = []
+    methods = (
+        "_capture_compression_tool_results",
+        "_budget_tool_results_openai",
+        "_budget_tool_results_anthropic",
+        "_snip_stale_results_openai",
+        "_snip_stale_results_anthropic",
+        "_microcompact_openai",
+        "_microcompact_anthropic",
+        "_persist_compression_replacements",
+    )
+    for method in methods:
+        monkeypatch.setattr(
+            agent,
+            method,
+            lambda method=method: called.append(method),
+        )
+
+    large_result = "new canonical result 🙂\n" * 1_000
+    if provider == "openai":
+        agent._openai_messages = [
+            {
+                "role": "tool",
+                "tool_call_id": "call-new",
+                "content": large_result,
+            }
+        ]
+    else:
+        agent._anthropic_messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call-new",
+                        "content": large_result,
+                    }
+                ],
+            }
+        ]
+    before = deepcopy(
+        agent._openai_messages if provider == "openai" else agent._anthropic_messages
+    )
+    agent.last_input_token_count = agent.effective_window
+
+    # The repeated call models a retry/next live attempt at high utilization;
+    # neither attempt may mutate the newly completed result.
+    agent._run_compression_pipeline(archive_aware=True)
+    agent._run_compression_pipeline(archive_aware=True)
+    assert called == []
+    assert (
+        agent._openai_messages if provider == "openai" else agent._anthropic_messages
+    ) == before
+
+
+def test_projection_archive_failure_returns_error_without_success_ref(tmp_path: Path):
+    class Failure:
+        def check(self, point: str) -> None:
+            if point in {"artifact.write", "archive.write"}:
+                raise RuntimeError("fixture archive write failure")
+
+    archive = ArtifactArchive(tmp_path / "artifacts", fault_hook=Failure())
+    capability = ToolResultArchiveCapability(
+        archive,
+        session_id="session-a",
+        run_id="run-a",
+    )
+    content = "正文🙂\n" * 2_000
+    messages = (
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "call-fault", "name": "read_file", "arguments": {}}],
+        },
+        {"role": "tool", "tool_call_id": "call-fault", "content": content},
+    )
+
+    projected = project_archived_tool_results(messages, capability, budget_bytes=2_000)
+    error = projected[1]["content"]
+    assert error["kind"] == "archive_read_error"
+    assert error["error_type"] == "capability_unavailable"
+    assert "ref" not in error
+    assert not list((tmp_path / "artifacts").rglob("*.json"))
+
+
+def test_logical_archive_read_page_is_passed_through_without_recursive_archive(
+    tmp_path: Path,
+) -> None:
+    archive = ArtifactArchive(tmp_path / "artifacts")
+    capability = ToolResultArchiveCapability(
+        archive,
+        session_id="session-a",
+        run_id="run-a",
+    )
+    ref = capability.archive_result("archive page body\n" * 20, call_id="call-source", tool_name="fixture")
+    page = json.loads(capability.execute({
+        "operation": "read",
+        "ref": ref.ref,
+        "offset": 0,
+        "limit": 32,
+    }))
+    before = sorted(path.name for path in (tmp_path / "artifacts" / "refs").glob("*.json"))
+    messages = (
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "call-archive", "name": "ArchiveRead", "arguments": {}}],
+        },
+        {"role": "tool", "tool_call_id": "call-archive", "content": page},
+    )
+
+    projected = project_archived_tool_results(messages, capability, budget_bytes=200_000)
+
+    assert projected[1]["content"] == page
+    assert sorted(path.name for path in (tmp_path / "artifacts" / "refs").glob("*.json")) == before
+    assert json.dumps(projected[1]["content"]).count("artifact:tool-result:") == 1
+
+
 def test_stale_ref_can_be_read_back_as_a_normal_bounded_page(tmp_path: Path):
     _archive, ref, capability, messages, content = _fixture(tmp_path)
     stale = project_archived_tool_results(
@@ -252,27 +650,12 @@ def test_real_agent_replay_reaches_fake_provider_with_archive_projection(
             )["content"]
         assert first_wire.startswith("内容🙂")
         assert len(first_wire) > 16_000
+        assert result.result == "内容🙂\n" * 4_500
+        assert not list((tmp_path / "artifacts").rglob("*.bin"))
 
         replay = agent.project_canonical_model_context()
         assert replay is not None
-        assert replay.messages[-1]["content"]["kind"] == "bounded_ref"
-        assert archive.inspect(result.result["ref"]).size_bytes > 16_000
-
-        read_back = json.loads(
-            asyncio.run(
-                agent._execute_tool_call(
-                    "ArchiveRead",
-                    {
-                        "operation": "read",
-                        "ref": result.result["ref"],
-                        "offset": 0,
-                        "limit": 32,
-                    },
-                )
-            )
-        )
-        assert read_back["kind"] == "archive_page"
-        assert read_back["page"].startswith("内容🙂")
+        assert replay.messages[-1]["content"] == result.result
 
         agent.effective_window = 400
         rescue_context = agent._refresh_provider_context_from_canonical()
@@ -288,9 +671,25 @@ def test_real_agent_replay_reaches_fake_provider_with_archive_projection(
             else next(message for message in rescue_context.messages if message.get("role") == "tool")["content"]
         )
         rescue_value = json.loads(rescue_wire)
-        assert rescue_value["truncated"] is True
+        assert rescue_value["kind"] == "bounded_ref"
         assert rescue_value["preview_chars"] <= 4_000
-        assert "ArchiveRead" in rescue_value["read_instructions"]
+        ref = rescue_value["ref"]
+        assert archive.inspect(ref).size_bytes > 16_000
+        read_back = json.loads(
+            asyncio.run(
+                agent._execute_tool_call(
+                    "ArchiveRead",
+                    {
+                        "operation": "read",
+                        "ref": ref,
+                        "offset": 0,
+                        "limit": 32,
+                    },
+                )
+            )
+        )
+        assert read_back["kind"] == "archive_page"
+        assert read_back["page"].startswith("内容🙂")
 
 
 def test_archive_read_errors_are_bounded_and_path_free(tmp_path: Path):

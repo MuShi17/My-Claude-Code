@@ -6,7 +6,7 @@ grep_search, run_shell, skill, enter/exit_plan_mode, agent, tool_search, web_fet
   1. 模型返回 tool_use 块 → 解析为 {name, input} 字典
   2. check_permission() 根据权限模式 + 规则决定 allow/deny/confirm
   3. execute_tool() 执行实际逻辑，返回字符串结果
-  4. 结果截断后注入回对话上下文
+  4. 结果通过公共 canonical JSON 字节上限后注入回对话上下文
 """
 
 from __future__ import annotations
@@ -18,9 +18,11 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 from .memory import get_memory_dir
 from .frontmatter import parse_frontmatter
+from .tool_result import MAX_TOOL_RESULT_BYTES, is_tool_result_error, public_tool_result
 
 # ─── 权限模式 ──────────────────────────────────────────────
 # 5种模式控制工具执行的安全级别，从完全开放到只读计划模式
@@ -54,6 +56,16 @@ tool_definitions: list[ToolDef] = [
             "type": "object",
             "properties": {
                 "file_path": {"type": "string", "description": "The path to the file to read"},
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Optional 0-based line offset; defaults to 0.",
+                },
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional positive number of lines; defaults to the end of the file.",
+                },
             },
             "required": ["file_path"],
         },
@@ -245,16 +257,38 @@ def _read_file_with_encoding(file_path: str) -> tuple[str, str]:
     return content, last_error
 
 
+def _read_file_pagination(inp: dict) -> tuple[int, int | None] | str:
+    """Validate read_file pagination without touching the target file."""
+
+    offset = inp.get("offset", 0)
+    limit = inp.get("limit")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        return "Error: read_file offset must be a non-negative integer."
+    if limit is not None and (
+        isinstance(limit, bool) or not isinstance(limit, int) or limit < 1
+    ):
+        return "Error: read_file limit must be a positive integer."
+    return offset, limit
+
+
 def _read_file(inp: dict) -> str:
-    """读取文件内容，返回带行号的文本（格式：行号 | 内容）。"""
+    """读取分页后的文件内容，行号仍使用原文件的 1-based 行号。"""
+
+    pagination = _read_file_pagination(inp)
+    if isinstance(pagination, str):
+        return pagination
+    offset, limit = pagination
     file_path = inp["file_path"]
     # 尝试的编码列表（按优先级）
     content, last_error = _read_file_with_encoding(file_path)
     if content is None:
         return f"Error reading file: cannot decode with any encoding (last error: {last_error})"
-    # 添加行号
+    # 先按原文件行切片，再添加原始 1-based 行号。
     lines = content.split("\n")
-    numbered = "\n".join(f"{i+1:4d} | {line}" for i, line in enumerate(lines))
+    page = lines[offset:] if limit is None else lines[offset : offset + limit]
+    numbered = "\n".join(
+        f"{offset + i + 1:4d} | {line}" for i, line in enumerate(page)
+    )
     return numbered
 
 
@@ -756,22 +790,19 @@ def check_permission(
     return {"action": "allow"}
 
 
-# ─── 工具结果截断 ─────────────────────────────────────────
-# 防止超大工具结果撑爆上下文窗口，超过 50000 字符时保留首尾各一半
+# ─── 公共工具结果边界 ─────────────────────────────────────
+# 兼容旧导入名，但不再执行静默首尾截断；真正的公共 gate 是
+# public_tool_result()，上限对所有工具统一为 16 MiB canonical JSON 字节。
 
-MAX_RESULT_CHARS = 50000
+MAX_RESULT_BYTES = MAX_TOOL_RESULT_BYTES
+# Compatibility alias for integrations importing the historical name.
+MAX_RESULT_CHARS = MAX_RESULT_BYTES
 
 
 def _truncate_result(result: str) -> str:
-    """截断过长结果，保留首尾各约一半，中间插入截断提示。"""
-    if len(result) <= MAX_RESULT_CHARS:
-        return result
-    keep_each = (MAX_RESULT_CHARS - 60) // 2
-    return (
-        result[:keep_each]
-        + f"\n\n[... truncated {len(result) - keep_each * 2} chars ...]\n\n"
-        + result[-keep_each:]
-    )
+    """Compatibility shim: return the complete value without silent truncation."""
+
+    return result
 
 
 # ─── 工具调用执行入口 ─────────────────────────────────────
@@ -779,29 +810,57 @@ def _truncate_result(result: str) -> str:
 # 其他工具均在此文件中实现并分发。
 
 
-async def execute_tool(
-    name: str, inp: dict, read_file_state: dict[str, float] | None = None
-) -> str:
-    """执行工具调用的主入口函数。
+def commit_tool_state(
+    name: str,
+    inp: dict,
+    result: Any,
+    read_file_state: dict[str, float] | None,
+) -> None:
+    """Commit先读后改状态 only after the caller accepts the result.
 
-    read_file_state: 用于实现"先读后改"安全机制。
+    The durable boundary owns canonical result validation.  Keeping this
+    mutation separate prevents an over-limit/read-error result from granting
+    edit permission merely because the file was touched internally.
+    """
+
+    if read_file_state is None:
+        return
+    if name == "read_file":
+        if (isinstance(result, str) and result.startswith("Error")) or is_tool_result_error(result):
+            return
+    elif name in ("write_file", "edit_file"):
+        if isinstance(result, str) and result.startswith("Error"):
+            return
+    else:
+        return
+    abs_path = str(Path(inp["file_path"]).resolve())
+    try:
+        read_file_state[abs_path] = os.path.getmtime(abs_path)
+    except OSError:
+        pass
+
+
+async def execute_tool_value(
+    name: str, inp: dict, read_file_state: dict[str, float] | None = None
+) -> Any:
+    """Execute a tool and return its raw value to the durable boundary.
+
+    The public ``execute_tool`` wrapper applies the common canonical JSON
+    byte gate.  The Agent path uses this raw variant so the durable boundary
+    performs exactly one normalization and size check.
+
+    ``read_file_state`` implements the read-before-edit safety check:
+
     - read_file 时记录文件的 mtime
     - write_file/edit_file 前检查：文件是否已被读取、mtime 是否一致
     - 编辑成功后更新 mtime
 
-    返回工具执行结果字符串（已截断）。
+    返回工具原始结果；不得在此处提前做公共结果序列化。
     """
     # ─── 先读后改 + mtime 新鲜度检查 ───────────────────────
     # 防止模型在未读取文件内容的情况下盲目编辑，以及外部并发修改导致的冲突
     if name == "read_file":
-        result = _read_file(inp)
-        if read_file_state is not None and not result.startswith("Error"):
-            abs_path = str(Path(inp["file_path"]).resolve())
-            try:
-                read_file_state[abs_path] = os.path.getmtime(abs_path)
-            except OSError:
-                pass
-        return _truncate_result(result)
+        return _read_file(inp)
 
     if name in ("write_file", "edit_file") and read_file_state is not None:
         abs_path = str(Path(inp["file_path"]).resolve())
@@ -842,16 +901,17 @@ async def execute_tool(
     handler = handlers.get(name)
     if not handler:
         return f"Unknown tool: {name}"
-    result = _truncate_result(handler(inp))
+    return handler(inp)
 
-    # 编辑成功后更新 mtime，确保后续编辑能通过新鲜度检查
-    if name in ("write_file", "edit_file") and read_file_state is not None and not result.startswith("Error"):
-        abs_path = str(Path(inp["file_path"]).resolve())
-        try:
-            read_file_state[abs_path] = os.path.getmtime(abs_path)
-        except OSError:
-            pass
 
+async def execute_tool(
+    name: str, inp: dict, read_file_state: dict[str, float] | None = None
+) -> str:
+    """Execute a tool through the public canonical JSON byte boundary."""
+
+    value = await execute_tool_value(name, inp, read_file_state)
+    result = public_tool_result(value, name)
+    commit_tool_state(name, inp, result, read_file_state)
     return result
 
 

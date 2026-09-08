@@ -77,15 +77,12 @@ def test_owned_runtime_and_archive_survive_consecutive_large_result_turns(
     assert len(results) == 1
     result = results[0]
     assert result.success is True
-    assert result.result["kind"] == "bounded_ref"
-    assert archive.inspect(result.result["ref"]).size_bytes == 17_000
-    metadata = store.read_artifact_metadata(result.result["ref"])
-    assert metadata is not None
-    assert metadata["size_bytes"] == 17_000
+    assert result.result == "x" * 17_000
+    assert not list((tmp_path / "artifacts").rglob("*"))
 
     asyncio.run(agent.aclose())
     with pytest.raises(StoreClosedError, match="runtime store is closed"):
-        store.read_artifact_metadata(result.result["ref"])
+        store.read_event_records()
 
 
 def test_agent_close_is_idempotent_and_terminal(

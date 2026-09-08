@@ -16,12 +16,19 @@ from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Mapping
 
 from .archive_capability import ToolResultArchiveCapability
-from .artifact_archive import ArtifactArchive, ArtifactArchiveError
+from .artifact_archive import ArtifactArchive
 from .event_ids import IdentityFactory, RunContext
 from .event_sink import CanonicalToolCallConflictError, RuntimeEventEmitter
-from .redaction import RedactionPolicy, bound_payload, redact_payload
+from .redaction import RedactionPolicy, redact_payload
 from .runtime_event import RuntimeEvent, canonical_json_bytes
 from .tool_call_identity import decode_tool_arguments
+from .tool_result import (
+    ToolResultLimitError,
+    ToolResultSerializationError,
+    canonical_tool_result,
+    parsed_result_error,
+    validate_tool_result_size,
+)
 
 
 def _now_ms() -> int:
@@ -547,23 +554,35 @@ class DurableToolBoundary:
             value = executor()
             if inspect.isawaitable(value):
                 value = await asyncio.wait_for(value, timeout) if timeout is not None else await value
-            bounded, archive_error = self._bound_result(value, call_id=call_id, name=name)
-            success = not (isinstance(value, str) and value.startswith("Error:"))
-            if archive_error is not None:
+            result_value: Any = value
+            error_type: str | None = None
+            try:
+                validate_tool_result_size(value, name)
+                result_value = canonical_tool_result(value)
+            except (ToolResultLimitError, ToolResultSerializationError) as error:
+                result_value = error.payload()
+                error_type = error.code
                 success = False
+            else:
+                public_error = parsed_result_error(value)
+                if public_error is not None:
+                    result_value = dict(public_error)
+                    error_type = str(public_error.get("error_type") or "ToolResultError")
+                    success = False
+                else:
+                    success = not (isinstance(value, str) and value.startswith("Error:"))
             self._outcome(
                 call_id,
                 name,
-                bounded,
+                result_value,
                 success=success,
                 executed=True,
-                error_type=type(archive_error).__name__ if archive_error else None,
+                error_type=error_type,
                 operation_id=operation_id,
                 duration_ms=int((time.monotonic() - execution_started_at) * 1000),
             )
             return ToolExecutionResult(
-                call_id, name, bounded, success, True,
-                type(archive_error).__name__ if archive_error else None,
+                call_id, name, result_value, success, True, error_type,
                 operation_id=operation_id,
             )
         except asyncio.CancelledError:
@@ -595,76 +614,6 @@ class DurableToolBoundary:
                 operation_id=operation_id,
             )
 
-    def _bound_result(
-        self,
-        value: Any,
-        *,
-        call_id: str,
-        name: str,
-    ) -> tuple[Any, Exception | None]:
-        policy = RedactionPolicy(
-            version=self.redaction_policy.version,
-            max_inline_bytes=self.max_result_bytes,
-            max_string_chars=self.redaction_policy.max_string_chars,
-        )
-        try:
-            encoded = (
-                value.encode("utf-8") if isinstance(value, str)
-                else canonical_json_bytes(value)
-            )
-        except (TypeError, ValueError):
-            encoded = str(value).encode("utf-8")
-        if len(encoded) <= self.max_result_bytes:
-            return bound_payload(value, ref=f"tool-result:{call_id}", policy=policy), None
-        if self.artifact_archive is None:
-            return {
-                "kind": "archive_error",
-                "error_type": "ArtifactArchiveUnavailable",
-                "message": "large tool result cannot be referenced without an artifact archive",
-                "size_bytes": len(encoded),
-                "tool_name": name,
-            }, ArtifactArchiveError("artifact archive is not configured")
-        if self.archive_capability is None:
-            return {
-                "kind": "archive_error",
-                "error_type": "ArchiveCapabilityUnavailable",
-                "message": "large tool result cannot be referenced without ArchiveRead capability",
-                "size_bytes": len(encoded),
-                "tool_name": name,
-            }, ArtifactArchiveError("archive read capability is not configured")
-        try:
-            archived = self.artifact_archive.archive(
-                value,
-                mime_type=(
-                    "text/plain"
-                    if isinstance(value, str)
-                    else "application/octet-stream"
-                    if isinstance(value, bytes)
-                    else "application/json"
-                ),
-                encoding="utf-8" if isinstance(value, str) else "binary",
-                scope="tool-result",
-                redaction_policy=self.redaction_policy,
-                metadata={
-                    "call_id": call_id,
-                    "tool_name": name,
-                    "session_id": self.context.session_id,
-                    "run_id": self.context.run_id,
-                    "parent_run_id": self.context.parent_run_id,
-                },
-            )
-            if self.archive_capability is not None:
-                self.archive_capability.register_ref(archived.ref)
-            return archived.placeholder(), None
-        except Exception as error:
-            return {
-                "kind": "archive_error",
-                "error_type": type(error).__name__,
-                "message": str(error),
-                "size_bytes": len(encoded),
-                "tool_name": name,
-            }, error
-
     def _outcome(
         self,
         call_id: str,
@@ -678,7 +627,10 @@ class DurableToolBoundary:
         operation_id: str | None = None,
         duration_ms: int | None = None,
     ) -> None:
-        safe_result = redact_payload(result, self.redaction_policy)
+        # The enclosing RuntimeEvent redaction pass is path-aware and sees
+        # this value at ``content.result``.  Redacting here first would move
+        # it to the root path and incorrectly create an ``inline:*`` ref.
+        safe_result = result
         action = {"name": name, "success": success, "executed": executed}
         if operation_id:
             action.update(

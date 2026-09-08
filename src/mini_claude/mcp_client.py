@@ -17,6 +17,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from .tool_result import public_tool_result
+
 
 # ─── 单个 MCP 连接（一个服务器一个连接） ──────────────────
 
@@ -114,14 +116,19 @@ class McpConnection:
             for t in result["tools"]
         ]
 
-    async def call_tool(self, name: str, args: dict) -> str:
-        """调用工具并返回文本结果。"""
+    async def call_tool_value(self, name: str, args: dict) -> Any:
+        """调用工具并返回未序列化结果，供 DurableToolBoundary 使用。"""
         result = await self._send_request("tools/call", {"name": name, "arguments": args})
         if isinstance(result, dict) and isinstance(result.get("content"), list):
             return "\n".join(
                 c["text"] for c in result["content"] if c.get("type") == "text"
             )
-        return json.dumps(result)
+        return result
+
+    async def call_tool(self, name: str, args: dict) -> str:
+        """调用工具并通过公共 canonical JSON 字节边界返回文本。"""
+
+        return public_tool_result(await self.call_tool_value(name, args), name)
 
     def close(self) -> None:
         """终止服务器进程。"""
@@ -209,6 +216,19 @@ class McpManager:
         if not conn:
             raise RuntimeError(f"MCP server '{server_name}' not connected")
         return await conn.call_tool(tool_name, args)
+
+    async def call_tool_value(self, prefixed_name: str, args: dict) -> Any:
+        """将带前缀的工具调用路由到未序列化结果。"""
+
+        parts = prefixed_name.split("__")
+        if len(parts) < 3:
+            raise ValueError(f"Invalid MCP tool name: {prefixed_name}")
+        server_name = parts[1]
+        tool_name = "__".join(parts[2:])
+        conn = self._connections.get(server_name)
+        if not conn:
+            raise RuntimeError(f"MCP server '{server_name}' not connected")
+        return await conn.call_tool_value(tool_name, args)
 
     async def disconnect_all(self) -> None:
         """断开所有服务器连接。"""

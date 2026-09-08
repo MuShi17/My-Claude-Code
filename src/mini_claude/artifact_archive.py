@@ -22,6 +22,8 @@ from .runtime_event import canonical_json_bytes
 
 ARTIFACT_SCHEMA_VERSION = 1
 ARTIFACT_REF_PREFIX = "artifact:sha256:"
+ARTIFACT_LOGICAL_REF_PREFIX = "artifact:tool-result:"
+ARTIFACT_REF_PREFIXES = (ARTIFACT_REF_PREFIX, ARTIFACT_LOGICAL_REF_PREFIX)
 
 
 class ArtifactArchiveError(RuntimeError):
@@ -61,13 +63,14 @@ class ArtifactRef:
     redaction_version: str
     created_at: str
     metadata_version: int = ARTIFACT_SCHEMA_VERSION
+    artifact_id: str | None = None
 
     @property
     def digest(self) -> str:
         return self.sha256.removeprefix("sha256:")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "ref": self.ref,
             "sha256": self.sha256,
             "size_bytes": self.size_bytes,
@@ -78,6 +81,9 @@ class ArtifactRef:
             "created_at": self.created_at,
             "metadata_version": self.metadata_version,
         }
+        if self.artifact_id is not None:
+            result["artifact_id"] = self.artifact_id
+        return result
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "ArtifactRef":
@@ -92,6 +98,11 @@ class ArtifactRef:
                 redaction_version=str(value.get("redaction_version", "unknown")),
                 created_at=str(value.get("created_at", "")),
                 metadata_version=int(value.get("metadata_version", ARTIFACT_SCHEMA_VERSION)),
+                artifact_id=(
+                    str(value["artifact_id"])
+                    if value.get("artifact_id") is not None
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError) as error:
             raise ArtifactMetadataError(f"invalid artifact metadata: {error}") from error
@@ -113,6 +124,8 @@ class ArtifactRef:
             "metadata_version": self.metadata_version,
             "truncated": truncated,
         }
+        if self.artifact_id is not None:
+            value["artifact_id"] = self.artifact_id
         if preview:
             value["preview"] = preview
         return value
@@ -148,7 +161,7 @@ class ArtifactPage:
     has_more: bool
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "ref": self.artifact.ref,
             "sha256": self.artifact.sha256,
             "size_bytes": self.artifact.size_bytes,
@@ -163,6 +176,9 @@ class ArtifactPage:
             "unit": self.unit,
             "has_more": self.has_more,
         }
+        if self.artifact.artifact_id is not None:
+            result["artifact_id"] = self.artifact.artifact_id
+        return result
 
 
 def _utc_now() -> str:
@@ -170,17 +186,40 @@ def _utc_now() -> str:
 
 
 def _validate_ref(ref: ArtifactRef) -> None:
-    if not ref.ref.startswith(ARTIFACT_REF_PREFIX):
+    if ref.ref.startswith(ARTIFACT_REF_PREFIX):
+        if ref.artifact_id is not None:
+            raise ArtifactMetadataError("legacy artifact ref cannot carry artifact_id")
+        expected = ARTIFACT_REF_PREFIX + ref.digest
+        if ref.ref != expected:
+            raise ArtifactMetadataError(f"artifact ref is not content addressed: {ref.ref!r}")
+    elif ref.ref.startswith(ARTIFACT_LOGICAL_REF_PREFIX):
+        artifact_id = ref.ref.removeprefix(ARTIFACT_LOGICAL_REF_PREFIX)
+        _validate_artifact_id(artifact_id)
+        if ref.artifact_id != artifact_id:
+            raise ArtifactMetadataError(f"logical artifact ref identity mismatch: {ref.ref!r}")
+    else:
         raise ArtifactMetadataError(f"unsupported artifact ref {ref.ref!r}")
-    expected = ARTIFACT_REF_PREFIX + ref.digest
-    if ref.ref != expected or len(ref.digest) != 64:
-        raise ArtifactMetadataError(f"artifact ref is not content addressed: {ref.ref!r}")
+    if len(ref.digest) != 64:
+        raise ArtifactMetadataError(f"artifact digest is not 256-bit: {ref.digest!r}")
     try:
         int(ref.digest, 16)
     except ValueError as error:
         raise ArtifactMetadataError(f"artifact digest is not hexadecimal: {ref.digest!r}") from error
     if ref.size_bytes < 0:
         raise ArtifactMetadataError("artifact size must not be negative")
+
+
+def _validate_artifact_id(value: str) -> None:
+    if len(value) != 64:
+        raise ArtifactMetadataError("artifact_id must be a 256-bit hexadecimal value")
+    try:
+        int(value, 16)
+    except ValueError as error:
+        raise ArtifactMetadataError("artifact_id must be hexadecimal") from error
+
+
+def is_artifact_ref(value: Any) -> bool:
+    return isinstance(value, str) and value.startswith(ARTIFACT_REF_PREFIXES)
 
 
 class ArtifactArchive:
@@ -255,6 +294,15 @@ class ArtifactArchive:
         directory = self.root / "sha256" / digest[:2]
         return directory / f"{digest}.bin", directory / f"{digest}.json"
 
+    def _logical_metadata_path(self, artifact_id: str) -> Path:
+        _validate_artifact_id(artifact_id)
+        return self.root / "refs" / f"{artifact_id}.json"
+
+    def _metadata_path_for_ref(self, ref: ArtifactRef) -> Path:
+        if ref.artifact_id is not None:
+            return self._logical_metadata_path(ref.artifact_id)
+        return self._paths(ref.digest)[1]
+
     @staticmethod
     def _atomic_write(path: Path, data: bytes, *, archive: "ArtifactArchive", label: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -291,12 +339,30 @@ class ArtifactArchive:
         scope: str = "runtime",
         redaction_policy: RedactionPolicy | None = None,
         metadata: Mapping[str, Any] | None = None,
+        artifact_id: str | None = None,
+        logical_identity: Mapping[str, Any] | None = None,
     ) -> ArtifactRef:
+        if artifact_id is not None and logical_identity is not None:
+            raise ValueError("artifact_id and logical_identity are mutually exclusive")
         policy = redaction_policy or RedactionPolicy()
         payload, report = self._redacted_bytes(value, encoding=encoding, policy=policy)
         digest = hashlib.sha256(payload).hexdigest()
+        if logical_identity is not None:
+            identity = dict(logical_identity)
+            identity["body_sha256"] = "sha256:" + digest
+            identity.setdefault("rewrite_version", 1)
+            try:
+                artifact_id = hashlib.sha256(canonical_json_bytes(identity)).hexdigest()
+            except (TypeError, ValueError, OverflowError, RecursionError) as error:
+                raise ArtifactMetadataError("logical artifact identity is not serializable") from error
+        if artifact_id is not None:
+            artifact_id = str(artifact_id)
+            _validate_artifact_id(artifact_id)
+            ref_value = ARTIFACT_LOGICAL_REF_PREFIX + artifact_id
+        else:
+            ref_value = ARTIFACT_REF_PREFIX + digest
         ref = ArtifactRef(
-            ref=ARTIFACT_REF_PREFIX + digest,
+            ref=ref_value,
             sha256="sha256:" + digest,
             size_bytes=len(payload),
             mime_type=mime_type,
@@ -304,41 +370,30 @@ class ArtifactArchive:
             scope=scope,
             redaction_version=report.version,
             created_at=_utc_now(),
+            artifact_id=artifact_id,
         )
         _validate_ref(ref)
-        content_path, metadata_path = self._paths(digest)
+        content_path = self._paths(digest)[0]
+        metadata_path = self._metadata_path_for_ref(ref)
 
         # A complete existing object is reusable.  A half-written object is
         # diagnosed instead of silently overwriting a possible corruption.
-        if content_path.exists() or metadata_path.exists():
-            if not content_path.exists() or not metadata_path.exists():
+        if metadata_path.exists():
+            if not content_path.exists():
                 raise ArtifactIntegrityError(f"incomplete artifact object {ref.ref}")
             existing = self._read_metadata_file(metadata_path)
             if any(
                 getattr(existing, name) != getattr(ref, name)
-                for name in ("ref", "sha256", "size_bytes", "mime_type", "encoding", "scope", "redaction_version")
+                for name in (
+                    "ref", "artifact_id", "sha256", "size_bytes", "mime_type",
+                    "encoding", "scope", "redaction_version",
+                )
             ):
                 raise ArtifactIntegrityError(f"metadata mismatch for {ref.ref}")
             self._verify_content(existing, content_path)
-            if self.metadata_store is not None and hasattr(self.metadata_store, "read_artifact_metadata"):
-                try:
-                    mirrored = self.metadata_store.read_artifact_metadata(existing.ref)
-                    if mirrored is None:
-                        self.metadata_store.write_artifact_metadata(
-                            existing.ref,
-                            sha256=existing.sha256,
-                            size_bytes=existing.size_bytes,
-                            mime_type=existing.mime_type,
-                            encoding=existing.encoding,
-                            scope=existing.scope,
-                            redaction_version=existing.redaction_version,
-                            metadata=self._metadata(existing, metadata),
-                        )
-                except Exception as error:
-                    raise ArtifactMetadataError(f"runtime artifact metadata commit failed: {error}") from error
+            self._mirror_metadata(existing, self._metadata(existing, metadata))
             return existing
 
-        self._atomic_write(content_path, payload, archive=self, label="write")
         full_metadata = self._metadata(
             ref,
             {
@@ -349,22 +404,60 @@ class ArtifactArchive:
         metadata_bytes = json.dumps(
             full_metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
-        self._atomic_write(metadata_path, metadata_bytes, archive=self, label="metadata")
-        if self.metadata_store is not None and hasattr(self.metadata_store, "write_artifact_metadata"):
-            try:
-                self.metadata_store.write_artifact_metadata(
-                    ref.ref,
-                    sha256=ref.sha256,
-                    size_bytes=ref.size_bytes,
-                    mime_type=ref.mime_type,
-                    encoding=ref.encoding,
-                    scope=ref.scope,
-                    redaction_version=ref.redaction_version,
-                    metadata=full_metadata,
-                )
-            except Exception as error:
-                raise ArtifactMetadataError(f"runtime artifact metadata commit failed: {error}") from error
+        content_created = False
+        metadata_created = False
+        if content_path.exists():
+            if ref.artifact_id is None:
+                raise ArtifactIntegrityError(f"incomplete artifact object {ref.ref}")
+            self._verify_content(ref, content_path)
+        else:
+            self._atomic_write(content_path, payload, archive=self, label="write")
+            content_created = True
+        try:
+            self._atomic_write(metadata_path, metadata_bytes, archive=self, label="metadata")
+            metadata_created = True
+            self._mirror_metadata(ref, full_metadata)
+        except Exception as error:
+            cleanup_errors: list[BaseException] = []
+            for path, created in ((metadata_path, metadata_created), (content_path, content_created)):
+                if not created:
+                    continue
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            if cleanup_errors:
+                raise ArtifactMetadataError(
+                    "artifact publication failed and local cleanup requires recovery"
+                ) from error
+            if isinstance(error, ArtifactMetadataError):
+                raise
+            raise ArtifactMetadataError(f"runtime artifact metadata commit failed: {error}") from error
         return ref
+
+    def _mirror_metadata(self, ref: ArtifactRef, full_metadata: Mapping[str, Any]) -> None:
+        if self.metadata_store is None or not hasattr(self.metadata_store, "write_artifact_metadata"):
+            return
+        if hasattr(self.metadata_store, "read_artifact_metadata"):
+            try:
+                if self.metadata_store.read_artifact_metadata(ref.ref) is not None:
+                    return
+            except Exception as error:
+                raise ArtifactMetadataError(f"runtime artifact metadata read failed: {error}") from error
+        try:
+            self.metadata_store.write_artifact_metadata(
+                ref.ref,
+                sha256=ref.sha256,
+                size_bytes=ref.size_bytes,
+                mime_type=ref.mime_type,
+                encoding=ref.encoding,
+                scope=ref.scope,
+                redaction_version=ref.redaction_version,
+                metadata=full_metadata,
+                created_at=ref.created_at,
+            )
+        except Exception as error:
+            raise ArtifactMetadataError(f"runtime artifact metadata commit failed: {error}") from error
 
     archive_payload = archive
 
@@ -407,15 +500,27 @@ class ArtifactArchive:
                     created_at="",
                 )
                 _validate_ref(item)
+            elif text.startswith(ARTIFACT_LOGICAL_REF_PREFIX):
+                artifact_id = text.removeprefix(ARTIFACT_LOGICAL_REF_PREFIX)
+                _validate_artifact_id(artifact_id)
+                metadata_path = self._logical_metadata_path(artifact_id)
+                if not metadata_path.exists():
+                    raise ArtifactNotFoundError(text)
+                item = self._read_metadata_file(metadata_path)
+                if item.ref != text or item.artifact_id != artifact_id:
+                    raise ArtifactIntegrityError(f"reference metadata mismatch for {text}")
             else:
                 raise ArtifactMetadataError(f"invalid artifact ref {text!r}")
         _validate_ref(item)
-        content_path, metadata_path = self._paths(item.digest)
+        content_path = self._paths(item.digest)[0]
+        metadata_path = self._metadata_path_for_ref(item)
         if metadata_path.exists():
             stored = self._read_metadata_file(metadata_path)
             if stored.ref != item.ref:
                 raise ArtifactIntegrityError(f"reference metadata mismatch for {item.ref}")
             item = stored
+        elif item.artifact_id is not None:
+            raise ArtifactNotFoundError(item.ref)
         return item, content_path
 
     def read(
@@ -519,7 +624,7 @@ class ArtifactArchive:
         if allowed_scopes is not None and item.scope not in set(allowed_scopes):
             raise ArtifactAccessError(f"scope {item.scope!r} is not allowed")
         self._verify_content(item, content_path)
-        metadata_path = self._paths(item.digest)[1]
+        metadata_path = self._metadata_path_for_ref(item)
         try:
             value = json.loads(metadata_path.read_text(encoding="utf-8"))
         except FileNotFoundError as error:
@@ -539,24 +644,69 @@ class ArtifactArchive:
             return []
         diagnostics: list[ArtifactDiagnostic] = []
         content_paths = set(self.root.glob("sha256/*/*.bin")) if self.root.exists() else set()
-        metadata_paths = set(self.root.glob("sha256/*/*.json")) if self.root.exists() else set()
-        for content_path in sorted(content_paths | metadata_paths):
-            digest = content_path.stem
-            content, metadata = self._paths(digest)
-            if content not in content_paths or metadata not in metadata_paths:
+        legacy_metadata_paths = set(self.root.glob("sha256/*/*.json")) if self.root.exists() else set()
+        logical_metadata_paths = set(self.root.glob("refs/*.json")) if self.root.exists() else set()
+        referenced_content: set[Path] = set()
+
+        for metadata_path in sorted(logical_metadata_paths):
+            logical_ref = ARTIFACT_LOGICAL_REF_PREFIX + metadata_path.stem
+            try:
+                item = self._read_metadata_file(metadata_path)
+                content_path = self._paths(item.digest)[0]
+                if content_path not in content_paths:
+                    diagnostics.append(ArtifactDiagnostic(
+                        "dangling_ref",
+                        item.ref,
+                        "logical artifact metadata has no content blob",
+                        str(metadata_path),
+                        repairable=False,
+                    ))
+                    continue
+                referenced_content.add(content_path)
+                self._verify_content(item, content_path)
+            except ArtifactArchiveError as error:
                 diagnostics.append(ArtifactDiagnostic(
-                    "orphan_archive" if content in content_paths else "dangling_ref",
+                    error.code,
+                    logical_ref,
+                    str(error),
+                    str(metadata_path),
+                    repairable=False,
+                ))
+
+        for metadata_path in sorted(legacy_metadata_paths):
+            digest = metadata_path.stem
+            content_path = self._paths(digest)[0]
+            if content_path not in content_paths:
+                diagnostics.append(ArtifactDiagnostic(
+                    "dangling_ref",
                     ARTIFACT_REF_PREFIX + digest,
-                    "artifact content and metadata are not both present",
-                    str(content_path),
-                    repairable=content in content_paths,
+                    "artifact metadata has no content blob",
+                    str(metadata_path),
+                    repairable=False,
                 ))
                 continue
+            referenced_content.add(content_path)
             try:
-                item = self._read_metadata_file(metadata)
-                self._verify_content(item, content)
+                item = self._read_metadata_file(metadata_path)
+                self._verify_content(item, content_path)
             except ArtifactArchiveError as error:
-                diagnostics.append(ArtifactDiagnostic(error.code, ARTIFACT_REF_PREFIX + digest, str(error), str(content_path)))
+                diagnostics.append(ArtifactDiagnostic(
+                    error.code,
+                    ARTIFACT_REF_PREFIX + digest,
+                    str(error),
+                    str(content_path),
+                    repairable=False,
+                ))
+
+        for content_path in sorted(content_paths - referenced_content):
+            digest = content_path.stem
+            diagnostics.append(ArtifactDiagnostic(
+                "orphan_archive",
+                ARTIFACT_REF_PREFIX + digest,
+                "artifact content has no metadata reference",
+                str(content_path),
+                repairable=True,
+            ))
         return diagnostics
 
     def repair_orphans(self, *, adopt: bool = False) -> list[ArtifactDiagnostic]:
@@ -597,7 +747,9 @@ class ArtifactArchive:
 
 
 __all__ = [
+    "ARTIFACT_LOGICAL_REF_PREFIX",
     "ARTIFACT_REF_PREFIX",
+    "ARTIFACT_REF_PREFIXES",
     "ARTIFACT_SCHEMA_VERSION",
     "ArtifactAccessError",
     "ArtifactArchive",
@@ -609,4 +761,5 @@ __all__ = [
     "ArtifactPage",
     "ArtifactRef",
     "ArtifactSizeLimitError",
+    "is_artifact_ref",
 ]

@@ -14,6 +14,9 @@
 4. 终端对 `bounded_ref`、`archive_page`、`archive_read_error` 的有界正文优先显示。
 5. 多 invocation 的 run metrics 起点、首 token 和 terminal duration。
 6. canonical facts、artifact bytes、metadata、ref、digest 的不可变性与 closed-store/integrity fail-closed。
+7. 新工具结果归档的逻辑 artifact identity 与内容 `sha256` 分离；相同内容跨 session 可以复用 blob，但不能复用带 session 授权的 metadata/ref。
+8. canonical tool-result serialization boundary 改为对规范化后的最终 JSON UTF-8 字节数执行公共 `16 MiB`（16,777,216 字节）上限；二进制先规范化为 Base64 envelope 后再计数。
+9. artifact 内容、逻辑 metadata 和 runtime-store mirror 的发布失败必须回滚或明确进入 recovery-required，不能向 canonical event 或 Provider 投放不可读的成功 ref。
 
 “真实本地消费者”至少包括两个层次：
 
@@ -30,6 +33,8 @@
 - 让 terminal renderer 对已知归档结果采用 typed、正文优先、有界格式化，避免把转义 JSON metadata 当作唯一可读内容。
 - 修复 run 级 metrics 的首次 invocation 起点、显式 first-token 事件和 terminal duration，并保留 invocation 级耗时。
 - 增加 P0 reducer、Session/Model Replay、ArchiveRead、双 Provider 最终 SDK 边界、CLI 新进程、resume、terminal、metrics 和 immutability 回归测试；记录真实本地消费者证据，不保存 secrets/raw body。
+- 修复工具结果的公共序列化边界：所有内置工具、MCP、子 Agent、特殊工具和 durable boundary 共享同一套“先规范化、再按最终 UTF-8 JSON 字节计数”的 16 MiB（16,777,216 字节）契约，并补充二进制膨胀、Unicode 和不可序列化值测试。
+- 为工具结果归档增加 session/run/parent-lineage/event/call/tool/body-digest/rewrite-version 派生的逻辑 artifact identity；底层 content blob 可按 sha256 去重，但每个逻辑 ref 的 metadata 独立授权，并在 metadata/mirror 失败时撤销未完成发布。
 
 ## Capabilities
 
@@ -45,5 +50,5 @@
 
 - 影响 `src/mini_claude/agent.py`、`runtime_lifecycle.py`、`artifact_archive.py`、`archive_capability.py`、`archive_projection.py`、`ui.py` 以及 `projections/` 下的 runtime、session、model replay、provider context 和 metrics 投影。
 - 影响 `src/mini_claude/tests/` 的回归测试、最终本地 fake SDK/loopback consumer、CLI 子进程夹具和临时 session 输出。
-- 不改变 `D:/workspace/maka`，不扩大普通子 Agent allowlist，不提高全局工具结果阈值，不删除或重写历史 artifact/event。
+- 不改变 `D:/workspace/maka`，不扩大普通子 Agent allowlist；将公共工具结果安全上限统一为 16 MiB（16,777,216）canonical JSON UTF-8 字节，但不把它当作 Provider 容量方案；不删除或重写历史 artifact/event，旧 `artifact:sha256:*` ref 保持只读兼容。
 - 本批次不执行 commit、push、MR、merge、release、deployment 或真实外部 Provider 调用。

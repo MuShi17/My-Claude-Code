@@ -16,7 +16,10 @@ from .artifact_archive import (
     ArtifactPage,
     ArtifactRef,
     ArtifactSizeLimitError,
+    is_artifact_ref,
 )
+from .redaction import RedactionPolicy
+from .tool_result import MAX_TOOL_RESULT_BYTES, validate_tool_result_size
 
 ARCHIVE_READ_TOOL_NAME = "ArchiveRead"
 ARCHIVE_READ_DEFAULT_LIMIT = 6_000
@@ -24,6 +27,7 @@ ARCHIVE_READ_MAX_LIMIT = 7_500
 ARCHIVE_PREVIEW_CHARS = 4_000
 ARCHIVE_ALLOWED_SCOPES = frozenset({"tool-result", "runtime"})
 ARCHIVE_QUERY_MAX_FIELDS = 16
+ARCHIVE_REWRITE_VERSION = 1
 ARCHIVE_READ_INSTRUCTIONS = (
     'This result is archived but still readable. Call ArchiveRead with '
     'operation "inspect" first, or operation "read" with the provided ref, '
@@ -127,6 +131,8 @@ def _public_metadata(item: ArtifactRef, metadata: Mapping[str, Any]) -> dict[str
             "session_id",
             "run_id",
             "parent_run_id",
+            "runtime_event_id",
+            "rewrite_version",
             "lineage",
         ):
             value = nested.get(key)
@@ -165,6 +171,8 @@ class ToolResultArchiveCapability:
             raise ValueError("invalid ArchiveRead limits")
         self.archive = archive
         self.session_id = str(session_id)
+        self._run_id = str(run_id) if run_id else None
+        self._parent_run_id = str(parent_run_id) if parent_run_id else None
         self.default_limit = int(default_limit)
         self.max_limit = int(max_limit)
         self.allowed_scopes = frozenset(str(item) for item in allowed_scopes)
@@ -195,7 +203,7 @@ class ToolResultArchiveCapability:
                     },
                     "ref": {
                         "type": "string",
-                        "description": "The artifact:sha256:<digest> reference.",
+                        "description": "The artifact reference supplied by a tool result.",
                     },
                     "offset": {
                         "type": "integer",
@@ -232,8 +240,10 @@ class ToolResultArchiveCapability:
     def grant_run(self, run_id: str | None, parent_run_id: str | None = None) -> None:
         if run_id:
             self._allowed_run_ids.add(str(run_id))
+            self._run_id = str(run_id)
         if parent_run_id:
             self._allowed_run_ids.add(str(parent_run_id))
+            self._parent_run_id = str(parent_run_id)
 
     def register_ref(self, ref: ArtifactRef | Mapping[str, Any] | str) -> str:
         """Authorize a ref observed in the current canonical lineage.
@@ -246,10 +256,93 @@ class ToolResultArchiveCapability:
         value = ref.ref if isinstance(ref, ArtifactRef) else (
             str(ref.get("ref")) if isinstance(ref, Mapping) else str(ref)
         )
-        if not value.startswith("artifact:sha256:"):
-            raise ArchiveReadInputError("ref must use the artifact:sha256 prefix")
+        if not is_artifact_ref(value):
+            raise ArchiveReadInputError("ref must use a supported artifact prefix")
         self._authorized_refs.add(value)
         return value
+
+    def archive_result(
+        self,
+        value: Any,
+        *,
+        call_id: str | None = None,
+        tool_name: str | None = None,
+        runtime_event_id: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> ArtifactRef:
+        """Persist a complete canonical result for a later projection.
+
+        This is an internal projection operation.  The model-facing
+        ``ArchiveRead`` tool remains read-only and page bounded.
+        """
+
+        validate_tool_result_size(value, tool_name or "tool-result")
+        self._ensure_store_open()
+        archive_value = value
+        extra = dict(metadata or {})
+
+        def set_scoped_metadata(name: str, scoped_value: Any) -> None:
+            existing = extra.get(name)
+            if existing is not None and str(existing) != str(scoped_value):
+                raise ValueError(f"archive metadata {name} conflicts with capability scope")
+            extra[name] = scoped_value
+
+        set_scoped_metadata("session_id", self.session_id)
+        if call_id is not None:
+            set_scoped_metadata("call_id", str(call_id))
+        if tool_name is not None:
+            set_scoped_metadata("tool_name", str(tool_name))
+        if runtime_event_id is not None:
+            set_scoped_metadata("runtime_event_id", str(runtime_event_id))
+        set_scoped_metadata("rewrite_version", ARCHIVE_REWRITE_VERSION)
+        if self._run_id is not None:
+            set_scoped_metadata("run_id", self._run_id)
+        if self._parent_run_id is not None:
+            set_scoped_metadata("parent_run_id", self._parent_run_id)
+        if (
+            isinstance(value, Mapping)
+            and value.get("kind") == "binary_tool_result"
+            and value.get("encoding") == "base64"
+            and isinstance(value.get("data"), str)
+        ):
+            try:
+                archive_value = base64.b64decode(value["data"], validate=True)
+            except (ValueError, TypeError):
+                raise ValueError("invalid binary tool result encoding")
+            extra.setdefault("canonical_kind", "binary_tool_result")
+        if isinstance(archive_value, str):
+            mime_type = "text/plain"
+            encoding = "utf-8"
+        elif isinstance(archive_value, bytes):
+            mime_type = "application/octet-stream"
+            encoding = "binary"
+        else:
+            mime_type = "application/json"
+            encoding = "binary"
+        policy = RedactionPolicy(
+            max_inline_bytes=MAX_TOOL_RESULT_BYTES,
+            max_string_chars=MAX_TOOL_RESULT_BYTES,
+        )
+        logical_identity = {
+            "session_id": self.session_id,
+            "run_id": self._run_id or "",
+            "parent_run_id": self._parent_run_id or "",
+            "runtime_event_id": str(runtime_event_id or ""),
+            "tool_call_id": str(call_id or ""),
+            "tool_name": str(tool_name or "tool-result"),
+            "rewrite_version": ARCHIVE_REWRITE_VERSION,
+        }
+        archived = self.archive.archive(
+            archive_value,
+            mime_type=mime_type,
+            encoding=encoding,
+            scope="tool-result",
+            redaction_policy=policy,
+            metadata=extra,
+            logical_identity=logical_identity,
+        )
+        self.register_ref(archived.ref)
+        return archived
 
     def derive(
         self,
@@ -273,7 +366,10 @@ class ToolResultArchiveCapability:
             max_limit=self.max_limit,
         )
         child._authorized_refs = set(self._authorized_refs)
-        self.grant_run(run_id, parent_run_id)
+        if run_id:
+            self._allowed_run_ids.add(str(run_id))
+        if parent_run_id:
+            self._allowed_run_ids.add(str(parent_run_id))
         return child
 
     def _ensure_store_open(self) -> None:
@@ -518,6 +614,7 @@ class ToolResultArchiveCapability:
             "redaction_version",
             "created_at",
             "metadata_version",
+            "artifact_id",
         }
         requested = list(fields) if fields is not None else sorted(allowed)
         if any(field not in allowed for field in requested):
@@ -603,6 +700,7 @@ __all__ = [
     "ARCHIVE_READ_TOOL_NAME",
     "ARCHIVE_READ_INSTRUCTIONS",
     "ARCHIVE_QUERY_MAX_FIELDS",
+    "ARCHIVE_REWRITE_VERSION",
     "ArchiveCapabilityError",
     "ArchiveReadInputError",
     "ArchiveReadRangeError",

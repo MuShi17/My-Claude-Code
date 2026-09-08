@@ -188,3 +188,60 @@ Provider hydration, terminal formatting, historical deduplication and ArchiveRea
 
 - **WHEN** an old valid `bounded_ref` lacks a `read_instructions` field
 - **THEN** the Provider projection derives a safe default ArchiveRead instruction without rewriting the historical artifact
+
+### Requirement: Canonical tool-result serialization SHALL use a normalized UTF-8 byte boundary
+
+All tool-result ingress paths SHALL normalize the result before measuring it. Raw `bytes` SHALL become a JSON-safe Base64 binary envelope, and the measured value SHALL be the compact canonical JSON UTF-8 serialization, including JSON string quoting and escaping. The shared public limit SHALL be `16,777,216` bytes (16 MiB); a result at or below the limit SHALL pass and a result above it or not serializable SHALL produce a bounded `result_too_large` or `result_not_serializable` error without publishing an archive ref.
+
+#### Scenario: Binary Base64 expansion is included in the boundary
+
+- **WHEN** a binary result whose raw UTF-8 replacement length is below 16,777,216 expands beyond 16,777,216 after Base64 envelope normalization and canonical JSON serialization
+- **THEN** the durable boundary rejects it as `result_too_large`, records no successful artifact ref, and does not expose the binary payload in the error
+
+#### Scenario: Unicode and JSON escaping use UTF-8 byte size
+
+- **WHEN** a result contains CJK, emoji, control characters, or JSON escaping that changes its serialized byte length
+- **THEN** the boundary decision uses the exact normalized canonical JSON UTF-8 byte count rather than Unicode character count
+
+#### Scenario: An exact byte boundary is accepted
+
+- **WHEN** the normalized canonical JSON serialization is exactly 16,777,216 bytes
+- **THEN** the result passes the common boundary and remains available as the complete canonical result
+
+#### Scenario: A non-serializable result is bounded
+
+- **WHEN** a tool returns a circular or otherwise non-JSON-serializable value
+- **THEN** the boundary returns a stable `result_not_serializable` error without using `str(value)` as an under-counting substitute
+
+### Requirement: New tool-result artifacts SHALL separate logical identity from content digest
+
+New capability-owned tool-result artifacts SHALL derive a logical `artifact_id` from session/run/parent-lineage/event/call/tool/body-digest/rewrite identity and SHALL expose a ref that is distinct from the content `sha256`. The underlying content blob MAY be shared by digest, but logical metadata SHALL remain separate and authorization SHALL validate the logical ref's session and lineage metadata. Legacy `artifact:sha256:<digest>` refs SHALL remain readable through their existing metadata without being rewritten.
+
+#### Scenario: Identical content is archived in two sessions
+
+- **WHEN** session A and session B archive the same tool-result body
+- **THEN** they receive different logical refs with the same content digest, each session can read its own ref, and neither session can read the other's ref
+
+#### Scenario: A logical ref fails integrity validation
+
+- **WHEN** a logical ref's metadata names a different digest/size than its content or its ref identity does not match metadata
+- **THEN** inspection fails with a bounded integrity/metadata error and no page is returned
+
+### Requirement: Artifact publication SHALL fail closed and roll back incomplete local state
+
+Artifact publication SHALL return a successful ref only after local content, logical metadata, and any runtime-store metadata mirror have succeeded. If a later publication stage fails, files newly created by that call SHALL be removed where possible; a shared pre-existing content blob SHALL NOT be deleted. The failure SHALL never be converted into a successful canonical or Provider placeholder.
+
+#### Scenario: Metadata commit fails after content write
+
+- **WHEN** writing logical metadata fails after a new content blob was staged or published
+- **THEN** the call returns an artifact metadata error, no successful ref is available, and the new content is absent or explicitly marked recovery-required
+
+#### Scenario: Runtime-store mirror fails after local publication
+
+- **WHEN** the runtime-store metadata mirror fails after local publication
+- **THEN** the call does not return a ref; newly-created local logical metadata is rolled back without deleting a pre-existing shared blob
+
+#### Scenario: ArchiveRead output is never recursively archived
+
+- **WHEN** a projected `ArchiveRead` page or error is processed again
+- **THEN** it is validated and passed through as a bounded result, and no new artifact ref is created from its envelope

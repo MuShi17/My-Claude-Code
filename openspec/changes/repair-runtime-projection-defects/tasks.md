@@ -79,3 +79,26 @@
 - [ ] 8.1 用真实父 Agent/子 Agent 新进程场景验证 derived capability 的 scope、普通 child allowlist、汇总 envelope 和 store close barrier
 - [ ] 8.2 扩展历史 session 样本和跨版本 projection compatibility，覆盖更多旧 bounded_ref/read_instructions 形状
 - [ ] 8.3 评估将 Maka 对齐 capability 与本 change integrity requirements 同步到 `openspec/specs/` 的独立变更
+
+## 9. P0 Artifact identity and canonical serialization follow-up
+
+- [x] 9.1 先补跨 session 同内容、逻辑 ref/共享 blob、旧 hash-only ref 兼容和 metadata identity mismatch 回归测试
+- [x] 9.2 实现统一 normalized canonical JSON UTF-8 byte counter：`bytes` 先转 Base64 envelope，公共上限为 16 MiB（16,777,216 字节），覆盖精确边界、+1、CJK/emoji/control/escaping、二进制膨胀和不可序列化值
+- [x] 9.3 让 DurableToolBoundary、普通工具/MCP/特殊工具出口和 `archive_result` 统一复用 byte boundary；超限/序列化失败不得写入 artifact 或 canonical success ref
+- [x] 9.4 为 logical metadata 增加原子发布与失败回滚；覆盖本地 metadata fault、runtime-store mirror fault、共享 blob 不误删和 recovery diagnostic
+- [x] 9.5 让 capability、archive projection、terminal projection 和 ArchiveRead 接受新 logical ref，并验证 ArchiveRead/ArchiveRead page 不会产生 ref 套 ref
+- [x] 9.6 运行 P0 focused tests、fresh-process/local consumer 回归、全量 Python tests、compileall、OpenSpec strict validate 和 `git diff --check`；回写本任务段的证据与残余 P1 边界
+
+验证记录（2026-09-08）：
+
+- P0 focused tests：`python -m pytest src\\mini_claude\\tests\\test_tool_result_boundary.py src\\mini_claude\\tests\\test_archive_capability.py src\\mini_claude\\tests\\test_archive_projection.py src\\mini_claude\\tests\\test_compaction_artifacts.py -q --disable-warnings --tb=short`，64 passed。
+- fresh-process/local consumer 回归及全量 Python tests：`python -m pytest src\\mini_claude\\tests -q --disable-warnings --tb=short`，286 passed。
+- `python -m compileall -q src\\mini_claude` 通过；两个 change 均通过 `openspec validate ... --type change --strict --no-interactive`；`git diff --check` 通过（仅有 Git 的换行符提示）。
+- 根目录 `python -m pytest -q` 未作为通过证据：benchmark 测试收集阶段缺少可选依赖 `harbor`（`ModuleNotFoundError`），与本次 Python 包实现无关。
+- 仍保留的 P1 边界：8.1–8.3 和 10.1–10.3 未在本批次实现；包括完整 Provider request envelope 容量校准、真正的增量/range 读取，以及 ArchiveRead 最终 JSON envelope 的完整响应字节预算。
+
+## 10. Deferred P1 scope
+
+- [ ] 10.1 将完整 Provider request envelope（system/tools/output reserve）纳入独立容量校准，而不是只统计 message list
+- [ ] 10.2 评估 workspace `read_file` 的真正增量读取和 ArchiveRead 的 range read，避免分页时重复加载/校验完整 payload
+- [ ] 10.3 对 ArchiveRead 最终 JSON envelope 做完整响应字节上限控制，必要时按 page 内容动态缩短

@@ -102,9 +102,10 @@ def test_archive_fault_does_not_return_a_reference(tmp_path: Path, fault_point: 
     with pytest.raises(RuntimeError, match=f"fixture fault at {fault_point}"):
         archive.archive("x" * 100)
     assert list((tmp_path / "artifacts").rglob("*.json")) == []
+    assert list((tmp_path / "artifacts").rglob("*.bin")) == []
 
 
-def test_durable_tool_archives_before_emitting_bounded_outcome(tmp_path: Path):
+def test_durable_tool_keeps_large_result_before_provider_projection(tmp_path: Path):
     sink = RecordingEventSink()
     archive = ArtifactArchive(tmp_path / "artifacts")
     context = _context()
@@ -125,13 +126,13 @@ def test_durable_tool_archives_before_emitting_bounded_outcome(tmp_path: Path):
         executor=lambda: "line\n" * 1000,
     ))
     assert result.success is True
-    assert result.result["kind"] == "bounded_ref"
-    assert archive.inspect(result.result["ref"]).size_bytes == result.result["size_bytes"]
+    assert result.result == "line\n" * 1000
+    assert not list((tmp_path / "artifacts").rglob("*"))
     outcomes = [event for event in sink.events if event.kind == "tool_outcome"]
-    assert outcomes[-1].content["result"]["ref"] == result.result["ref"]
+    assert outcomes[-1].content["result"] == result.result
 
 
-def test_durable_tool_archive_failure_is_bounded_and_has_no_dangling_ref(tmp_path: Path):
+def test_durable_tool_does_not_touch_archive_for_a_result_under_common_limit(tmp_path: Path):
     sink = RecordingEventSink()
     archive = ArtifactArchive(tmp_path / "artifacts", fault_hook=FaultInjector("artifact.write"))
     context = _context()
@@ -151,12 +152,12 @@ def test_durable_tool_archive_failure_is_bounded_and_has_no_dangling_ref(tmp_pat
         permission="allow",
         executor=lambda: "x" * 1000,
     ))
-    assert result.success is False
-    assert result.result["kind"] == "archive_error"
-    assert "ref" not in result.result
+    assert result.success is True
+    assert result.result == "x" * 1000
+    assert not list((tmp_path / "artifacts").rglob("*"))
 
 
-def test_durable_tool_without_archive_capability_fails_closed(tmp_path: Path):
+def test_durable_tool_without_archive_capability_keeps_first_result_inline(tmp_path: Path):
     sink = RecordingEventSink()
     archive = ArtifactArchive(tmp_path / "artifacts")
     context = _context()
@@ -173,14 +174,8 @@ def test_durable_tool_without_archive_capability_fails_closed(tmp_path: Path):
         permission="allow",
         executor=lambda: "x" * 1000,
     ))
-    assert result.success is False
-    assert result.result == {
-        "kind": "archive_error",
-        "error_type": "ArchiveCapabilityUnavailable",
-        "message": "large tool result cannot be referenced without ArchiveRead capability",
-        "size_bytes": 1000,
-        "tool_name": "read_file",
-    }
+    assert result.success is True
+    assert result.result == "x" * 1000
     assert list((tmp_path / "artifacts").rglob("*")) == []
 
 

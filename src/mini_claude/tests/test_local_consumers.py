@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
 import json
 import os
 import subprocess
@@ -32,24 +31,13 @@ from mini_claude.artifact_archive import ArtifactArchive
 from mini_claude.runtime_event import canonical_json_bytes
 from mini_claude.runtime_lifecycle import DurableToolBoundary
 from mini_claude.runtime_store import SQLiteRuntimeStore
-from mini_claude.tools import _read_file, _truncate_result
+from mini_claude.tool_result import MAX_TOOL_RESULT_BYTES
 
 
 LARGE_CONTENT = "内容🙂\n" * 4_500
-CLI_LARGE_CONTENT = "内容🙂\n" * 100_000
-
-
-def _expected_read_file_archive_ref(path: str) -> str:
-    """Reconstruct the deterministic archive ref for the CLI fixture.
-
-    The default fixture model has enough budget to receive the bounded
-    50,000-character read_file result in full.  The loopback model still needs
-    a known ref to exercise the subsequent ArchiveRead consumer path.
-    """
-
-    result = _truncate_result(_read_file({"file_path": path}))
-    digest = hashlib.sha256(result.encode("utf-8")).hexdigest()
-    return f"artifact:sha256:{digest}"
+# The numbered read_file rendering is about 18 UTF-8 bytes per input line;
+# keep this fixture over the common 16 MiB canonical-result cap.
+CLI_LARGE_CONTENT = "内容🙂\n" * (MAX_TOOL_RESULT_BYTES // 18 + 100_000)
 
 
 def _sse_event(event_type: str, payload: dict[str, Any]) -> bytes:
@@ -527,6 +515,7 @@ def test_actual_agent_sdk_receives_stale_and_archive_page_without_terminal_subst
             assert stale["kind"] == "bounded_ref"
             assert "preview" not in stale
             assert "ArchiveRead" in stale["read_instructions"]
+            ref = stale["ref"]
 
             boundary = DurableToolBoundary(
                 agent._runtime_emitter,
@@ -539,7 +528,7 @@ def test_actual_agent_sdk_receives_stale_and_archive_page_without_terminal_subst
                 name="ArchiveRead",
                 arguments={
                     "operation": "read",
-                    "ref": result.result["ref"],
+                    "ref": ref,
                     "offset": 0,
                     "limit": 32,
                 },
@@ -547,7 +536,7 @@ def test_actual_agent_sdk_receives_stale_and_archive_page_without_terminal_subst
                     "ArchiveRead",
                     {
                         "operation": "read",
-                        "ref": result.result["ref"],
+                        "ref": ref,
                         "offset": 0,
                         "limit": 32,
                     },
@@ -602,6 +591,7 @@ def test_actual_agent_sdk_without_archive_capability_fails_closed(
         )
         try:
             agent._archive_capability = None
+            agent.effective_window = 400
             agent._refresh_provider_context_from_canonical()
             captured: list[dict[str, Any]] = []
             client = _provider_client(provider, captured)
@@ -774,29 +764,34 @@ def test_archive_and_canonical_bytes_are_unchanged_by_all_local_projections(
             tmp_path, "openai"
         )
         try:
-            ref = result.result["ref"]
-            artifact_before = archive.read(ref, max_bytes=64 * 1024)
-            metadata_before = canonical_json_bytes(archive.metadata(ref))
-            sha256_before = archive.inspect(ref).sha256
+            assert isinstance(result.result, str)
             events_before = tuple(
                 (ordinal, canonical_json_bytes(event.to_dict()))
                 for ordinal, event in store.read_event_records()
             )
-            ref_before = ref
             agent._refresh_provider_context_from_canonical()
             provider_messages_before = deepcopy(agent._openai_messages)
-            assert format_terminal_tool_result(
-                result.result, agent._archive_capability
-            ) is not None
+            assert format_terminal_tool_result(result.result, agent._archive_capability) is None
+            agent.effective_window = 400
+            agent._refresh_provider_context_from_canonical()
+            rescue = _provider_tool_content("openai", agent._openai_messages)
+            rescue_value = json.loads(rescue)
+            assert rescue_value["kind"] == "bounded_ref"
+            ref = rescue_value["ref"]
             assert agent._archive_capability is not None
+            artifact_before = archive.read(ref, max_bytes=64 * 1024)
+            metadata_before = canonical_json_bytes(archive.metadata(ref))
+            sha256_before = archive.inspect(ref).sha256
+            ref_before = ref
+            assert format_terminal_tool_result(
+                rescue_value, agent._archive_capability
+            ) is not None
             page = json.loads(
                 agent._archive_capability.execute(
                     {"operation": "read", "ref": ref, "offset": 0, "limit": 16}
                 )
             )
             assert page["kind"] == "archive_page"
-            agent.effective_window = 400
-            agent._refresh_provider_context_from_canonical()
 
             assert ref == ref_before
             assert archive.read(ref, max_bytes=64 * 1024) == artifact_before
@@ -870,32 +865,18 @@ class _LoopbackArchiveFollowupHandler(BaseHTTPRequestHandler):
                 "read_file", arguments, call_id="call-cli-read"
             )
         elif request_number == 2:
-            ref = ""
-            for message in payload.get("messages", []):
-                if message.get("role") != "tool":
-                    continue
-                try:
-                    value = json.loads(message.get("content", ""))
-                except (TypeError, ValueError):
-                    continue
-                if isinstance(value, dict) and isinstance(value.get("ref"), str):
-                    ref = value["ref"]
-                    break
-            if not ref:
-                ref = _expected_read_file_archive_ref(self.source_path)
-            offset = 0 if self.mode == "page" else 999_999
+            limit = 6_000 if self.mode == "page" else 0
             arguments = json.dumps(
                 {
-                    "operation": "read",
-                    "ref": ref,
-                    "offset": offset,
-                    "limit": 32,
+                    "file_path": self.source_path,
+                    "offset": 0,
+                    "limit": limit,
                 },
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
             response = _openai_stream_body_with_tool(
-                "ArchiveRead", arguments, call_id="call-cli-archive"
+                "read_file", arguments, call_id="call-cli-page"
             )
         else:
             response = _openai_stream_body("done")
@@ -1007,7 +988,6 @@ def test_real_cli_subprocess_uses_loopback_protocol_and_resume(tmp_path: Path):
         first_stderr = first.stderr.decode("utf-8", errors="replace")
         assert first.returncode == 0, first_stderr + first_stdout
         assert "内容🙂" in first_stdout
-        assert "ArchiveRead" in first_stdout
         assert len(_LoopbackProtocolHandler.requests) == 2
         assert any(cli_home.joinpath(".mini-claude").rglob("session.v2.json"))
 
@@ -1095,10 +1075,9 @@ def test_real_cli_subprocess_displays_archive_page_and_error(
         assert len(_LoopbackArchiveFollowupHandler.requests) == 3
         if mode == "page":
             assert "内容🙂" in stdout
-            assert "next_offset=32" in stdout
-            assert "has_more=true" in stdout
+            assert "result_too_large" in stdout
         else:
-            assert "Error [invalid_range]" in stdout
+            assert "read_file limit" in stdout
         assert "Traceback" not in stdout
     finally:
         server.shutdown()

@@ -106,6 +106,8 @@ def redact_payload(
             return [visit(child, _path(path, index)) for index, child in enumerate(item)]
         replay_payload = (
             path == "content.text"
+            or path == "content.result"
+            or path.startswith("content.result.")
             or path.startswith("actions.compaction.context_messages")
             or path.startswith("actions.context_transition.replacements")
         )

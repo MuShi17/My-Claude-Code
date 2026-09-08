@@ -1,10 +1,11 @@
 """Provider and terminal projections for archived tool results.
 
-The canonical event keeps a bounded ``ArtifactRef``.  This module decides
+The canonical event keeps the complete safe result.  This module decides
 which consumer-visible view is safe for the current moment: complete content
 for a newly completed result when the request can hold it, a bounded prefix
 when capacity is insufficient, and an actionable placeholder for stale
-history.  None of these projections mutate the canonical event.
+history.  Legacy bounded references remain readable.  None of these
+projections mutate the canonical event.
 """
 
 from __future__ import annotations
@@ -14,10 +15,11 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from .archive_capability import (
+    ARCHIVE_READ_TOOL_NAME,
     ARCHIVE_PREVIEW_CHARS,
     ToolResultArchiveCapability,
 )
-from .artifact_archive import ArtifactArchiveError
+from .artifact_archive import ArtifactArchiveError, is_artifact_ref
 from .runtime_event import canonical_json_bytes
 
 
@@ -29,10 +31,15 @@ _ERROR_CODES = {
 }
 
 
-def _capacity_error(ref: str) -> dict[str, Any]:
+def _capacity_error(
+    ref: str,
+    *,
+    message: str = "tool result does not fit the current Provider capacity",
+) -> dict[str, Any]:
     return {
         "kind": "archive_read_error",
         "error_type": "capacity_exhausted",
+        "message": message,
         "ref": ref,
     }
 
@@ -71,6 +78,14 @@ def _archive_error(ref: str, error: BaseException) -> dict[str, Any]:
     }
 
 
+def _capability_unavailable() -> dict[str, Any]:
+    return {
+        "kind": "archive_read_error",
+        "error_type": "capability_unavailable",
+        "message": "ArchiveRead capability is unavailable",
+    }
+
+
 def _bounded_ref_value(value: Any) -> Mapping[str, Any] | None:
     candidate: Any = value
     if isinstance(candidate, str):
@@ -83,7 +98,7 @@ def _bounded_ref_value(value: Any) -> Mapping[str, Any] | None:
     if candidate.get("kind") != "bounded_ref":
         return None
     ref = candidate.get("ref")
-    if not isinstance(ref, str) or not ref.startswith("artifact:sha256:"):
+    if not is_artifact_ref(ref):
         return None
     return candidate
 
@@ -96,6 +111,106 @@ def _structured_value(value: Any) -> Mapping[str, Any] | None:
         except (TypeError, ValueError):
             return None
     return candidate if isinstance(candidate, Mapping) else None
+
+
+def _tool_names_by_call_id(
+    messages: Sequence[Mapping[str, Any]],
+) -> dict[str, str]:
+    """Resolve tool names without relying on provider-specific message shape."""
+
+    names: dict[str, str] = {}
+    for message in messages:
+        if message.get("role") != "assistant":
+            continue
+        calls = message.get("tool_calls")
+        if not isinstance(calls, list):
+            continue
+        for call in calls:
+            if not isinstance(call, Mapping):
+                continue
+            call_id = call.get("id")
+            name = call.get("name")
+            if isinstance(call_id, str) and call_id and isinstance(name, str) and name:
+                names[call_id] = name
+
+    # Neutral replay normally has the assistant call metadata.  The fallback
+    # keeps the projector useful for already-normalized tool messages that
+    # retain their provider-neutral ``name`` field but no longer carry calls.
+    for message in messages:
+        if message.get("role") != "tool":
+            continue
+        call_id = message.get("tool_call_id")
+        name = message.get("name")
+        if (
+            isinstance(call_id, str)
+            and call_id
+            and isinstance(name, str)
+            and name
+        ):
+            names.setdefault(call_id, name)
+    return names
+
+
+def _archive_read_capacity_error(value: Any) -> dict[str, Any]:
+    """Return a bounded, non-recursive error for an oversized ArchiveRead page."""
+
+    structured = _structured_value(value)
+    ref = ""
+    if structured is not None:
+        candidate_ref = structured.get("ref")
+        if is_artifact_ref(candidate_ref):
+            ref = candidate_ref
+    result = _capacity_error(
+        ref,
+        message=(
+            "ArchiveRead result does not fit the current Provider capacity; "
+            "retry with a smaller limit"
+        ),
+    )
+    if structured is not None:
+        operation = structured.get("operation")
+        if isinstance(operation, str) and operation:
+            result["operation"] = operation
+        offset = structured.get("offset")
+        if isinstance(offset, int) and not isinstance(offset, bool) and offset >= 0:
+            result["offset"] = offset
+        unit = structured.get("unit")
+        if unit in {"chars", "bytes"}:
+            result["unit"] = unit
+    return result
+
+
+def _project_archive_read_result(
+    projected: list[dict[str, Any]],
+    index: int,
+    value: Any,
+    capability: ToolResultArchiveCapability | None,
+    *,
+    budget_bytes: int | None,
+    size_fn: Callable[[Sequence[Mapping[str, Any]]], int] | None,
+) -> Any:
+    """Pass through bounded ArchiveRead output without creating another ref."""
+
+    parsed = _bounded_ref_value(value)
+    if parsed is not None:
+        ref = str(parsed["ref"])
+        if capability is None:
+            return _archive_error(
+                ref,
+                RuntimeError("ArchiveRead capability is unavailable"),
+            )
+        try:
+            # A historical ArchiveRead bounded_ref may be missing a hint, but
+            # its original ref must still be validated before reuse.  This
+            # performs no archive write and therefore cannot create ref -> ref.
+            capability.register_ref(ref)
+            capability.inspect(ref)
+        except (ArtifactArchiveError, RuntimeError, ValueError, TypeError) as error:
+            return _archive_error(ref, error)
+
+    if _fits(projected, index, value, budget_bytes, size_fn):
+        return value
+    return _archive_read_capacity_error(value)
 
 
 def _value_size(value: Any) -> int:
@@ -129,25 +244,44 @@ def _fresh_tool_call_ids(messages: Sequence[Mapping[str, Any]]) -> set[str]:
             continue
         return set()
 
-    index = last_tool_index
-    result_ids: set[str] = set()
-    while index >= 0 and messages[index].get("role") == "tool":
-        value = messages[index].get("tool_call_id")
-        if isinstance(value, str) and value:
-            result_ids.add(value)
-        index -= 1
-    if index < 0 or messages[index].get("role") != "assistant":
+    # One user turn can contain several completed Provider steps.  Only the
+    # last contiguous tool-result group is active; aggregating all results
+    # since the user boundary and comparing them with the first assistant
+    # call group makes the newest group look stale immediately.
+    group_start = last_tool_index
+    while group_start > 0 and messages[group_start - 1].get("role") == "tool":
+        group_start -= 1
+
+    result_ids = {
+        str(message.get("tool_call_id"))
+        for message in messages[group_start : last_tool_index + 1]
+        if isinstance(message.get("tool_call_id"), str)
+        and message.get("tool_call_id")
+    }
+    if not result_ids:
         return set()
-    calls = messages[index].get("tool_calls")
+
+    assistant_index = group_start - 1
+    while assistant_index >= 0 and messages[assistant_index].get("role") != "assistant":
+        message = messages[assistant_index]
+        if message.get("role") == "user" and not message.get("context_type"):
+            return set()
+        assistant_index -= 1
+    if assistant_index < 0:
+        return set()
+    calls = messages[assistant_index].get("tool_calls")
     if not isinstance(calls, list):
         return set()
     call_ids = {
         str(call.get("id"))
         for call in calls
-        if isinstance(call, Mapping) and isinstance(call.get("id"), str)
+        if (
+            isinstance(call, Mapping)
+            and isinstance(call.get("id"), str)
+            and call.get("id")
+        )
     }
-    # A partially rendered group is not eligible for first-use hydration.
-    return call_ids if result_ids == call_ids else set()
+    return result_ids if call_ids == result_ids else set()
 
 
 def _replace_message_content(
@@ -228,6 +362,81 @@ def _minimal_placeholder(
     return capability.placeholder(ref, include_metadata=False)
 
 
+def _project_archived_ref(
+    projected: list[dict[str, Any]],
+    index: int,
+    ref: str,
+    capability: ToolResultArchiveCapability,
+    *,
+    first_use: bool,
+    budget_bytes: int | None,
+    preview_chars: int,
+    size_fn: Callable[[Sequence[Mapping[str, Any]]], int] | None,
+) -> Any:
+    """Project one already archived result without changing canonical input."""
+
+    capability.register_ref(ref)
+    metadata = capability.inspect(ref)
+    if not first_use:
+        placeholder = _minimal_placeholder(capability, ref)
+        return (
+            placeholder
+            if _fits(projected, index, placeholder, budget_bytes, size_fn)
+            else _capacity_error(ref)
+        )
+
+    artifact_size = int(metadata.get("size_bytes", 0))
+    if budget_bytes is None or artifact_size <= max(0, budget_bytes):
+        full_value = capability.materialize(ref)
+        if _fits(projected, index, full_value, budget_bytes, size_fn):
+            return full_value
+
+    page = capability.preview(ref, limit=preview_chars)
+    rescue = _capacity_rescue(
+        capability,
+        ref,
+        page,
+        preview_units=preview_chars,
+    )
+    if _fits(projected, index, rescue, budget_bytes, size_fn):
+        return rescue
+
+    # Reduce only the prefix. If even the actionable envelope does not fit,
+    # return a bounded failure instead of a successful ref that cannot be
+    # recovered from this request.
+    page_text = page.get("page")
+    if isinstance(page_text, str) and page.get("unit") in {"chars", "bytes"}:
+        for length in (2_000, 1_000, 512, 256, 128, 64, 0):
+            if length == 0:
+                candidate = _minimal_placeholder(capability, ref)
+            elif page.get("unit") == "chars":
+                short_page = dict(page)
+                short_page["page"] = page_text[:length]
+                short_page["next_offset"] = int(page.get("offset", 0)) + min(
+                    length, len(page_text)
+                )
+                short_page["has_more"] = True
+                candidate = _capacity_rescue(
+                    capability,
+                    ref,
+                    short_page,
+                    preview_units=length,
+                )
+            else:
+                # Re-read binary pages by byte limit. Slicing base64 text
+                # would corrupt the byte-offset contract.
+                short_page = capability.preview(ref, limit=length)
+                candidate = _capacity_rescue(
+                    capability,
+                    ref,
+                    short_page,
+                    preview_units=length,
+                )
+            if _fits(projected, index, candidate, budget_bytes, size_fn):
+                return candidate
+    return _capacity_error(ref)
+
+
 def project_archived_tool_results(
     messages: Sequence[Mapping[str, Any]],
     capability: ToolResultArchiveCapability | None,
@@ -248,116 +457,133 @@ def project_archived_tool_results(
     # copy is deliberate: replay can contain immutable provider argument
     # wrappers (for example mappingproxy/FrozenDict) that are not deepcopyable.
     projected = [dict(message) for message in messages]
+    first_use_ids = _fresh_tool_call_ids(projected)
+    tool_names = _tool_names_by_call_id(projected)
+    preview_chars = max(1, min(int(preview_chars), ARCHIVE_PREVIEW_CHARS))
+
     if capability is None:
         for index, message in enumerate(projected):
-            parsed = _bounded_ref_value(message.get("content"))
-            if parsed is None:
+            if message.get("role") != "tool":
                 continue
-            replacement = _archive_error(
-                str(parsed["ref"]),
-                RuntimeError("ArchiveRead capability is unavailable"),
+            is_archive_read = (
+                tool_names.get(str(message.get("tool_call_id")))
+                == ARCHIVE_READ_TOOL_NAME
             )
-            preview = parsed.get("preview", parsed.get("inline"))
-            if isinstance(preview, str):
-                replacement["preview"] = preview[:preview_chars]
-            if _fits(projected, index, replacement, budget_bytes, size_fn):
-                message["content"] = replacement
+            if is_archive_read:
+                projected[index]["content"] = _project_archive_read_result(
+                    projected,
+                    index,
+                    message.get("content"),
+                    None,
+                    budget_bytes=budget_bytes,
+                    size_fn=size_fn,
+                )
                 continue
-            if isinstance(preview, str):
-                for length in (2_000, 1_000, 512, 256, 128, 64, 0):
-                    candidate = dict(replacement)
-                    if length:
-                        candidate["preview"] = preview[:length]
+            parsed = _bounded_ref_value(message.get("content"))
+            if parsed is not None:
+                ref = str(parsed["ref"])
+                replacement = _archive_error(
+                    ref,
+                    RuntimeError("ArchiveRead capability is unavailable"),
+                )
+                preview = parsed.get("preview", parsed.get("inline"))
+                if isinstance(preview, str):
+                    replacement["preview"] = preview[:preview_chars]
+                if _fits(projected, index, replacement, budget_bytes, size_fn):
+                    projected[index]["content"] = replacement
+                    continue
+                if isinstance(preview, str):
+                    for length in (2_000, 1_000, 512, 256, 128, 64, 0):
+                        candidate = dict(replacement)
+                        if length:
+                            candidate["preview"] = preview[:length]
+                        else:
+                            candidate.pop("preview", None)
+                        if _fits(projected, index, candidate, budget_bytes, size_fn):
+                            projected[index]["content"] = candidate
+                            break
                     else:
-                        candidate.pop("preview", None)
-                    if _fits(projected, index, candidate, budget_bytes, size_fn):
-                        message["content"] = candidate
-                        break
+                        projected[index]["content"] = _capacity_error(ref)
                 else:
-                    message["content"] = _capacity_error(str(parsed["ref"]))
-            else:
-                message["content"] = _capacity_error(str(parsed["ref"]))
+                    projected[index]["content"] = _capacity_error(ref)
+                continue
+            if message.get("tool_call_id") not in first_use_ids:
+                projected[index]["content"] = _capability_unavailable()
+            elif not _fits(projected, index, message.get("content"), budget_bytes, size_fn):
+                projected[index]["content"] = _capability_unavailable()
         return tuple(projected)
-    first_use_ids = _fresh_tool_call_ids(projected)
 
     for index, message in enumerate(projected):
         if message.get("role") != "tool":
             continue
-        parsed = _bounded_ref_value(message.get("content"))
-        if parsed is None:
-            continue
-        ref = str(parsed["ref"])
-        try:
-            # Legacy refs do not carry session/run metadata.  Registration is
-            # scoped to this replay capability; metadata-bearing refs still
-            # pass their independent session/lineage checks below.
-            capability.register_ref(ref)
-            metadata = capability.inspect(ref)
-            artifact_size = int(metadata.get("size_bytes", 0))
-            tool_call_id = message.get("tool_call_id")
-            if tool_call_id not in first_use_ids:
-                placeholder = _minimal_placeholder(capability, ref)
-                projected[index]["content"] = (
-                    placeholder
-                    if _fits(projected, index, placeholder, budget_bytes, size_fn)
-                    else _capacity_error(ref)
-                )
-                continue
-
-            full_value: Any | None = None
-            if budget_bytes is None or artifact_size <= max(0, budget_bytes):
-                full_value = capability.materialize(ref)
-                if _fits(projected, index, full_value, budget_bytes, size_fn):
-                    projected[index]["content"] = full_value
-                    continue
-
-            page = capability.preview(ref, limit=preview_chars)
-            rescue = _capacity_rescue(
+        tool_call_id = message.get("tool_call_id")
+        first_use = tool_call_id in first_use_ids
+        is_archive_read = (
+            tool_names.get(str(tool_call_id)) == ARCHIVE_READ_TOOL_NAME
+        )
+        if is_archive_read:
+            projected[index]["content"] = _project_archive_read_result(
+                projected,
+                index,
+                message.get("content"),
                 capability,
-                ref,
-                page,
-                preview_units=preview_chars,
+                budget_bytes=budget_bytes,
+                size_fn=size_fn,
             )
-            if _fits(projected, index, rescue, budget_bytes, size_fn):
-                projected[index]["content"] = rescue
-                continue
+            continue
+        parsed = _bounded_ref_value(message.get("content"))
+        if parsed is not None:
+            ref = str(parsed["ref"])
+            try:
+                projected[index]["content"] = _project_archived_ref(
+                    projected,
+                    index,
+                    ref,
+                    capability,
+                    first_use=first_use,
+                    budget_bytes=budget_bytes,
+                    preview_chars=preview_chars,
+                    size_fn=size_fn,
+                )
+            except (ArtifactArchiveError, RuntimeError, ValueError, TypeError) as error:
+                projected[index]["content"] = _archive_error(ref, error)
+            continue
 
-            # Reduce only the prefix. If even the actionable envelope does not
-            # fit, return a bounded failure instead of a successful ref that
-            # cannot be recovered from this request.
-            page_text = page.get("page")
-            if isinstance(page_text, str) and page.get("unit") in {"chars", "bytes"}:
-                for length in (2_000, 1_000, 512, 256, 128, 64, 0):
-                    if length == 0:
-                        candidate = _minimal_placeholder(capability, ref)
-                    else:
-                        if page.get("unit") == "chars":
-                            short_page = dict(page)
-                            short_page["page"] = page_text[:length]
-                            short_page["next_offset"] = int(page.get("offset", 0)) + min(
-                                length, len(page_text)
-                            )
-                            short_page["has_more"] = True
-                        else:
-                            # Re-read binary pages by byte limit.  Slicing a
-                            # base64 string would corrupt the unit/offset
-                            # contract and could skip bytes on continuation.
-                            short_page = capability.preview(ref, limit=length)
-                        candidate = _capacity_rescue(
-                            capability,
-                            ref,
-                            short_page,
-                            preview_units=length,
-                        )
-                    if _fits(projected, index, candidate, budget_bytes, size_fn):
-                        projected[index]["content"] = candidate
-                        break
-                else:
-                    projected[index]["content"] = _capacity_error(ref)
-            else:
-                projected[index]["content"] = _capacity_error(ref)
+        # Complete canonical results remain inline on the first request when
+        # the final provider payload fits.  They are archived only when a
+        # later request needs a stale placeholder or capacity rescue.
+        if first_use and _fits(projected, index, message.get("content"), budget_bytes, size_fn):
+            continue
+        if capability is None:
+            projected[index]["content"] = _capability_unavailable()
+            continue
+        ref = ""
+        try:
+            archived = capability.archive_result(
+                message.get("content"),
+                call_id=tool_call_id if isinstance(tool_call_id, str) else None,
+                tool_name=message.get("name") if isinstance(message.get("name"), str) else None,
+                runtime_event_id=(
+                    message.get("runtime_event_id")
+                    if isinstance(message.get("runtime_event_id"), str)
+                    else None
+                ),
+            )
+            ref = archived.ref
+            projected[index]["content"] = _project_archived_ref(
+                projected,
+                index,
+                ref,
+                capability,
+                first_use=first_use,
+                budget_bytes=budget_bytes,
+                preview_chars=preview_chars,
+                size_fn=size_fn,
+            )
         except (ArtifactArchiveError, RuntimeError, ValueError, TypeError) as error:
-            projected[index]["content"] = _archive_error(ref, error)
+            projected[index]["content"] = (
+                _archive_error(ref, error) if ref else _capability_unavailable()
+            )
 
     return tuple(projected)
 

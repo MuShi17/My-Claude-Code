@@ -21,7 +21,8 @@ import openai
 
 from .tools import (
     tool_definitions,
-    execute_tool,
+    execute_tool_value,
+    commit_tool_state,
     check_permission,
     CONCURRENCY_SAFE_TOOLS,
     get_active_tool_definitions,
@@ -758,6 +759,8 @@ class Agent:
                 "tool_start", {"tool_name": name, "tool_input": inp, "tool_call_id": call_id}
             ),
         )
+        if result.success:
+            commit_tool_state(name, inp, result.result, self._read_file_state)
         return result.result, result.success, result.executed
 
     def _emit_runtime_observation(self, event: str, payload: Any) -> None:
@@ -1739,7 +1742,7 @@ class Agent:
             return None
         summary_resp = await self._anthropic_client.messages.create(
             model=self.model,
-            max_tokens=2048,
+            max_tokens=4096,
             system="You are a conversation summarizer. Be concise but preserve important details.",
             messages=[
                 *self._provider_messages_for_neutral(summary_source),
@@ -1768,13 +1771,25 @@ class Agent:
         return summary_text
 
     # ─── 多层压缩管线 ────────────────────────────────────────
-    # 每轮 API 调用前执行以下 3 层（Tier 1-3）：
+    # legacy 路径每轮 API 调用前执行以下 3 层（Tier 1-3）：
     #   Tier 1: budget 截断 — 超出预算的大工具结果被头尾截断
     #   Tier 2: stale snip — 利用率 > 60% 时裁剪旧工具结果
     #   Tier 3: microcompact — 空闲 > 5 分钟时清除旧结果
     # Tier 4 (auto-compact) 在每轮 API 调用后检查触发。
 
-    def _run_compression_pipeline(self) -> None:
+    def _run_compression_pipeline(self, *, archive_aware: bool = False) -> None:
+        """Run legacy result rewrites unless the live archive-aware path opts out.
+
+        The live Provider loop refreshes from canonical replay immediately
+        afterwards.  Running the old Tier 1-3 rewrites first would replace a
+        newly completed tool result before its first Provider request, so that
+        path is deliberately a no-op here.  Explicit legacy callers retain the
+        existing compression behavior.
+        """
+
+        if archive_aware:
+            return
+
         import copy
 
         previous_messages = copy.deepcopy(
@@ -2056,19 +2071,16 @@ class Agent:
     # 统一分发：plan_mode / agent / skill / MCP / 标准工具。
     # agent 和 skill 在此处理以避免循环依赖（tools.py 不引用 agent.py）。
 
-    async def _execute_tool_call(self, name: str, inp: dict) -> str:
+    async def _execute_tool_call(self, name: str, inp: dict) -> Any:
         if name in ("enter_plan_mode", "exit_plan_mode"):
             return await self._execute_plan_mode_tool(name)
         if name == "ArchiveRead":
             if self._archive_capability is None:
-                return json.dumps(
-                    {
-                        "kind": "archive_read_error",
-                        "error_type": "capability_unavailable",
-                        "message": "ArchiveRead capability is unavailable",
-                    },
-                    ensure_ascii=False,
-                )
+                return {
+                    "kind": "archive_read_error",
+                    "error_type": "capability_unavailable",
+                    "message": "ArchiveRead capability is unavailable",
+                }
             return self._archive_capability.execute(inp)
         if name == "agent":
             return await self._execute_agent_tool(inp)
@@ -2076,8 +2088,8 @@ class Agent:
             return await self._execute_skill_tool(inp)
         # Route MCP tool calls to the MCP manager
         if self._mcp_manager.is_mcp_tool(name):
-            return await self._mcp_manager.call_tool(name, inp)
-        return await execute_tool(name, inp, self._read_file_state)
+            return await self._mcp_manager.call_tool_value(name, inp)
+        return await execute_tool_value(name, inp, self._read_file_state)
 
     # ─── Skill 执行（支持 inline / fork 双模式）─────────────
     # inline: 返回解析后的 prompt，注入当前对话
@@ -2364,7 +2376,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 break
 
             _pre_size = self._msg_char_count()
-            self._run_compression_pipeline()
+            self._run_compression_pipeline(archive_aware=True)
             self._refresh_provider_context_from_canonical()
             _post_size = self._msg_char_count()
             if _post_size < _pre_size:
@@ -2753,7 +2765,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 break
 
             _pre_size = self._msg_char_count()
-            self._run_compression_pipeline()
+            self._run_compression_pipeline(archive_aware=True)
             self._refresh_provider_context_from_canonical()
             _post_size = self._msg_char_count()
             if _post_size < _pre_size:
