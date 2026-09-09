@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any, Callable, Protocol, runtime_checkable
 
 from .context_transition import (
@@ -34,9 +34,19 @@ class CanonicalToolCallConflictError(CanonicalSinkError):
     code = "call_identity_conflict"
 
 
+_OPTIONAL_UNSUPPORTED = object()
+
+
 def _delegate_optional(sink: Any, name: str, *args: Any, **kwargs: Any) -> Any:
     method = getattr(sink, name, None)
     return method(*args, **kwargs) if callable(method) else None
+
+
+def _delegate_streaming_optional(sink: Any, name: str, *args: Any, **kwargs: Any) -> Any:
+    """Call a streaming extension without conflating unsupported and success."""
+
+    method = getattr(sink, name, None)
+    return method(*args, **kwargs) if callable(method) else _OPTIONAL_UNSUPPORTED
 
 
 @runtime_checkable
@@ -213,6 +223,29 @@ class CanonicalSink:
 
     append = emit
 
+    def append_runtime_partial_batch(self, events: Iterable[RuntimeEvent]) -> Any:
+        return _delegate_streaming_optional(
+            self.downstream, "append_runtime_partial_batch", events
+        )
+
+    def append_event_and_clear_runtime_partials(
+        self,
+        event: RuntimeEvent,
+        *,
+        stream_keys: Iterable[str] = (),
+        clear_invocation: bool = False,
+    ) -> Any:
+        return _delegate_streaming_optional(
+            self.downstream,
+            "append_event_and_clear_runtime_partials",
+            event,
+            stream_keys=stream_keys,
+            clear_invocation=clear_invocation,
+        )
+
+    def read_runtime_stream_partials(self, **kwargs: Any) -> Any:
+        return _delegate_optional(self.downstream, "read_runtime_stream_partials", **kwargs)
+
     def flush(self) -> None:
         try:
             self.downstream.flush()
@@ -266,6 +299,16 @@ class RuntimeEventEmitter:
     ) -> None:
         self.sink = sink
         self.redaction_policy = redaction_policy or RedactionPolicy()
+        # ``None`` means that no partial batch has been attempted yet.  The
+        # first partial anchor resolves this once, allowing the recorder to
+        # apply the ordered compatibility boundary only to legacy sinks.
+        self._partial_batch_supported: bool | None = None
+
+    @property
+    def partial_batch_supported(self) -> bool | None:
+        """Whether the downstream accepted the optional batch extension."""
+
+        return self._partial_batch_supported
 
     def emit(self, event: RuntimeEvent | dict[str, Any]) -> RuntimeEvent:
         clean = self.prepare(event)
@@ -280,6 +323,82 @@ class RuntimeEventEmitter:
         return self.sink.emit(clean)
 
     append = emit
+
+    @staticmethod
+    def _normalise_result(result: Any, fallback: RuntimeEvent) -> RuntimeEvent:
+        candidate = getattr(result, "event", None)
+        if isinstance(candidate, RuntimeEvent):
+            return candidate
+        if isinstance(result, RuntimeEvent):
+            return result
+        return fallback
+
+    def emit_partial_batch(
+        self, events: Iterable[RuntimeEvent | dict[str, Any]]
+    ) -> list[RuntimeEvent]:
+        """Emit a prepared partial batch, using the optional optimized sink API."""
+
+        clean = [self.prepare(event) for event in events]
+        if not clean:
+            return []
+        method = getattr(self.sink, "append_runtime_partial_batch", None)
+        if callable(method):
+            result = method(clean)
+            if result is not _OPTIONAL_UNSUPPORTED:
+                self._partial_batch_supported = True
+                if result is None:
+                    return clean
+                if isinstance(result, (list, tuple)):
+                    if len(result) != len(clean):
+                        raise EventSinkError(
+                            "partial batch sink returned an unexpected event count"
+                        )
+                    return [
+                        self._normalise_result(item, clean[index])
+                        for index, item in enumerate(result)
+                    ]
+                if len(clean) != 1:
+                    raise EventSinkError(
+                        "partial batch sink must return one result per event"
+                    )
+                return [self._normalise_result(result, clean[-1])]
+        self._partial_batch_supported = False
+        return [
+            self._normalise_result(self.sink.emit(event), event)
+            for event in clean
+        ]
+
+    def emit_final(
+        self,
+        event: RuntimeEvent | dict[str, Any],
+        *,
+        clear_partial_stream_keys: Iterable[str] = (),
+        clear_partial_invocation: bool = False,
+    ) -> RuntimeEvent:
+        """Emit a final event and optionally close partial state atomically."""
+
+        clean = self.prepare(event)
+        existing = self._existing_final_tool_call(clean)
+        if existing is not None and not equivalent_tool_call(existing, clean):
+            call_id = str((clean.content or {}).get("id", "unknown-call"))
+            raise CanonicalToolCallConflictError(
+                f"call_identity_conflict for {clean.run_id}:{call_id}"
+            )
+        keys = tuple(str(key) for key in clear_partial_stream_keys if str(key).strip())
+        clear_requested = bool(keys) or clear_partial_invocation
+        if clear_requested:
+            method = getattr(self.sink, "append_event_and_clear_runtime_partials", None)
+            if callable(method):
+                result = method(
+                    clean,
+                    stream_keys=keys,
+                    clear_invocation=clear_partial_invocation,
+                )
+                if result is not _OPTIONAL_UNSUPPORTED:
+                    return self._normalise_result(result, existing or clean)
+        if existing is not None:
+            return existing
+        return self._normalise_result(self.sink.emit(clean), clean)
 
     def prepare(self, event: RuntimeEvent | dict[str, Any]) -> RuntimeEvent:
         return _prepare_event(event, self.redaction_policy)

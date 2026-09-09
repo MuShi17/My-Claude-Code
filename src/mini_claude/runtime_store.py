@@ -8,7 +8,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from .event_sink import EventSink, EventSinkError
 from .context_transition import ContextTransition, ContextTransitionError
@@ -20,7 +20,7 @@ from .runtime_event import (
     canonical_json_bytes,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class RuntimeStoreError(RuntimeError):
@@ -126,6 +126,31 @@ class PartialSnapshot:
     version: int
     bounded: bool
     created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class StreamingPartialSnapshot:
+    """The latest mutable observation for one provider stream."""
+
+    stream_key: str
+    session_id: str
+    run_id: str
+    invocation_id: str
+    attempt_id: str | None
+    stream_kind: str
+    tool_call_id: str | None
+    tool_name: str | None
+    payload: Any
+    first_event_id: str
+    last_event_id: str
+    first_ts: int
+    last_ts: int
+    fragment_count: int
+    last_partial_seq: int
+    size_bytes: int
+    digest: str
+    created_at: str
+    updated_at: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,6 +325,33 @@ class SQLiteRuntimeStore:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS runtime_stream_partials (
+                    stream_key TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    run_id TEXT NOT NULL,
+                    invocation_id TEXT NOT NULL,
+                    attempt_id TEXT NOT NULL,
+                    stream_kind TEXT NOT NULL,
+                    tool_call_id TEXT,
+                    tool_name TEXT,
+                    payload_json BLOB NOT NULL,
+                    first_event_id TEXT NOT NULL,
+                    last_event_id TEXT NOT NULL,
+                    first_ts INTEGER NOT NULL,
+                    last_ts INTEGER NOT NULL,
+                    fragment_count INTEGER NOT NULL,
+                    last_partial_seq INTEGER NOT NULL DEFAULT 0,
+                    size_bytes INTEGER NOT NULL,
+                    digest TEXT NOT NULL,
+                    last_event_digest TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_runtime_stream_partials_run
+                    ON runtime_stream_partials(run_id, invocation_id, updated_at);
+                CREATE INDEX IF NOT EXISTS idx_runtime_stream_partials_session
+                    ON runtime_stream_partials(session_id, updated_at);
+
                 CREATE TABLE IF NOT EXISTS runtime_llm_captures (
                     llm_ref TEXT PRIMARY KEY,
                     session_id TEXT NOT NULL,
@@ -423,6 +475,16 @@ class SQLiteRuntimeStore:
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_events_invocation_event_seq "
                 "ON runtime_events(invocation_id, event_seq)"
             )
+            stream_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(runtime_stream_partials)"
+                ).fetchall()
+            }
+            if "last_event_digest" not in stream_columns:
+                connection.execute(
+                    "ALTER TABLE runtime_stream_partials ADD COLUMN last_event_digest TEXT"
+                )
             connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             connection.commit()
         except Exception:
@@ -516,6 +578,433 @@ class SQLiteRuntimeStore:
             if connection.in_transaction:
                 connection.rollback()
             raise StoreIOError(f"SQLite append failed: {error}") from error
+
+    @staticmethod
+    def _partial_fields(event: RuntimeEvent) -> dict[str, Any]:
+        if not event.partial:
+            raise StoreValidationError("streaming partial batch requires partial events")
+        content = dict(event.content or {})
+        kind = content.get("kind")
+        if kind not in {"text", "thinking", "function_call"}:
+            raise StoreValidationError(
+                "streaming partial content must be text, thinking or function_call"
+            )
+        if kind in {"text", "thinking"}:
+            field = "text"
+            fragment = content.get(field)
+            call_id = None
+            tool_name = None
+        else:
+            field = "args"
+            fragment = content.get(field)
+            call_id = content.get("id")
+            tool_name = content.get("name")
+            if not isinstance(call_id, str) or not call_id.strip():
+                raise StoreValidationError("partial function_call requires a call id")
+            if not isinstance(tool_name, str) or not tool_name.strip():
+                raise StoreValidationError("partial function_call requires a tool name")
+        if not isinstance(fragment, str):
+            raise StoreValidationError(f"partial {kind} requires a string {field}")
+
+        metadata = dict(event.metadata or {})
+        attempt_id = metadata.get("attempt_id")
+        if attempt_id is None:
+            attempt_id = ""
+        elif not isinstance(attempt_id, str):
+            attempt_id = str(attempt_id)
+        stream_key = metadata.get("partial_stream_key")
+        if not isinstance(stream_key, str) or not stream_key.strip():
+            stream_key = ":".join(
+                (
+                    "partial",
+                    event.invocation_id,
+                    attempt_id,
+                    str(kind),
+                    str(call_id or ""),
+                )
+            )
+        sequence_value = metadata.get("partial_seq")
+        if sequence_value is None:
+            partial_seq = 0
+        elif isinstance(sequence_value, bool):
+            raise StoreValidationError("partial_seq must be a positive integer")
+        else:
+            try:
+                partial_seq = int(sequence_value)
+            except (TypeError, ValueError) as error:
+                raise StoreValidationError("partial_seq must be a positive integer") from error
+            if partial_seq < 1:
+                raise StoreValidationError("partial_seq must be a positive integer")
+        return {
+            "stream_key": stream_key,
+            "attempt_id": attempt_id,
+            "stream_kind": str(kind),
+            "tool_call_id": call_id,
+            "tool_name": tool_name,
+            "field": field,
+            "fragment": fragment,
+            "partial_seq": partial_seq,
+        }
+
+    @staticmethod
+    def _stream_payload_from_row(row: sqlite3.Row) -> tuple[dict[str, Any], RuntimeEvent]:
+        try:
+            raw = row["payload_json"]
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8")
+            payload = json.loads(raw)
+            if not isinstance(payload, dict):
+                raise TypeError("payload must be an object")
+            encoded = canonical_json_bytes(payload)
+            digest = hashlib.sha256(encoded).hexdigest()
+            if digest != row["digest"] or len(encoded) != int(row["size_bytes"]):
+                raise ValueError("streaming partial payload digest or size mismatch")
+            event = RuntimeEvent.from_dict(payload)
+            fields = SQLiteRuntimeStore._partial_fields(event)
+        except (
+            RuntimeEventError,
+            StoreValidationError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            TypeError,
+            ValueError,
+        ) as error:
+            raise CorruptionError(
+                f"cannot decode runtime_stream_partials stream_key={row['stream_key']}: {error}"
+            ) from error
+        if (
+            event.id != row["last_event_id"]
+            or event.session_id != row["session_id"]
+            or event.run_id != row["run_id"]
+            or event.invocation_id != row["invocation_id"]
+            or not event.partial
+        ):
+            raise CorruptionError(
+                f"identity mismatch for runtime_stream_partials stream_key={row['stream_key']}"
+            )
+        if any(
+            value != row[column]
+            for column, value in (
+                ("stream_key", fields["stream_key"]),
+                ("attempt_id", fields["attempt_id"]),
+                ("stream_kind", fields["stream_kind"]),
+                ("tool_call_id", fields["tool_call_id"]),
+                ("tool_name", fields["tool_name"]),
+            )
+        ) or int(row["last_partial_seq"]) != int(fields["partial_seq"]):
+            raise CorruptionError(
+                f"stream metadata mismatch for runtime_stream_partials stream_key={row['stream_key']}"
+            )
+        fragment_count = (event.metadata or {}).get("partial_fragment_count")
+        if fragment_count is not None:
+            try:
+                fragment_count_value = int(fragment_count)
+            except (TypeError, ValueError) as error:
+                raise CorruptionError(
+                    f"invalid stream fragment count for runtime_stream_partials stream_key={row['stream_key']}"
+                ) from error
+            if fragment_count_value != int(row["fragment_count"]):
+                raise CorruptionError(
+                    f"stream fragment count mismatch for runtime_stream_partials stream_key={row['stream_key']}"
+                )
+        return payload, event
+
+    @classmethod
+    def _stream_snapshot_payload(
+        cls,
+        event: RuntimeEvent,
+        fields: Mapping[str, Any],
+        aggregate: str,
+        *,
+        fragment_count: int,
+    ) -> tuple[dict[str, Any], bytes]:
+        payload = event.to_dict()
+        content = dict(payload.get("content") or {})
+        content[str(fields["field"])] = aggregate
+        payload["content"] = content
+        metadata = dict(payload.get("metadata") or {})
+        metadata.update(
+            {
+                "partial_aggregate": True,
+                "partial_stream_key": fields["stream_key"],
+                "partial_fragment_count": fragment_count,
+            }
+        )
+        if fields["partial_seq"]:
+            metadata["partial_seq"] = fields["partial_seq"]
+        payload["metadata"] = metadata
+        encoded = canonical_json_bytes(payload)
+        return payload, encoded
+
+    @staticmethod
+    def _validate_partial_state(
+        connection: sqlite3.Connection, event: RuntimeEvent
+    ) -> None:
+        state = connection.execute(
+            "SELECT session_id, invocation_id, sealed FROM runtime_run_state WHERE run_id = ?",
+            (event.run_id,),
+        ).fetchone()
+        if state is None:
+            raise StoreValidationError(
+                f"streaming partial requires an existing run {event.run_id}"
+            )
+        if state["session_id"] != event.session_id:
+            raise StoreValidationError(
+                f"run {event.run_id} identity does not match streaming partial"
+            )
+        if bool(state["sealed"]):
+            raise SealedRunError(f"run {event.run_id} is sealed")
+        opening = connection.execute(
+            "SELECT 1 FROM runtime_events WHERE run_id = ? AND invocation_id = ? "
+            "AND event_id = (SELECT event_id FROM runtime_events "
+            "WHERE run_id = ? AND invocation_id = ? ORDER BY ordinal LIMIT 1)",
+            (event.run_id, event.invocation_id, event.run_id, event.invocation_id),
+        ).fetchone()
+        if opening is None:
+            raise StoreValidationError(
+                "streaming partial requires a persisted invocation opening event"
+            )
+
+    def _upsert_stream_partial_in_transaction(
+        self, event: RuntimeEvent, connection: sqlite3.Connection
+    ) -> None:
+        fields = self._partial_fields(event)
+        self._validate_partial_state(connection, event)
+        row = connection.execute(
+            "SELECT * FROM runtime_stream_partials WHERE stream_key = ?",
+            (fields["stream_key"],),
+        ).fetchone()
+        now = _utc_now()
+        if row is None:
+            payload, encoded = self._stream_snapshot_payload(
+                event,
+                fields,
+                fields["fragment"],
+                fragment_count=1,
+            )
+            connection.execute(
+                """
+                INSERT INTO runtime_stream_partials(
+                    stream_key, session_id, run_id, invocation_id, attempt_id,
+                    stream_kind, tool_call_id, tool_name, payload_json,
+                    first_event_id, last_event_id, first_ts, last_ts,
+                    fragment_count, last_partial_seq, size_bytes, digest,
+                    last_event_digest, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    fields["stream_key"], event.session_id, event.run_id,
+                    event.invocation_id, fields["attempt_id"], fields["stream_kind"],
+                    fields["tool_call_id"], fields["tool_name"], encoded,
+                    event.id, event.id, event.ts, event.ts, 1,
+                    fields["partial_seq"], len(encoded), hashlib.sha256(encoded).hexdigest(),
+                    event.digest(), now, now,
+                ),
+            )
+            return
+
+        for column, value in (
+            ("session_id", event.session_id),
+            ("run_id", event.run_id),
+            ("invocation_id", event.invocation_id),
+            ("attempt_id", fields["attempt_id"]),
+            ("stream_kind", fields["stream_kind"]),
+            ("tool_call_id", fields["tool_call_id"]),
+            ("tool_name", fields["tool_name"]),
+        ):
+            if row[column] != value:
+                raise IdempotencyConflictError(
+                    f"streaming partial identity conflict for {fields['stream_key']}"
+                )
+
+        previous_payload, previous_event = self._stream_payload_from_row(row)
+        del previous_payload
+        last_seq = int(row["last_partial_seq"])
+        incoming_seq = int(fields["partial_seq"])
+        if incoming_seq and incoming_seq <= last_seq:
+            # The sequence is recorder-owned. A retry of a committed batch is
+            # already represented by the snapshot and must not append twice.
+            # The latest sequence also carries its event digest so a caller
+            # cannot silently replace the last committed fragment with a
+            # different payload under the same sequence number.
+            if incoming_seq < last_seq:
+                raise IdempotencyConflictError(
+                    f"stale streaming partial sequence for {fields['stream_key']}"
+                )
+            if incoming_seq == last_seq:
+                stored_digest = row["last_event_digest"]
+                if (
+                    event.id != row["last_event_id"]
+                    or (stored_digest is not None and event.digest() != stored_digest)
+                ):
+                    raise IdempotencyConflictError(
+                        f"streaming partial sequence conflict for {fields['stream_key']}"
+                    )
+            return
+        if incoming_seq and incoming_seq != last_seq + 1:
+            raise IdempotencyConflictError(
+                f"streaming partial sequence gap for {fields['stream_key']}"
+            )
+        if not incoming_seq and event.id == row["last_event_id"]:
+            stored_digest = row["last_event_digest"]
+            if stored_digest is not None and event.digest() != stored_digest:
+                raise IdempotencyConflictError(
+                    f"streaming partial event conflict for {fields['stream_key']}"
+                )
+            return
+        previous_fields = self._partial_fields(previous_event)
+        if previous_fields["field"] != fields["field"]:
+            raise IdempotencyConflictError(
+                f"streaming partial kind conflict for {fields['stream_key']}"
+            )
+        previous_fragment = str(previous_event.content[fields["field"]])
+        payload, encoded = self._stream_snapshot_payload(
+            event,
+            fields,
+            previous_fragment + fields["fragment"],
+            fragment_count=int(row["fragment_count"]) + 1,
+        )
+        effective_seq = incoming_seq or last_seq + 1
+        connection.execute(
+            """
+            UPDATE runtime_stream_partials
+                SET payload_json = ?, last_event_id = ?, last_ts = ?,
+                fragment_count = ?, last_partial_seq = ?, size_bytes = ?,
+                digest = ?, last_event_digest = ?, updated_at = ?
+            WHERE stream_key = ?
+            """,
+            (
+                encoded, event.id, event.ts, int(row["fragment_count"]) + 1,
+                effective_seq, len(encoded), hashlib.sha256(encoded).hexdigest(),
+                event.digest(), now, fields["stream_key"],
+            ),
+        )
+
+    def append_runtime_partial_batch(
+        self, events: Iterable[RuntimeEvent | Mapping[str, Any]]
+    ) -> list[RuntimeEvent]:
+        """Persist streaming observations as one mutable SQLite batch."""
+
+        values = list(events)
+        if not values:
+            return []
+        canonical: list[RuntimeEvent] = []
+        try:
+            for event in values:
+                item = event if isinstance(event, RuntimeEvent) else RuntimeEvent.from_dict(event)
+                item.validate()
+                canonical.append(item)
+        except RuntimeEventError as error:
+            raise StoreValidationError(str(error)) from error
+        identities = {
+            (event.session_id, event.run_id, event.invocation_id)
+            for event in canonical
+        }
+        if len(identities) > 1:
+            raise StoreValidationError(
+                "streaming partial batch must use one session, run and invocation"
+            )
+        # A sequence-less event can still be read as a legacy/direct snapshot,
+        # but the optimized batch boundary cannot distinguish a new fragment
+        # from a replay of an older one.  Reject it before opening a SQLite
+        # transaction instead of synthesizing an identity that may later
+        # become unreadable or duplicate content.
+        for event in canonical:
+            if self._partial_fields(event)["partial_seq"] == 0:
+                raise StoreValidationError(
+                    "streaming partial batch requires a positive partial_seq"
+                )
+        self._ensure_open()
+        self._fault("store.append_partial")
+        self._fault("store.corrupt_read")
+        connection = self.connection
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for event in canonical:
+                self._upsert_stream_partial_in_transaction(event, connection)
+            self._fault("store.commit")
+            connection.commit()
+            return canonical
+        except (SealedRunError, IdempotencyConflictError, StoreFaultError, RuntimeStoreError):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise StoreIOError(f"SQLite partial append constraint failed: {error}") from error
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            if "commit" in str(error).lower():
+                raise StoreCommitError(str(error)) from error
+            self._raise_sqlite(error, operation="partial append")
+        except Exception as error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise StoreIOError(f"SQLite partial append failed: {error}") from error
+
+    def append_event_and_clear_runtime_partials(
+        self,
+        event: RuntimeEvent | Mapping[str, Any],
+        *,
+        stream_keys: Iterable[str] = (),
+        clear_invocation: bool = False,
+    ) -> AppendResult:
+        """Append a final event and remove its mutable partial state atomically."""
+
+        try:
+            canonical = event if isinstance(event, RuntimeEvent) else RuntimeEvent.from_dict(event)
+            canonical.validate()
+        except RuntimeEventError as error:
+            raise StoreValidationError(str(error)) from error
+        if canonical.partial:
+            raise StoreValidationError("final event cleanup requires a non-partial event")
+        keys = tuple(dict.fromkeys(str(key) for key in stream_keys if str(key).strip()))
+        if not clear_invocation and not keys:
+            return self.append(canonical)
+        self._ensure_open()
+        self._fault("store.append_final")
+        self._fault("store.corrupt_read")
+        connection = self.connection
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            result = self._append_in_transaction(canonical, connection)
+            if clear_invocation:
+                connection.execute(
+                    "DELETE FROM runtime_stream_partials "
+                    "WHERE session_id = ? AND run_id = ? AND invocation_id = ?",
+                    (canonical.session_id, canonical.run_id, canonical.invocation_id),
+                )
+            elif keys:
+                placeholders = ", ".join("?" for _ in keys)
+                connection.execute(
+                    "DELETE FROM runtime_stream_partials "
+                    "WHERE session_id = ? AND run_id = ? AND invocation_id = ? "
+                    f"AND stream_key IN ({placeholders})",
+                    (canonical.session_id, canonical.run_id, canonical.invocation_id, *keys),
+                )
+            self._fault("store.commit")
+            connection.commit()
+            return result
+        except (SealedRunError, IdempotencyConflictError, StoreFaultError, RuntimeStoreError):
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        except sqlite3.IntegrityError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise StoreIOError(f"SQLite final append constraint failed: {error}") from error
+        except sqlite3.OperationalError as error:
+            if connection.in_transaction:
+                connection.rollback()
+            if "commit" in str(error).lower():
+                raise StoreCommitError(str(error)) from error
+            self._raise_sqlite(error, operation="final append")
+        except Exception as error:
+            if connection.in_transaction:
+                connection.rollback()
+            raise StoreIOError(f"SQLite final append failed: {error}") from error
 
     def _append_in_transaction(
         self, canonical: RuntimeEvent, connection: sqlite3.Connection
@@ -1025,6 +1514,83 @@ class SQLiteRuntimeStore:
         except sqlite3.Error as error:
             self._raise_sqlite(error, operation="read")
             raise AssertionError("unreachable")
+
+    @classmethod
+    def _streaming_snapshot_from_row(
+        cls, row: sqlite3.Row
+    ) -> StreamingPartialSnapshot:
+        payload, _event = cls._stream_payload_from_row(row)
+        return StreamingPartialSnapshot(
+            stream_key=str(row["stream_key"]),
+            session_id=str(row["session_id"]),
+            run_id=str(row["run_id"]),
+            invocation_id=str(row["invocation_id"]),
+            attempt_id=str(row["attempt_id"]) or None,
+            stream_kind=str(row["stream_kind"]),
+            tool_call_id=str(row["tool_call_id"]) if row["tool_call_id"] is not None else None,
+            tool_name=str(row["tool_name"]) if row["tool_name"] is not None else None,
+            payload=payload,
+            first_event_id=str(row["first_event_id"]),
+            last_event_id=str(row["last_event_id"]),
+            first_ts=int(row["first_ts"]),
+            last_ts=int(row["last_ts"]),
+            fragment_count=int(row["fragment_count"]),
+            last_partial_seq=int(row["last_partial_seq"]),
+            size_bytes=int(row["size_bytes"]),
+            digest=str(row["digest"]),
+            created_at=str(row["created_at"]),
+            updated_at=str(row["updated_at"]),
+        )
+
+    def read_runtime_stream_partials(
+        self,
+        *,
+        session_id: str | None = None,
+        run_id: str | None = None,
+        invocation_id: str | None = None,
+        stream_key: str | None = None,
+    ) -> list[StreamingPartialSnapshot]:
+        """Read mutable streaming observations with integrity validation."""
+
+        connection = self._ensure_open()
+        self._fault("store.corrupt_read")
+        clauses: list[str] = []
+        parameters: list[Any] = []
+        for field, value in (
+            ("session_id", session_id),
+            ("run_id", run_id),
+            ("invocation_id", invocation_id),
+            ("stream_key", stream_key),
+        ):
+            if value is not None:
+                clauses.append(f"{field} = ?")
+                parameters.append(value)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        try:
+            rows = connection.execute(
+                "SELECT * FROM runtime_stream_partials"
+                f"{where} ORDER BY created_at, stream_key",
+                parameters,
+            ).fetchall()
+        except sqlite3.Error as error:
+            self._raise_sqlite(error, operation="streaming partial read")
+            raise AssertionError("unreachable")
+        return [self._streaming_snapshot_from_row(row) for row in rows]
+
+    def list_runtime_partial_run_ids(self, *, session_id: str | None = None) -> set[str]:
+        """Return runs with pending streaming observations for recovery."""
+
+        connection = self._ensure_open()
+        if session_id is None:
+            rows = connection.execute(
+                "SELECT DISTINCT run_id FROM runtime_stream_partials"
+            ).fetchall()
+        else:
+            rows = connection.execute(
+                "SELECT DISTINCT run_id FROM runtime_stream_partials WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
+        return {str(row[0]) for row in rows}
 
     @staticmethod
     def _validate_event_sequences(connection: sqlite3.Connection) -> None:
@@ -1754,6 +2320,7 @@ __all__ = [
     "StoreFaultError",
     "StoreIOError",
     "StoreValidationError",
+    "StreamingPartialSnapshot",
     "ToolOperationRecord",
     "RuntimeStoreError",
 ]

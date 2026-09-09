@@ -1107,6 +1107,17 @@ class Agent:
             self._runtime_exit_reason = str(error)
         finally:
             self._current_task = None
+            if self._runtime_recorder:
+                try:
+                    # A cancellation may bypass ModelCallRecorder.finish();
+                    # persist the last buffered observation before finalizing
+                    # the run or flushing the canonical sink.
+                    self._runtime_recorder.flush_partials()
+                except Exception as error:
+                    canonical_failure = canonical_failure or error
+                    self._runtime_exit_status = "failed"
+                    self._runtime_exit_reason = f"canonical partial flush failed: {error}"
+                    print(f"[runtime] partial flush failed: {error}", flush=True)
             if self._runtime_guard and not self._runtime_guard.is_terminal:
                 final_status = self._runtime_exit_status or (
                     "aborted" if self._aborted else "completed"
@@ -1194,6 +1205,11 @@ class Agent:
         emitter = self._runtime_emitter
         owned_store = self._runtime_store if self._runtime_store_owned else None
         try:
+            if self._runtime_recorder is not None:
+                try:
+                    self._runtime_recorder.flush_partials()
+                except Exception as error:
+                    failures.append(("runtime partial flush", error))
             if emitter is not None:
                 try:
                     emitter.flush()
@@ -2746,7 +2762,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                                 await self._emit("first_token", {"is_thinking": True})
                             self._emit_text(thinking)
                             if self._runtime_recorder:
-                                self._runtime_recorder.partial_text(thinking)
+                                self._runtime_recorder.partial_text(thinking, kind="thinking")
                         elif hasattr(delta, 'partial_json'):
                             tb = tool_blocks_by_index.get(event.index)
                             if tb:
@@ -3131,7 +3147,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         await self._emit("first_token", {"is_thinking": True})
                     self._emit_text(rc)
                     if self._runtime_recorder:
-                        self._runtime_recorder.partial_text(rc)
+                        self._runtime_recorder.partial_text(rc, kind="thinking")
                     reasoning_content += rc
 
                 if delta is not None and getattr(delta, "content", None) is not None:

@@ -159,6 +159,82 @@ def _anthropic_stream_body_with_tool(
     )
 
 
+def _anthropic_stream_body_with_thinking(
+    thinking: str = "plan", text: str = "done"
+) -> bytes:
+    return b"".join(
+        (
+            _sse_event(
+                "message_start",
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": "msg-thinking-fixture",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": "fixture-model",
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {"input_tokens": 11, "output_tokens": 0},
+                    },
+                },
+            ),
+            _sse_event(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "thinking", "thinking": ""},
+                },
+            ),
+            _sse_event(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "thinking_delta", "thinking": thinking},
+                },
+            ),
+            _sse_event(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "signature_delta", "signature": "fixture-signature"},
+                },
+            ),
+            _sse_event("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            _sse_event(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            ),
+            _sse_event(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": {"type": "text_delta", "text": text},
+                },
+            ),
+            _sse_event("content_block_stop", {"type": "content_block_stop", "index": 1}),
+            _sse_event(
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": 2},
+                },
+            ),
+            _sse_event("message_stop", {"type": "message_stop"}),
+        )
+    )
+
+
 def _openai_stream_body(text: str = "ack") -> bytes:
     chunks = [
         {
@@ -198,6 +274,60 @@ def _openai_stream_body(text: str = "ack") -> bytes:
     ) + b"data: [DONE]\n\n"
 
 
+def _openai_stream_body_with_reasoning(
+    reasoning: str = "plan", text: str = "done"
+) -> bytes:
+    chunks = [
+        {
+            "id": "chatcmpl-reasoning-fixture",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "fixture-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "reasoning_content": reasoning},
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            "id": "chatcmpl-reasoning-fixture",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "fixture-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"content": text},
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            "id": "chatcmpl-reasoning-fixture",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "fixture-model",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        },
+        {
+            "id": "chatcmpl-reasoning-fixture",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "fixture-model",
+            "choices": [],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 2, "total_tokens": 13},
+        },
+    ]
+    return b"".join(
+        b"data: "
+        + json.dumps(chunk, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        + b"\n\n"
+        for chunk in chunks
+    ) + b"data: [DONE]\n\n"
+
+
 def _provider_tool_content(provider: str, messages: list[dict[str, Any]]) -> Any:
     if provider == "anthropic":
         return next(
@@ -225,6 +355,7 @@ def _provider_client(
     captured: list[dict[str, Any]],
     *,
     response_text: str = "ack",
+    response_body: bytes | None = None,
 ):
     if provider == "anthropic":
         def handler(request: Any):
@@ -232,7 +363,7 @@ def _provider_client(
             return anthropic_httpx.Response(
                 200,
                 headers={"content-type": "text/event-stream"},
-                content=_anthropic_stream_body(response_text),
+                content=response_body or _anthropic_stream_body(response_text),
             )
 
         return AsyncAnthropic(
@@ -248,7 +379,7 @@ def _provider_client(
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            content=_openai_stream_body(response_text),
+            content=response_body or _openai_stream_body(response_text),
         )
 
     return AsyncOpenAI(
@@ -381,6 +512,94 @@ async def _build_agent_with_binary_result(tmp_path: Path, provider: str):
 
 
 @pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_actual_agent_sdk_thinking_stream_uses_isolated_partial_kind(
+    tmp_path: Path, provider: str
+):
+    async def scenario() -> None:
+        store = SQLiteRuntimeStore(tmp_path / f"{provider}-thinking.sqlite")
+        archive = ArtifactArchive(
+            tmp_path / f"{provider}-thinking-artifacts", metadata_store=store
+        )
+        model = "claude-sonnet-4-6" if provider == "anthropic" else "fixture-model"
+        agent = Agent(
+            api_base="https://fixture.invalid/v1" if provider == "openai" else None,
+            api_key="fixture-key",
+            model=model,
+            thinking_effort="low" if provider == "anthropic" else "none",
+            custom_system_prompt="fixture system",
+            is_sub_agent=True,
+            runtime_store=store,
+            artifact_archive=archive,
+            runtime_session_id=f"session-thinking-{provider}",
+            runtime_run_id=f"run-thinking-{provider}",
+            runtime_context_id=f"context-thinking-{provider}",
+        )
+        agent._ask_count = 1
+        agent._setup_runtime_facade()
+        if provider == "anthropic":
+            agent._anthropic_messages.append({"role": "user", "content": "hello"})
+        else:
+            agent._openai_messages.append({"role": "user", "content": "hello"})
+        captured: list[dict[str, Any]] = []
+        body = (
+            _anthropic_stream_body_with_thinking()
+            if provider == "anthropic"
+            else _openai_stream_body_with_reasoning()
+        )
+        client = _provider_client(provider, captured, response_body=body)
+        try:
+            if provider == "anthropic":
+                agent._anthropic_client = client
+                messages = agent._anthropic_messages
+            else:
+                agent._openai_client = client
+                messages = agent._openai_messages
+            agent._start_runtime_model_call(
+                f"request-thinking-{provider}", provider, {"messages": messages}
+            )
+            if provider == "anthropic":
+                response = await agent._call_anthropic_stream()
+                assert any(block.type == "thinking" for block in response.content)
+            else:
+                response = await agent._call_openai_stream()
+                assert response["choices"][0]["message"]["reasoning_content"] == "plan"
+
+            snapshots = store.read_runtime_stream_partials()
+            assert {snapshot.stream_kind for snapshot in snapshots} == {"thinking", "text"}
+            thinking_snapshot = next(
+                snapshot for snapshot in snapshots if snapshot.stream_kind == "thinking"
+            )
+            assert thinking_snapshot.payload["content"]["text"] == "plan"
+            assert all(not event.partial for event in store.read_events())
+
+            assert agent._runtime_recorder is not None
+            agent._runtime_recorder.final_thinking(
+                "plan", signature="fixture-signature"
+            )
+            agent._runtime_recorder.final_text("done")
+            agent._runtime_recorder.finish(
+                "stop", usage={"input_tokens": 11, "output_tokens": 2}
+            )
+            final_events = store.read_events()
+            assert store.read_runtime_stream_partials() == []
+            assert not any(event.partial for event in final_events)
+            assert any(
+                event.content and event.content.get("kind") == "thinking"
+                for event in final_events
+            )
+            assert any(
+                event.content and event.content.get("kind") == "text"
+                for event in final_events
+            )
+        finally:
+            await agent.aclose()
+            await client.close()
+            store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
 @pytest.mark.parametrize("capacity_rescue", [False, True])
 def test_actual_agent_sdk_receives_full_or_capacity_rescue_projection(
     tmp_path: Path, provider: str, capacity_rescue: bool
@@ -416,6 +635,8 @@ def test_actual_agent_sdk_receives_full_or_capacity_rescue_projection(
                 else:
                     response = await agent._call_openai_stream()
                     assert response["choices"][0]["message"]["content"] == "ack"
+                assert not any(event.partial for event in store.read_events())
+                assert store.read_runtime_stream_partials()
             finally:
                 await client.close()
 
@@ -753,6 +974,8 @@ def test_public_agent_tool_loop_reaches_second_provider_request(
             else:
                 agent._openai_client = client
             await agent.chat(f"read {source}")
+            assert not any(event.partial for event in store.read_events())
+            assert store.read_runtime_stream_partials() == []
         finally:
             await agent.aclose()
             await client.close()

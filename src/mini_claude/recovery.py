@@ -101,6 +101,9 @@ class RecoveryProjection:
 
     def _raw_run_ids(self, store: SQLiteRuntimeStore) -> set[str]:
         ids = {state.run_id for state in store.list_run_states()}
+        partial_ids = getattr(store, "list_runtime_partial_run_ids", None)
+        if callable(partial_ids):
+            ids.update(partial_ids())
         try:
             ids.update(event.run_id for event in store.read_events())
         except CorruptionError:
@@ -112,6 +115,8 @@ class RecoveryProjection:
         records_by_run: dict[str, list[EventRecord]] = {}
         corrupt_runs: set[str] = set()
         corruption_message = ""
+        partials_by_run: dict[str, list[Any]] = {}
+        partial_corruption: dict[str, str] = {}
         try:
             records = store.read_event_records()
             for ordinal, event in records:
@@ -123,6 +128,17 @@ class RecoveryProjection:
             ).fetchall()
             corrupt_runs.update(str(row[0]) for row in rows)
 
+        partial_reader = getattr(store, "read_runtime_stream_partials", None)
+        partial_run_ids = getattr(store, "list_runtime_partial_run_ids", None)
+        if callable(partial_reader) and callable(partial_run_ids):
+            for partial_run_id in partial_run_ids():
+                try:
+                    partials_by_run[str(partial_run_id)] = list(
+                        partial_reader(run_id=str(partial_run_id))
+                    )
+                except CorruptionError as error:
+                    partial_corruption[str(partial_run_id)] = str(error)
+
         results: list[RecoveryRecord] = []
         for run_id in sorted(self._raw_run_ids(store) | set(records_by_run)):
             run_records = sorted(records_by_run.get(run_id, []), key=lambda item: item.ordinal)
@@ -130,9 +146,14 @@ class RecoveryProjection:
             diagnostics: list[RecoveryDiagnostic] = []
             high_water = max((item.ordinal for item in run_records), default=state.high_water if state else 0)
             digest: str | None = None
-            if run_id in corrupt_runs:
+            if run_id in corrupt_runs or run_id in partial_corruption:
                 diagnostics.append(RecoveryDiagnostic(
-                    "corrupt_event", corruption_message or "canonical event row failed integrity validation",
+                    "corrupt_event" if run_id in corrupt_runs else "corrupt_stream_partial",
+                    (
+                        corruption_message or "canonical event row failed integrity validation"
+                        if run_id in corrupt_runs
+                        else partial_corruption[run_id]
+                    ),
                     "error", run_id=run_id, recommended_action="inspect runtime.sqlite before retrying",
                 ))
                 status = "corrupt"
@@ -177,6 +198,14 @@ class RecoveryProjection:
                                     event_id=item.event.id, ref=ref,
                                     recommended_action="repair artifact metadata/content; keep canonical event",
                                 ))
+                if partials_by_run.get(run_id):
+                    diagnostics.append(RecoveryDiagnostic(
+                        "stream_partial_pending",
+                        f"{len(partials_by_run[run_id])} streaming partial snapshot(s) remain pending",
+                        "warning",
+                        run_id=run_id,
+                        recommended_action="inspect partial stream evidence; resume or close the run",
+                    ))
                 if terminal is not None or (state is not None and state.sealed):
                     status = "terminal"
                 elif uncertain:

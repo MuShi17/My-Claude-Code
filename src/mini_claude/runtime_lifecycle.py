@@ -13,7 +13,7 @@ import inspect
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any, Awaitable, Callable, Iterable, Mapping
 
 from .archive_capability import ToolResultArchiveCapability
 from .artifact_archive import ArtifactArchive
@@ -29,6 +29,9 @@ from .tool_result import (
     parsed_result_error,
     validate_tool_result_size,
 )
+
+RUNTIME_PARTIAL_FLUSH_INTERVAL_MS = 80
+RUNTIME_PARTIAL_BATCH_MAX_BYTES = 8 * 1024
 
 
 def _now_ms() -> int:
@@ -74,6 +77,8 @@ class ModelCallRecorder:
         id_factory: IdentityFactory | None = None,
         clock: Callable[[], int | float | datetime] | None = None,
         max_partial_chars: int = 4_096,
+        partial_flush_interval_ms: int = RUNTIME_PARTIAL_FLUSH_INTERVAL_MS,
+        partial_batch_max_bytes: int = RUNTIME_PARTIAL_BATCH_MAX_BYTES,
         redaction_policy: RedactionPolicy | None = None,
     ) -> None:
         self.emitter = emitter
@@ -83,6 +88,12 @@ class ModelCallRecorder:
         self.ids = id_factory or IdentityFactory()
         self.clock = clock or _now_ms
         self.max_partial_chars = max_partial_chars
+        if partial_flush_interval_ms <= 0:
+            raise ValueError("partial_flush_interval_ms must be positive")
+        if partial_batch_max_bytes <= 0:
+            raise ValueError("partial_batch_max_bytes must be positive")
+        self.partial_flush_interval_ms = partial_flush_interval_ms
+        self.partial_batch_max_bytes = partial_batch_max_bytes
         self.redaction_policy = redaction_policy or RedactionPolicy()
         self.request_id: str | None = None
         self.attempt = 0
@@ -90,6 +101,13 @@ class ModelCallRecorder:
         self._started_at = 0.0
         self._finished = False
         self.events: list[RuntimeEvent] = []
+        self._partial_buffers: dict[str, list[RuntimeEvent]] = {}
+        self._partial_arrival_order: list[RuntimeEvent] = []
+        self._partial_buffer_bytes = 0
+        self._partial_streams: set[str] = set()
+        self._partial_sequences: dict[str, int] = {}
+        self._partial_timer: asyncio.TimerHandle | None = None
+        self._partial_flush_error: BaseException | None = None
 
     def _timestamp(self) -> int:
         value = self.clock()
@@ -111,6 +129,8 @@ class ModelCallRecorder:
         status: str | None = None,
         partial: bool = False,
         metadata: Mapping[str, Any] | None = None,
+        clear_partial_stream_key: str | None = None,
+        clear_partial_invocation: bool = False,
     ) -> RuntimeEvent:
         event = RuntimeEvent.create(
             self.context,
@@ -132,10 +152,201 @@ class ModelCallRecorder:
                 **dict(metadata or {}),
             },
         )
-        persisted = self.emitter.emit(event)
+        if partial:
+            return self._emit_partial_event(event)
+        if self.emitter.partial_batch_supported is False:
+            # A legacy sink has no mutable partial boundary of its own.  Do
+            # not let a pending partial overtake any ordinary or terminal
+            # lifecycle event when we fall back to generic emit().
+            self.flush_partials()
+        clear_keys = (
+            (clear_partial_stream_key,)
+            if clear_partial_stream_key is not None
+            else ()
+        )
+        if clear_partial_invocation or clear_keys:
+            self.flush_partials(stream_keys=None if clear_partial_invocation else clear_keys)
+            persisted = self.emitter.emit_final(
+                event,
+                clear_partial_stream_keys=clear_keys,
+                clear_partial_invocation=clear_partial_invocation,
+            )
+            self._forget_partial_streams(
+                stream_keys=None if clear_partial_invocation else clear_keys,
+            )
+        else:
+            persisted = self.emitter.emit(event)
         event = persisted if isinstance(persisted, RuntimeEvent) else event
         self.events.append(event)
         return event
+
+    def _stream_key(self, kind: str, call_id: str | None = None) -> str:
+        attempt_id = self.attempt_id or f"attempt-{self.attempt}"
+        return ":".join(
+            (
+                "partial",
+                self.context.invocation_id,
+                attempt_id,
+                kind,
+                call_id or "",
+            )
+        )
+
+    def _next_partial_sequence(self, stream_key: str) -> int:
+        sequence = self._partial_sequences.get(stream_key, 0) + 1
+        self._partial_sequences[stream_key] = sequence
+        return sequence
+
+    @staticmethod
+    def _event_stream_key(event: RuntimeEvent) -> str:
+        metadata = event.metadata or {}
+        value = metadata.get("partial_stream_key")
+        if isinstance(value, str) and value.strip():
+            return value
+        content = event.content or {}
+        call_id = content.get("id") if content.get("kind") == "function_call" else ""
+        attempt_id = metadata.get("attempt_id") or ""
+        return ":".join(
+            ("partial", event.invocation_id, str(attempt_id), str(content.get("kind") or ""), str(call_id or ""))
+        )
+
+    def _raise_partial_flush_error(self) -> None:
+        if self._partial_flush_error is None:
+            return
+        error = self._partial_flush_error
+        self._partial_flush_error = None
+        raise error
+
+    def _cancel_partial_timer(self) -> None:
+        if self._partial_timer is not None:
+            self._partial_timer.cancel()
+            self._partial_timer = None
+
+    def _schedule_partial_flush(self) -> None:
+        if self._partial_timer is not None or not self._partial_buffers:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._partial_timer = loop.call_later(
+            self.partial_flush_interval_ms / 1000,
+            self._on_partial_timer,
+        )
+
+    def _on_partial_timer(self) -> None:
+        self._partial_timer = None
+        try:
+            self.flush_partials()
+        except BaseException as error:
+            # A synchronous callback cannot propagate into the provider async
+            # iterator. Preserve the failure and surface it at the next
+            # recorder operation or explicit flush instead.
+            self._partial_flush_error = error
+
+    def _emit_partial_event(self, event: RuntimeEvent) -> RuntimeEvent:
+        self._raise_partial_flush_error()
+        stream_key = self._event_stream_key(event)
+        if stream_key not in self._partial_streams:
+            # Maka closes the previous buffered stream before establishing a
+            # new stream anchor. This also prevents mixed text/tool streams.
+            try:
+                self.flush_partials()
+                persisted = self.emitter.emit_partial_batch([event])
+            except BaseException:
+                # The anchor did not become visible to this recorder. Reset
+                # its sequence so a retry can start at one; an uncertain
+                # SQLite commit remains fail-closed because the store will
+                # reject a conflicting committed sequence instead of appending
+                # a second anchor.
+                self._partial_sequences.pop(stream_key, None)
+                raise
+            if not persisted:
+                self._partial_sequences.pop(stream_key, None)
+                raise RuntimeError("partial batch emitter returned no event")
+            self._partial_streams.add(stream_key)
+            self.events.append(persisted[0])
+            self._schedule_partial_flush()
+            return persisted[0]
+
+        self.events.append(event)
+        self._partial_buffers.setdefault(stream_key, []).append(event)
+        self._partial_arrival_order.append(event)
+        self._partial_buffer_bytes += len(event.canonical_bytes())
+        if self._partial_buffer_bytes >= self.partial_batch_max_bytes:
+            self.flush_partials()
+        else:
+            self._schedule_partial_flush()
+        return event
+
+    def flush_partials(self, *, stream_keys: Iterable[str] | None = None) -> None:
+        """Flush buffered streaming observations without changing final facts."""
+
+        if stream_keys is None:
+            selected = set(self._partial_buffers)
+        else:
+            selected = {str(key) for key in stream_keys}
+        if self.emitter.partial_batch_supported is False:
+            # Generic sinks cannot perform selective snapshot cleanup.  Flush
+            # every pending partial first so no other stream can appear after
+            # a final event that arrived later.
+            selected = set(self._partial_buffers)
+        pending = [
+            event
+            for event in self._partial_arrival_order
+            if self._event_stream_key(event) in selected
+        ]
+        if not pending:
+            if not self._partial_buffers:
+                self._partial_flush_error = None
+                self._cancel_partial_timer()
+            return
+        self.emitter.emit_partial_batch(pending)
+        flushed_ids = {event.id for event in pending}
+        self._partial_arrival_order = [
+            event
+            for event in self._partial_arrival_order
+            if event.id not in flushed_ids
+        ]
+        for key in selected:
+            self._partial_buffers.pop(key, None)
+        self._partial_buffer_bytes = sum(
+            len(event.canonical_bytes())
+            for events in self._partial_buffers.values()
+            for event in events
+        )
+        if not self._partial_buffers:
+            # A successful explicit retry has recovered any timer failure
+            # marker associated with the drained buffers.  Do not replay a
+            # stale error on the next delta or provider retry.
+            self._partial_flush_error = None
+            self._cancel_partial_timer()
+        else:
+            self._schedule_partial_flush()
+
+    def _forget_partial_streams(
+        self, *, stream_keys: Iterable[str] | None = None
+    ) -> None:
+        if stream_keys is None:
+            keys = set(self._partial_streams)
+        else:
+            keys = {str(key) for key in stream_keys}
+        self._partial_streams.difference_update(keys)
+        self._partial_arrival_order = [
+            event
+            for event in self._partial_arrival_order
+            if self._event_stream_key(event) not in keys
+        ]
+        for key in keys:
+            self._partial_sequences.pop(key, None)
+            self._partial_buffers.pop(key, None)
+        self._partial_buffer_bytes = sum(
+            len(event.canonical_bytes())
+            for events in self._partial_buffers.values()
+            for event in events
+        )
+        if not self._partial_buffers:
+            self._cancel_partial_timer()
 
     def start(
         self,
@@ -177,10 +388,21 @@ class ModelCallRecorder:
             metadata=metadata,
         )
 
-    def partial_text(self, text: str) -> RuntimeEvent:
+    def partial_text(self, text: str, *, kind: str = "text") -> RuntimeEvent:
         self._require_started()
+        # Surface a failed timer flush before allocating the next sequence.
+        # A rejected delta must not create a sequence gap after recovery.
+        self._raise_partial_flush_error()
+        if kind not in {"text", "thinking"}:
+            raise ValueError("partial text kind must be text or thinking")
+        stream_key = self._stream_key(kind)
+        partial_seq = self._next_partial_sequence(stream_key)
         bounded = text
-        metadata: dict[str, Any] = {"lifecycle": "stream_partial"}
+        metadata: dict[str, Any] = {
+            "lifecycle": "stream_partial",
+            "partial_stream_key": stream_key,
+            "partial_seq": partial_seq,
+        }
         if len(text) > self.max_partial_chars:
             bounded = text[: self.max_partial_chars]
             metadata.update(
@@ -193,35 +415,45 @@ class ModelCallRecorder:
         return self._emit(
             role="model",
             author="agent",
-            content={"kind": "text", "text": bounded},
+            content={"kind": kind, "text": bounded},
             partial=True,
             metadata=metadata,
         )
 
     def partial_tool_arguments(self, call_id: str, name: str, fragment: str) -> RuntimeEvent:
         self._require_started()
+        self._raise_partial_flush_error()
+        stream_key = self._stream_key("function_call", call_id)
+        partial_seq = self._next_partial_sequence(stream_key)
         return self._emit(
             role="model",
             author="agent",
             content={"kind": "function_call", "id": call_id, "name": name, "args": fragment},
             partial=True,
             refs={"tool_call_id": call_id},
-            metadata={"lifecycle": "tool_arguments_partial"},
+            metadata={
+                "lifecycle": "tool_arguments_partial",
+                "partial_stream_key": stream_key,
+                "partial_seq": partial_seq,
+            },
         )
 
     def final_text(self, text: str) -> RuntimeEvent:
         self._require_started()
+        stream_key = self._stream_key("text")
         return self._emit(
             role="model",
             author="agent",
             content={"kind": "text", "text": text},
             metadata={"lifecycle": "model_final"},
+            clear_partial_stream_key=stream_key,
         )
 
     def final_thinking(self, text: str, *, signature: str | None = None) -> RuntimeEvent:
         """Persist provider thinking exactly enough for a later replay."""
 
         self._require_started()
+        stream_key = self._stream_key("thinking")
         content: dict[str, Any] = {"kind": "thinking", "text": text}
         if signature is not None:
             content["signature"] = signature
@@ -230,17 +462,20 @@ class ModelCallRecorder:
             author="agent",
             content=content,
             metadata={"lifecycle": "model_final"},
+            clear_partial_stream_key=stream_key,
         )
 
     def final_tool_call(self, call_id: str, name: str, arguments: Any) -> RuntimeEvent:
         self._require_started()
         safe_args = redact_payload(arguments, self.redaction_policy)
+        stream_key = self._stream_key("function_call", call_id)
         return self._emit(
             role="model",
             author="agent",
             content={"kind": "function_call", "id": call_id, "name": name, "args": safe_args},
             refs={"tool_call_id": call_id},
             metadata={"lifecycle": "tool_call_final"},
+            clear_partial_stream_key=stream_key,
         )
 
     def usage(self, usage: Mapping[str, Any] | None) -> RuntimeEvent:
@@ -277,6 +512,7 @@ class ModelCallRecorder:
             author="agent",
             actions={"model_finish": {"finish_reason": finish_reason, "latency_ms": latency}},
             metadata={"lifecycle": "model_final"},
+            clear_partial_invocation=True,
         )
         self._finished = True
         normalised_usage: dict[str, int | None] = {
@@ -304,6 +540,7 @@ class ModelCallRecorder:
         """Record an explicit provider retry while retaining prior attempt facts."""
 
         self._require_started()
+        self.flush_partials()
         next_attempt = attempt if attempt is not None else self.attempt + 1
         previous_attempt_id = self.attempt_id
         self.attempt = next_attempt
@@ -340,6 +577,7 @@ class ModelCallRecorder:
             content={"kind": "error", "code": error_code, "message": str(error)},
             status="failed",
             metadata={"lifecycle": "provider_error", "error_type": error_type},
+            clear_partial_invocation=True,
         )
         self._finished = True
         return ModelCallSummary(
@@ -356,14 +594,16 @@ class ModelCallRecorder:
 
     def budget_exceeded(self, reason: str) -> RuntimeEvent:
         self._require_started()
-        self._finished = True
-        return self._emit(
+        event = self._emit(
             role="system",
             author="system",
             content={"kind": "error", "code": "budget_exceeded", "message": reason},
             status="budget_exceeded",
             metadata={"lifecycle": "budget"},
+            clear_partial_invocation=True,
         )
+        self._finished = True
+        return event
 
     def _require_started(self) -> None:
         if self.request_id is None:
@@ -693,6 +933,8 @@ __all__ = [
     "DurableToolBoundary",
     "ModelCallRecorder",
     "ModelCallSummary",
+    "RUNTIME_PARTIAL_BATCH_MAX_BYTES",
+    "RUNTIME_PARTIAL_FLUSH_INTERVAL_MS",
     "ToolExecutionResult",
     "ToolOperationConflictError",
     "UncertainToolOperationError",
