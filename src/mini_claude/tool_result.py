@@ -21,6 +21,14 @@ MAX_TOOL_RESULT_BYTES = 16 * 1024 * 1024
 MAX_TOOL_RESULT_CHARS = MAX_TOOL_RESULT_BYTES
 TOOL_RESULT_ERROR_KIND = "tool_result_error"
 
+# Maka's prune policy uses a deliberately separate estimate from the Provider
+# byte budget.  The canonical serialized JSON text is the stable input, while
+# ``/ 3`` is the project-level approximation requested for pruning decisions.
+PRUNE_CHARS_PER_ESTIMATED_TOKEN = 3
+PRUNE_MAX_ESTIMATED_TOKENS = 2_048
+PRUNE_MIN_SUPERSESSION_TOKENS = 256
+PRUNE_PROTECTED_TURN_COUNT = 2
+
 
 def _measurement_text(value: Any) -> str:
     if isinstance(value, str):
@@ -89,6 +97,26 @@ def canonical_tool_result_bytes(value: Any, *, tool_name: str = "tool-result") -
         return canonical_json_bytes(normalized)
     except (TypeError, ValueError, OverflowError, RecursionError) as error:
         raise ToolResultSerializationError(tool_name, error) from error
+
+
+def estimated_tool_result_tokens(
+    value: Any,
+    *,
+    tool_name: str = "tool-result",
+) -> int:
+    """Estimate prune tokens from canonical serialized JSON code points.
+
+    This is intentionally not a UTF-8 byte count and not the Provider request
+    size.  The canonical JSON bytes are decoded first so CJK, emoji, escaping,
+    and the Base64 binary envelope all use one deterministic text boundary.
+    """
+
+    serialized_text = canonical_tool_result_bytes(value, tool_name=tool_name).decode(
+        "utf-8"
+    )
+    return (len(serialized_text) + PRUNE_CHARS_PER_ESTIMATED_TOKEN - 1) // (
+        PRUNE_CHARS_PER_ESTIMATED_TOKEN
+    )
 
 
 def tool_result_byte_count(value: Any, *, tool_name: str = "tool-result") -> int:
@@ -201,11 +229,16 @@ def is_tool_result_error(value: Any) -> bool:
 __all__ = [
     "MAX_TOOL_RESULT_BYTES",
     "MAX_TOOL_RESULT_CHARS",
+    "PRUNE_CHARS_PER_ESTIMATED_TOKEN",
+    "PRUNE_MAX_ESTIMATED_TOKENS",
+    "PRUNE_MIN_SUPERSESSION_TOKENS",
+    "PRUNE_PROTECTED_TURN_COUNT",
     "TOOL_RESULT_ERROR_KIND",
     "ToolResultLimitError",
     "ToolResultSerializationError",
     "canonical_tool_result",
     "canonical_tool_result_bytes",
+    "estimated_tool_result_tokens",
     "is_tool_result_error",
     "parsed_result_error",
     "public_tool_result",

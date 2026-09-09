@@ -55,7 +55,7 @@ from .subagent import get_sub_agent_config
 from .mcp_client import McpManager
 from .event_ids import IdentityFactory, RunContext
 from .event_sink import EventSink, RuntimeEventEmitter
-from .runtime_event import RuntimeEvent
+from .runtime_event import RuntimeEvent, canonical_json_bytes
 from .redaction import redact_payload
 from .runtime_lifecycle import DurableToolBoundary, ModelCallRecorder
 from .context_transition import (
@@ -78,6 +78,8 @@ from .projections.incremental_replay import IncrementalModelReplayCursor, Increm
 from .projections.provider_context import (
     CanonicalModelContextAdapter,
     ProviderCapacityError,
+    ProviderRequestCycle,
+    ProviderRequestCycleIdentity,
     provider_request_size_bytes,
 )
 from .artifact_archive import ArtifactArchive
@@ -465,6 +467,8 @@ class Agent:
         self._replay_last_rebuild_reason = "not_initialized"
         self._replay_last_source_digest = ""
         self._replay_last_projection_digest = ""
+        self._provider_request_cycle: ProviderRequestCycle | None = None
+        self._current_request_id: str | None = None
 
         # Ctrl+C 中断支持
         self._aborted = False
@@ -690,6 +694,42 @@ class Agent:
 
         return max(0, int(self.effective_window) * 4)
 
+    def _ensure_provider_request_cycle(
+        self,
+        result: ModelReplayResult,
+        *,
+        provider: str,
+        active_turn_id: str | None,
+        provider_tools: list[ToolDef],
+        budget_bytes: int | None,
+    ) -> ProviderRequestCycle | None:
+        """Create/reuse the cycle that owns at most one active emergency pass."""
+
+        request_id = self._current_request_id
+        if not request_id:
+            return None
+        system_tools_digest = hashlib.sha256(
+            canonical_json_bytes(
+                {"system": self._system_prompt, "tools": provider_tools}
+            )
+        ).hexdigest()
+        identity = ProviderRequestCycleIdentity(
+            session_id=self.session_id,
+            provider_request_id=str(request_id),
+            source_digest=result.source_digest,
+            source_high_water=result.high_water,
+            provider=provider,
+            active_turn_id=active_turn_id,
+            system_tools_digest=system_tools_digest,
+            request_budget_bytes=budget_bytes,
+        )
+        if (
+            self._provider_request_cycle is None
+            or self._provider_request_cycle.identity != identity
+        ):
+            self._provider_request_cycle = ProviderRequestCycle(identity)
+        return self._provider_request_cycle
+
     def _assert_provider_request_fits(
         self,
         provider: str,
@@ -709,6 +749,18 @@ class Agent:
                 provider=provider,
                 request_size_bytes=request_size,
                 request_budget_bytes=budget,
+                diagnostics=(
+                    {
+                        "code": "provider_capacity_exhausted",
+                        "message": "final Provider context exceeds the local request budget",
+                        "severity": "error",
+                    },
+                ),
+                cycle_identity=(
+                    self._provider_request_cycle.identity_digest
+                    if self._provider_request_cycle is not None
+                    else None
+                ),
             )
 
     def _effective_tool_definitions(self) -> list[ToolDef]:
@@ -1075,6 +1127,8 @@ class Agent:
 
         self._aborted = False
         self._ask_count += 1
+        self._provider_request_cycle = None
+        self._current_request_id = None
         # The cursor is run-scoped.  A new user turn starts from a cold
         # canonical prefix, then consumes only suffix ordinals for its loop.
         self._replay_cursor = None
@@ -1151,6 +1205,9 @@ class Agent:
                             canonical_failure = canonical_failure or error
                             self._runtime_exit_status = "failed"
                             self._runtime_exit_reason = f"canonical snapshot failed: {error}"
+
+            self._current_request_id = None
+            self._provider_request_cycle = None
 
         if canonical_failure is not None:
             diagnostic = CanonicalFinalizationError(
@@ -1478,13 +1535,30 @@ class Agent:
 
         result = cursor.result()
         provider = "openai" if self.use_openai else "anthropic"
+        if self._current_request_id is None:
+            # Direct/local consumers may refresh outside chat(); give that
+            # refresh a stable owner so repeated calls still share one cycle.
+            self._current_request_id = f"refresh-{self._ask_count:04d}"
+        provider_tools = self._effective_tool_definitions()
+        active_turn_id = self._runtime_context.turn_id if self._runtime_context else None
+        request_cycle = self._ensure_provider_request_cycle(
+            result,
+            provider=provider,
+            active_turn_id=active_turn_id,
+            provider_tools=provider_tools,
+            budget_bytes=self._provider_budget_bytes(),
+        )
         context = CanonicalModelContextAdapter().build_result(
             result,
             provider=provider,
             system_prompt=self._system_prompt,
-            provider_tools=self._effective_tool_definitions(),
+            provider_tools=provider_tools,
             archive_capability=self._archive_capability,
             budget_bytes=self._provider_budget_bytes(),
+            session_id=self.session_id,
+            request_id=self._current_request_id,
+            active_turn_id=active_turn_id,
+            request_cycle=request_cycle,
         )
         errors = [
             diagnostic for diagnostic in context.diagnostics
@@ -1510,6 +1584,8 @@ class Agent:
                 request_budget_bytes=context.request_budget_bytes
                 if context.request_budget_bytes is not None
                 else 0,
+                diagnostics=context.diagnostics,
+                cycle_identity=context.cycle_identity,
             )
         messages = [dict(message) for message in context.messages]
         if self.use_openai:
@@ -2426,6 +2502,9 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             if self._aborted:
                 break
 
+            request_id = uuid.uuid4().hex
+            self._current_request_id = request_id
+
             _pre_size = self._msg_char_count()
             self._run_compression_pipeline(archive_aware=True)
             self._refresh_provider_context_from_canonical()
@@ -2453,8 +2532,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             if not self.is_sub_agent:
                 start_spinner()
 
-            request_id = uuid.uuid4().hex
-            self._current_request_id = request_id
             api_start = time.time()
             self._start_runtime_model_call(request_id, "anthropic", {"messages": self._anthropic_messages})
             try:
@@ -2816,6 +2893,9 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             if self._aborted:
                 break
 
+            request_id = uuid.uuid4().hex
+            self._current_request_id = request_id
+
             _pre_size = self._msg_char_count()
             self._run_compression_pipeline(archive_aware=True)
             self._refresh_provider_context_from_canonical()
@@ -2843,8 +2923,6 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             if not self.is_sub_agent:
                 start_spinner()
 
-            request_id = uuid.uuid4().hex
-            self._current_request_id = request_id
             api_start = time.time()
             self._start_runtime_model_call(request_id, "openai", {"messages": self._openai_messages})
             try:

@@ -157,8 +157,8 @@ def test_anthropic_tool_result_serializes_structured_content_as_json_text():
     assert isinstance(tool_result["content"], str)
     degraded = json.loads(tool_result["content"])
     assert degraded["kind"] == "archive_read_error"
-    assert degraded["error_type"] == "capability_unavailable"
-    assert degraded["preview"] == bounded_ref["inline"]
+    assert degraded["error_type"] == "invalid_archive_read"
+    assert "preview" not in degraded
 
 
 def test_replay_groups_same_invocation_tool_calls_and_anthropic_batches_results():

@@ -650,8 +650,7 @@ def test_actual_agent_sdk_receives_full_or_capacity_rescue_projection(
                 rescue = json.loads(wire_content)
                 assert rescue["kind"] == "bounded_ref"
                 assert rescue["truncated"] is True
-                assert rescue["preview_chars"] <= 4_000
-                assert rescue["next_offset"] == rescue["preview_chars"]
+                assert "preview" not in rescue
                 assert "ArchiveRead" in rescue["read_instructions"]
             else:
                 assert wire_content == LARGE_CONTENT
@@ -785,13 +784,24 @@ def test_actual_agent_sdk_binary_rescue_preserves_byte_continuation(
             wire_content = _provider_tool_content(provider, captured[0]["messages"])
             rescue = json.loads(wire_content)
             assert rescue["kind"] == "bounded_ref"
-            assert rescue["unit"] == "bytes"
             assert rescue["truncated"] is True
-            assert rescue["preview"].startswith("base64:")
-            assert rescue["preview_bytes"] == rescue["next_offset"]
-            assert rescue["preview_bytes"] == len(base64.b64decode(rescue["preview"][7:]))
-            assert rescue["next_offset"] > 0
+            assert "preview" not in rescue
             assert "ArchiveRead" in rescue["read_instructions"]
+            page = json.loads(
+                await agent._execute_tool_call(
+                    "ArchiveRead",
+                    {
+                        "operation": "read",
+                        "ref": rescue["ref"],
+                        "offset": 0,
+                        "limit": 32,
+                    },
+                )
+            )
+            assert page["kind"] == "archive_page"
+            assert page["unit"] == "bytes"
+            assert page["page"].startswith("base64:")
+            assert page["next_offset"] == len(base64.b64decode(page["page"][7:]))
         finally:
             await agent.aclose()
             store.close()
@@ -811,6 +821,11 @@ def test_actual_agent_sdk_receives_stale_and_archive_page_without_terminal_subst
         try:
             assert agent._runtime_emitter is not None
             assert agent._runtime_context is not None
+            agent._ask_count = 2
+            agent._setup_runtime_facade()
+            agent._emit_canonical_user_event("middle step")
+            agent._ask_count = 3
+            agent._setup_runtime_facade()
             agent._emit_canonical_user_event("next step")
             context = agent._refresh_provider_context_from_canonical()
             stale_content = _provider_tool_content(
@@ -900,7 +915,6 @@ def test_actual_agent_sdk_without_archive_capability_fails_closed(
         try:
             agent._archive_capability = None
             agent.effective_window = 2_000
-            context = agent._refresh_provider_context_from_canonical()
             captured: list[dict[str, Any]] = []
             client = _provider_client(provider, captured)
             try:
@@ -908,30 +922,19 @@ def test_actual_agent_sdk_without_archive_capability_fails_closed(
                     agent._anthropic_client = client
                 else:
                     agent._openai_client = client
-                request_messages = (
-                    agent._anthropic_messages
-                    if provider == "anthropic"
-                    else agent._openai_messages
-                )
-                agent._start_runtime_model_call(
-                    "request-no-capability", provider, {"messages": request_messages}
-                )
-                if provider == "anthropic":
-                    await agent._call_anthropic_stream()
-                else:
-                    await agent._call_openai_stream()
+                with pytest.raises(ProviderCapacityError) as error:
+                    agent._refresh_provider_context_from_canonical()
             finally:
                 await client.close()
 
-            assert len(captured) == 1
-            assert context.request_fits is True
-            assert context.request_size_bytes <= context.request_budget_bytes
-            wire_content = _provider_tool_content(provider, captured[0]["messages"])
-            error = json.loads(wire_content)
-            assert error["kind"] == "archive_read_error"
-            assert error["error_type"] == "capability_unavailable"
-            assert "ArchiveRead" not in json.dumps(captured[0].get("tools", []))
-            assert str(tmp_path) not in json.dumps(captured[0], ensure_ascii=False)
+            assert captured == []
+            assert error.value.request_size_bytes > error.value.request_budget_bytes
+            assert "provider_capacity_exhausted" in {
+                item["code"] for item in error.value.to_dict()["diagnostics"]
+            }
+            assert "archive_write_failed" in {
+                item["code"] for item in error.value.to_dict()["diagnostics"]
+            }
         finally:
             await agent.aclose()
             store.close()
@@ -988,8 +991,7 @@ def test_public_agent_tool_loop_reaches_second_provider_request(
         rescue = json.loads(wire_content)
         assert rescue["kind"] == "bounded_ref"
         assert rescue["truncated"] is True
-        assert rescue["next_offset"] == rescue["preview_chars"]
-        assert rescue["preview"]
+        assert "preview" not in rescue
         assert "ArchiveRead" in rescue["read_instructions"]
         assert "terminal" not in json.dumps(second_request, ensure_ascii=False)
         tool_definitions = second_request.get("tools", [])
@@ -1000,6 +1002,83 @@ def test_public_agent_tool_loop_reaches_second_provider_request(
         assert "ArchiveRead" in names
 
     asyncio.run(scenario())
+
+
+def test_real_openai_consumer_semantically_prunes_duplicate_read_results(
+    tmp_path: Path,
+):
+    _LoopbackSemanticPruningHandler.requests = []
+    source = tmp_path / "semantic.txt"
+    source.write_text("semantic line🙂\n" * 220, encoding="utf-8")
+    _LoopbackSemanticPruningHandler.source_path = str(source)
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0), _LoopbackSemanticPruningHandler
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        cli_home = tmp_path / "cli-home"
+        cli_home.mkdir()
+        env = os.environ.copy()
+        env.update(
+            {
+                "PYTHONPATH": str(Path(__file__).parents[2]),
+                "HOME": str(cli_home),
+                "USERPROFILE": str(cli_home),
+                "MINI_CLAUDE_RUNTIME_DIR": str(cli_home / ".mini-claude"),
+                "OPENAI_API_KEY": "fixture-key",
+                "OPENAI_BASE_URL": f"http://127.0.0.1:{server.server_port}/v1",
+                "MINI_CLAUDE_THINKING_EFFORT": "none",
+                "PYTHON_DOTENV_DISABLED": "1",
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8",
+            }
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "mini_claude",
+                "--no-thinking",
+                "--model",
+                "fixture-model",
+                "read",
+                str(source),
+            ],
+            cwd=Path(__file__).parents[2],
+            env=env,
+            capture_output=True,
+            text=False,
+            timeout=60,
+        )
+        stdout = completed.stdout.decode("utf-8", errors="replace")
+        stderr = completed.stderr.decode("utf-8", errors="replace")
+        assert completed.returncode == 0, stderr + stdout
+        assert len(_LoopbackSemanticPruningHandler.requests) == 3
+
+        second_tools = [
+            message
+            for message in _LoopbackSemanticPruningHandler.requests[1]["messages"]
+            if message.get("role") == "tool"
+        ]
+        assert len(second_tools) == 1
+        assert "semantic line🙂" in second_tools[0]["content"]
+
+        third_tools = [
+            message
+            for message in _LoopbackSemanticPruningHandler.requests[2]["messages"]
+            if message.get("role") == "tool"
+        ]
+        assert len(third_tools) == 2
+        first_result = json.loads(third_tools[0]["content"])
+        assert first_result["kind"] == "bounded_ref"
+        assert "ArchiveRead" in first_result["read_instructions"]
+        assert isinstance(third_tools[1]["content"], str)
+        assert "semantic line🙂" in third_tools[1]["content"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def test_terminal_formatter_is_content_first_bounded_and_path_free(tmp_path: Path):
@@ -1138,6 +1217,45 @@ class _LoopbackProtocolHandler(BaseHTTPRequestHandler):
                 separators=(",", ":"),
             )
             response = _openai_stream_body_with_tool("read_file", tool_args)
+        else:
+            response = _openai_stream_body("done")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(response)
+        self.wfile.flush()
+
+    def log_message(self, format: str, *args: Any) -> None:
+        del format, args
+
+
+class _LoopbackSemanticPruningHandler(BaseHTTPRequestHandler):
+    requests: list[dict[str, Any]] = []
+    lock = threading.Lock()
+    source_path = ""
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib protocol hook.
+        length = int(self.headers.get("content-length", "0"))
+        payload = json.loads(self.rfile.read(length))
+        with self.lock:
+            self.requests.append(payload)
+            request_number = len(self.requests)
+
+        if request_number in {1, 2}:
+            arguments = json.dumps(
+                {"file_path": self.source_path},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            call_id = (
+                "call-semantic-first"
+                if request_number == 1
+                else "call-semantic-second"
+            )
+            response = _openai_stream_body_with_tool(
+                "read_file", arguments, call_id=call_id
+            )
         else:
             response = _openai_stream_body("done")
         self.send_response(200)

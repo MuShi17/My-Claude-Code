@@ -16,6 +16,7 @@ from .base import (
     source_digest,
     stable_digest,
 )
+from .replay_metadata import ReplayMessageMeta, build_replay_message_metadata
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +31,10 @@ class ModelReplayResult:
     diagnostics: tuple[ProjectionDiagnostic, ...]
     context_epoch: str = "context:initial"
     context_id: str | None = None
+    # Internal-only metadata aligned one-to-one with ``messages``.  It is
+    # intentionally omitted from ``to_dict`` so neutral digests and Provider
+    # wire payloads remain unchanged.
+    message_metadata: tuple[ReplayMessageMeta, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -183,7 +188,6 @@ class ModelReplayProjection:
                         "user", "assistant", "tool"
                     }:
                         item = dict(message)
-                        item.setdefault("runtime_event_id", event.id)
                         messages.append(item)
                 continue
             content = event.content or {}
@@ -301,6 +305,11 @@ class ModelReplayProjection:
                     )
                     emitted_response_ids.add(response.event.id)
         output = {"messages": messages, "partial_count": len(reducer.partial)}
+        message_metadata = build_replay_message_metadata(
+            messages,
+            records_by_event_id={record.event.id: record for record in records},
+            calls_by_key=reducer.calls,
+        )
         return ModelReplayResult(
             projection_version=self.projection_version,
             schema_version=1,
@@ -312,9 +321,10 @@ class ModelReplayProjection:
             diagnostics=tuple(reducer.diagnostics),
             context_epoch=context_epoch,
             context_id=context_id,
+            message_metadata=message_metadata,
         )
 
     build = project
 
 
-__all__ = ["ModelReplayProjection", "ModelReplayResult"]
+__all__ = ["ModelReplayProjection", "ModelReplayResult", "ReplayMessageMeta"]

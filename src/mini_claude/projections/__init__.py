@@ -2,11 +2,14 @@
 
 from .model_replay_projection import ModelReplayProjection, ModelReplayResult
 from .incremental_replay import IncrementalModelReplayCursor, IncrementalReplayError
+from .replay_metadata import ReplayMessageMeta
 from .metrics_projection import CanonicalMetricsProjection, MetricsProjectionResult
 from .provider_context import (
     CanonicalModelContextAdapter,
     ProviderCapacityError,
     ProviderContext,
+    ProviderRequestCycle,
+    ProviderRequestCycleIdentity,
     provider_request_size_bytes,
 )
 from .run_trace_projection import RunTraceProjection, RunTraceResult
@@ -17,11 +20,14 @@ __all__ = [
     "ModelReplayResult",
     "IncrementalModelReplayCursor",
     "IncrementalReplayError",
+    "ReplayMessageMeta",
     "CanonicalMetricsProjection",
     "MetricsProjectionResult",
     "CanonicalModelContextAdapter",
     "ProviderCapacityError",
     "ProviderContext",
+    "ProviderRequestCycle",
+    "ProviderRequestCycleIdentity",
     "provider_request_size_bytes",
     "RunTraceProjection",
     "RunTraceResult",

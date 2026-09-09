@@ -23,6 +23,7 @@ from .base import (
     stable_digest,
 )
 from .model_replay_projection import ModelReplayResult
+from .replay_metadata import build_replay_message_metadata
 from ..tool_call_identity import equivalent_tool_call, is_final_tool_call
 
 
@@ -42,6 +43,9 @@ class IncrementalModelReplayCursor:
         self._digest = hashlib.sha256(b"[")
         self._messages: list[dict[str, Any]] = []
         self._calls: dict[tuple[str, str], EventRecord] = {}
+        # Keep the canonical call lookup available after a compaction reset so
+        # retained tool messages can rebuild the same sidecar as cold replay.
+        self._all_calls_by_key: dict[tuple[str, str], EventRecord] = {}
         self._conflicted_call_keys: set[tuple[str, str]] = set()
         self._record_by_event_id: dict[str, EventRecord] = {}
         self._responses: dict[tuple[str, str], list[EventRecord]] = {}
@@ -138,6 +142,11 @@ class IncrementalModelReplayCursor:
     def result(self) -> ModelReplayResult:
         messages = self._visible_messages()
         output = {"messages": messages, "partial_count": self._partial_count}
+        message_metadata = build_replay_message_metadata(
+            messages,
+            records_by_event_id=self._record_by_event_id,
+            calls_by_key=self._all_calls_by_key,
+        )
         return ModelReplayResult(
             projection_version=self.projection_version,
             schema_version=1,
@@ -149,6 +158,7 @@ class IncrementalModelReplayCursor:
             diagnostics=tuple(self._diagnostics_with_unmatched()),
             context_epoch=self._context_epoch,
             context_id=self.context_id,
+            message_metadata=message_metadata,
         )
 
     def _append_record(self, record: EventRecord) -> None:
@@ -206,6 +216,7 @@ class IncrementalModelReplayCursor:
                     )
             else:
                 self._calls[key] = record
+                self._all_calls_by_key[key] = record
                 self._calls_by_group.setdefault(group_key, []).append((key, record))
                 self._pending_call_keys.add(key)
                 for response in self._responses.get(key, []):
@@ -310,7 +321,6 @@ class IncrementalModelReplayCursor:
                     "tool",
                 }:
                     item = dict(message)
-                    item.setdefault("runtime_event_id", event.id)
                     self._messages.append(item)
             return
 

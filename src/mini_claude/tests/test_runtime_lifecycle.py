@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -79,6 +80,32 @@ def test_request_hash_and_final_argument_decoder_are_deterministic():
     value, error = decode_tool_arguments('{"file_path":')
     assert value == '{"file_path":'
     assert error and error.startswith("invalid_json:")
+
+
+def test_model_recorder_canonicalizes_valid_string_arguments_and_preserves_invalid():
+    emitter, sink = _emitter()
+    recorder = ModelCallRecorder(emitter, _context(), provider="openai", model="fixture-model")
+    recorder.start("request-arguments")
+    recorder.final_tool_call(
+        "call-valid",
+        "read_file",
+        json.dumps({"file_path": "sample.txt"}, separators=(",", ":")),
+    )
+    valid = next(event for event in sink.events if event.content and event.content.get("id") == "call-valid")
+    assert valid.content["args"] == {"file_path": "sample.txt"}
+
+    emitter_invalid, sink_invalid = _emitter()
+    recorder_invalid = ModelCallRecorder(
+        emitter_invalid, _context(), provider="openai", model="fixture-model"
+    )
+    recorder_invalid.start("request-invalid-arguments")
+    recorder_invalid.final_tool_call("call-invalid", "read_file", '{"file_path":')
+    invalid = next(
+        event
+        for event in sink_invalid.events
+        if event.content and event.content.get("id") == "call-invalid"
+    )
+    assert invalid.content["args"] == '{"file_path":'
 
 
 def test_model_retry_has_distinct_attempt_identity_and_summary_link():

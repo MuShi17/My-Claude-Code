@@ -467,7 +467,14 @@ class ModelCallRecorder:
 
     def final_tool_call(self, call_id: str, name: str, arguments: Any) -> RuntimeEvent:
         self._require_started()
-        safe_args = redact_payload(arguments, self.redaction_policy)
+        decoded_arguments, argument_error = decode_tool_arguments(arguments)
+        # OpenAI-compatible providers deliver function.arguments as a JSON
+        # object string.  Persist the same mapping that DurableToolBoundary
+        # will use so canonical replay can build semantic descriptors without
+        # relying on provider-specific message shapes.  Invalid/non-object
+        # arguments remain unchanged; replay marks those inputs incomplete.
+        canonical_arguments = arguments if argument_error else decoded_arguments
+        safe_args = redact_payload(canonical_arguments, self.redaction_policy)
         stream_key = self._stream_key("function_call", call_id)
         return self._emit(
             role="model",

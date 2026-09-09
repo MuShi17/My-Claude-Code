@@ -99,10 +99,8 @@ def test_bounded_placeholder_has_identical_first_and_replayed_bytes(tmp_path: Pa
     response_event = RuntimeEvent.from_dict(response)
     safe_degradation = {
         "kind": "archive_read_error",
-        "error_type": "capability_unavailable",
-        "message": "ArchiveRead capability is unavailable",
-        "preview": bounded_ref["inline"],
-        "ref": bounded_ref["ref"],
+        "error_type": "invalid_archive_read",
+        "message": "invalid ArchiveRead result envelope",
     }
     first = materialize_tool_result(safe_degradation, provider="anthropic")
     assert isinstance(first, str)

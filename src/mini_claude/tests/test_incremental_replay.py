@@ -79,6 +79,9 @@ def test_warm_cursor_matches_cold_replay_for_multi_tool_and_thinking_shapes():
     warm = cursor.result()
 
     assert warm.to_dict() == cold.to_dict()
+    assert [item.to_dict() for item in warm.message_metadata] == [
+        item.to_dict() for item in cold.message_metadata
+    ]
     assert CanonicalModelContextAdapter().build_result(
         warm, provider="anthropic"
     ).messages == CanonicalModelContextAdapter().build(
@@ -217,6 +220,13 @@ def test_warm_cursor_restarts_effective_prefix_at_full_compaction():
     cursor.append([EventRecord(len(records) + 1, event)])
 
     assert cursor.result().to_dict() == cold.to_dict()
+    assert [item.to_dict() for item in cursor.result().message_metadata] == [
+        item.to_dict() for item in cold.message_metadata
+    ]
+    assert [item.identity_state for item in cursor.result().message_metadata] == [
+        "synthetic",
+        "synthetic",
+    ]
     assert cursor.result().context_epoch == "context:checkpoint-1"
 
 
@@ -262,6 +272,8 @@ def test_full_compaction_preserves_retained_source_ids_for_later_replacement():
     after_compaction = [*events, compaction_event]
     compacted = ModelReplayProjection().build(after_compaction)
     assert compacted.messages[-1]["runtime_event_id"] == retained_response_id
+    assert compacted.message_metadata[0].identity_state == "synthetic"
+    assert compacted.message_metadata[1].identity_state == "synthetic"
 
     replacement = ContextReplacement(
         target_event_id=retained_response_id,

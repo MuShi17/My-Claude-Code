@@ -9,7 +9,10 @@ from pathlib import Path
 
 import pytest
 
-from mini_claude.archive_capability import ToolResultArchiveCapability
+from mini_claude.archive_capability import (
+    ARCHIVE_PREVIEW_CHARS,
+    ToolResultArchiveCapability,
+)
 from mini_claude.archive_projection import (
     _archive_read_capacity_error,
     project_archived_tool_results,
@@ -22,6 +25,7 @@ from mini_claude.projections.provider_context import (
     ProviderCapacityError,
 )
 from mini_claude.projections.model_replay_projection import ModelReplayResult
+from mini_claude.projections.replay_metadata import ReplayMessageMeta
 from mini_claude.runtime_lifecycle import DurableToolBoundary
 from mini_claude.runtime_event import canonical_json_bytes
 from mini_claude.runtime_store import SQLiteRuntimeStore
@@ -75,7 +79,7 @@ def _fixture(tmp_path: Path, content: str = "首行\n" + "正文🙂\n" * 1200):
 
 
 @pytest.mark.parametrize("provider", ["anthropic", "openai"])
-def test_first_use_hydrates_complete_safe_body_for_each_provider(tmp_path: Path, provider: str):
+def test_existing_placeholder_is_not_hydrated_for_each_provider(tmp_path: Path, provider: str):
     _archive, ref, capability, messages, content = _fixture(tmp_path)
     context = CanonicalModelContextAdapter().build_result(
         _result(messages),
@@ -86,18 +90,25 @@ def test_first_use_hydrates_complete_safe_body_for_each_provider(tmp_path: Path,
     )
 
     if provider == "anthropic":
-        tool_result = next(
-            block
+        wire_content = next(
+            block["content"]
             for message in context.messages
             if message.get("role") == "user"
             for block in message.get("content", [])
             if block.get("type") == "tool_result"
         )
-        assert tool_result["content"] == content
     else:
-        tool_result = next(message for message in context.messages if message.get("role") == "tool")
-        assert tool_result["content"] == content
-    assert ref.ref not in str(tool_result.get("content"))
+        wire_content = next(
+            message["content"]
+            for message in context.messages
+            if message.get("role") == "tool"
+        )
+    projected = json.loads(wire_content)
+    assert projected["kind"] == "bounded_ref"
+    assert projected["ref"] == ref.ref
+    assert "preview" not in projected
+    assert "ArchiveRead" in projected["read_instructions"]
+    assert content not in wire_content
 
 
 @pytest.mark.parametrize("provider", ["anthropic", "openai"])
@@ -112,9 +123,7 @@ def test_capacity_rescue_and_stale_projection_are_actionable(tmp_path: Path, pro
     assert rescue["kind"] == "bounded_ref"
     assert rescue["ref"] == ref.ref
     assert rescue["truncated"] is True
-    assert rescue["preview"] == content[: rescue["preview_chars"]]
-    assert rescue["preview_chars"] <= 4_000
-    assert rescue["next_offset"] == rescue["preview_chars"]
+    assert "preview" not in rescue
     assert "ArchiveRead" in rescue["read_instructions"]
 
     stale_messages = (*messages, {"role": "user", "content": "next"})
@@ -155,12 +164,11 @@ def test_capacity_rescue_and_stale_projection_are_actionable(tmp_path: Path, pro
     assert ref.ref in wire
     assert "ArchiveRead" in wire
 
-    with pytest.raises(ProviderCapacityError) as blocked:
-        project_archived_tool_results(messages, capability, budget_bytes=1)
-    assert blocked.value.ref == ref.ref
+    blocked = project_archived_tool_results(messages, capability, budget_bytes=1)
+    assert blocked[1]["content"] == rescue
 
 
-def test_complete_canonical_result_is_archived_only_when_projection_needs_it(
+def test_raw_result_without_replay_metadata_is_fail_open(
     tmp_path: Path,
 ):
     archive = ArtifactArchive(tmp_path / "artifacts")
@@ -187,16 +195,13 @@ def test_complete_canonical_result_is_archived_only_when_projection_needs_it(
     assert messages[1]["content"] == content
 
     rescue = project_archived_tool_results(messages, capability, budget_bytes=2_000)
-    envelope = rescue[1]["content"]
-    assert envelope["kind"] == "bounded_ref"
-    assert envelope["preview"] == content[: envelope["preview_chars"]]
-    assert envelope["next_offset"] == envelope["preview_chars"]
-    assert archive.inspect(envelope["ref"]).size_bytes > 16_384
+    assert rescue[1]["content"] == content
+    assert not list((tmp_path / "artifacts").rglob("*.bin"))
     assert messages[1]["content"] == content
 
 
 @pytest.mark.parametrize("provider", ["anthropic", "openai"])
-def test_only_latest_completed_provider_step_is_first_use(
+def test_raw_active_steps_without_sidecar_are_not_guessed(
     tmp_path: Path, provider: str
 ):
     archive = ArtifactArchive(tmp_path / "artifacts")
@@ -232,9 +237,9 @@ def test_only_latest_completed_provider_step_is_first_use(
         capability,
         budget_bytes=200_000,
     )
-    assert projected[2]["content"]["kind"] == "bounded_ref"
+    assert projected[2]["content"] == first
     assert projected[4]["content"] == second
-    assert len(list((tmp_path / "artifacts").rglob("*.bin"))) == 1
+    assert len(list((tmp_path / "artifacts").rglob("*.bin"))) == 0
 
     context = CanonicalModelContextAdapter().build_result(
         _result(tuple(projected)),
@@ -388,13 +393,12 @@ def test_archive_read_capacity_error_does_not_archive_page(tmp_path: Path):
     )
     before = len(list((tmp_path / "artifacts").rglob("*.bin")))
 
-    with pytest.raises(ProviderCapacityError) as error:
-        project_archived_tool_results(
-            messages,
-            capability,
-            budget_bytes=1_000,
-        )
-    assert error.value.ref == ref.ref
+    projected = project_archived_tool_results(
+        messages,
+        capability,
+        budget_bytes=1_000,
+    )
+    assert projected[-1]["content"] == page
     assert len(list((tmp_path / "artifacts").rglob("*.bin"))) == before
 
 
@@ -433,9 +437,7 @@ def test_archive_read_capacity_error_is_returned_at_exact_fit(tmp_path: Path):
     )
 
     assert len(canonical_json_bytes(list(messages))) > exact_budget
-    assert projected[-1]["content"] == fallback
-    assert projected[-1]["content"]["error_type"] == "capacity_exhausted"
-    assert "ArchiveRead" in projected[-1]["content"]["read_instructions"]
+    assert projected[-1]["content"] == page
     assert len(list((tmp_path / "artifacts").rglob("*.bin"))) == 1
 
 
@@ -491,6 +493,233 @@ def test_historical_archive_read_bounded_ref_fills_missing_read_hint(tmp_path: P
     assert "ArchiveRead" in repaired["read_instructions"]
     assert '"offset":512' in repaired["read_instructions"]
     assert '"limit":64' in repaired["read_instructions"]
+
+
+def test_existing_placeholder_rejects_wrong_integrity_claims_and_repairs_legacy_fields(
+    tmp_path: Path,
+):
+    archive = ArtifactArchive(tmp_path / "artifacts")
+    capability = ToolResultArchiveCapability(
+        archive,
+        session_id="session-a",
+        run_id="run-a",
+    )
+    ref = capability.archive_result("trusted body\n" * 20, call_id="call-source")
+    original = ref.placeholder()
+
+    for field, value in (
+        ("sha256", "sha256:" + "0" * 64),
+        ("size_bytes", original["size_bytes"] + 1),
+    ):
+        tampered = dict(original)
+        tampered[field] = value
+        projected = project_archived_tool_results(
+            _archive_read_messages(tampered), capability, budget_bytes=200_000
+        )
+        error = projected[1]["content"]
+        assert error["kind"] == "archive_read_error"
+        assert error["error_type"] == "integrity_mismatch"
+        assert "sha256" not in error
+        assert "size_bytes" not in error
+
+    legacy = dict(original)
+    legacy.pop("sha256")
+    legacy.pop("size_bytes")
+    repaired = project_archived_tool_results(
+        _archive_read_messages(legacy), capability, budget_bytes=200_000
+    )[1]["content"]
+    assert repaired["ref"] == ref.ref
+    assert repaired["sha256"] == ref.sha256
+    assert repaired["size_bytes"] == ref.size_bytes
+
+
+def test_declared_invalid_bounded_ref_is_not_rearchived(
+    tmp_path: Path,
+):
+    archive = ArtifactArchive(tmp_path / "artifacts")
+    capability = ToolResultArchiveCapability(
+        archive,
+        session_id="session-a",
+        run_id="run-a",
+    )
+    malformed = {
+        "kind": "bounded_ref",
+        "ref": "artifact:sha256:not-a-256-bit-ref",
+    }
+    messages = (
+        {"role": "assistant", "content": None},
+        {"role": "tool", "tool_call_id": "call-invalid", "content": malformed},
+    )
+    metadata = (
+        ReplayMessageMeta(),
+        ReplayMessageMeta(
+            identity_state="complete",
+            runtime_event_id="event-invalid",
+            canonical_ordinal=2,
+            turn_id="turn-a",
+            run_id="run-a",
+            invocation_id="invocation-a",
+            step_key=("invocation-a", "call-invalid"),
+            step_ordinal=1,
+            tool_call_id="call-invalid",
+            tool_name="read_file",
+            body_sha256="sha256:" + "1" * 64,
+            estimated_tokens=3_000,
+            completed=True,
+            success=True,
+        ),
+    )
+    before = len(list((tmp_path / "artifacts").rglob("*.bin")))
+
+    projected = project_archived_tool_results(
+        messages,
+        capability,
+        message_metadata=metadata,
+        active_turn_id="turn-a",
+        include_latest_active=True,
+        budget_bytes=200_000,
+    )
+
+    error = projected[1]["content"]
+    assert error["kind"] == "archive_read_error"
+    assert error["error_type"] == "invalid_archive_read"
+    assert len(list((tmp_path / "artifacts").rglob("*.bin"))) == before
+
+
+def test_existing_archive_page_rejects_wrong_integrity_claims(tmp_path: Path):
+    archive = ArtifactArchive(tmp_path / "artifacts")
+    capability = ToolResultArchiveCapability(
+        archive,
+        session_id="session-a",
+        run_id="run-a",
+    )
+    ref = capability.archive_result("page source\n" * 20, call_id="call-source")
+    page = json.loads(
+        capability.execute(
+            {"operation": "read", "ref": ref.ref, "offset": 0, "limit": 32}
+        )
+    )
+    page["sha256"] = "sha256:" + "0" * 64
+    projected = project_archived_tool_results(
+        _archive_read_messages(page), capability, budget_bytes=200_000
+    )
+    assert projected[1]["content"]["kind"] == "archive_read_error"
+    assert projected[1]["content"]["error_type"] == "integrity_mismatch"
+
+
+def test_existing_archive_page_rejects_forged_body_and_range(tmp_path: Path):
+    archive = ArtifactArchive(tmp_path / "artifacts")
+    capability = ToolResultArchiveCapability(
+        archive,
+        session_id="session-a",
+        run_id="run-a",
+    )
+    ref = capability.archive_result("trusted page body\n" * 20, call_id="call-source")
+    page = json.loads(
+        capability.execute(
+            {"operation": "read", "ref": ref.ref, "offset": 0, "limit": 32}
+        )
+    )
+    forged = dict(page)
+    forged.update(page="forged", next_offset=1, total_units=1, has_more=False)
+
+    projected = project_archived_tool_results(
+        _archive_read_messages(forged), capability, budget_bytes=200_000
+    )
+
+    error = projected[1]["content"]
+    assert error["kind"] == "archive_read_error"
+    assert error["error_type"] == "integrity_mismatch"
+    assert "page" not in error
+    assert "next_offset" not in error
+    assert "total_units" not in error
+
+
+def test_archive_read_envelopes_bound_optional_fields_and_unknown_keys(
+    tmp_path: Path,
+):
+    archive = ArtifactArchive(tmp_path / "artifacts")
+    capability = ToolResultArchiveCapability(
+        archive,
+        session_id="session-a",
+        run_id="run-a",
+    )
+    ref = capability.archive_result("bounded page body\n" * 20, call_id="call-source")
+    page = json.loads(
+        capability.execute(
+            {"operation": "read", "ref": ref.ref, "offset": 0, "limit": 32}
+        )
+    )
+
+    oversized_page_hint = dict(
+        page,
+        read_instructions="x" * 2_049,
+    )
+    oversized_page_result = project_archived_tool_results(
+        _archive_read_messages(oversized_page_hint), capability, budget_bytes=200_000
+    )[1]["content"]
+    assert oversized_page_result["error_type"] == "invalid_archive_read"
+    assert "read_instructions" not in oversized_page_result
+
+    unknown_page_field = dict(page, unexpected="must not pass")
+    unknown_page_result = project_archived_tool_results(
+        _archive_read_messages(unknown_page_field), capability, budget_bytes=200_000
+    )[1]["content"]
+    assert unknown_page_result["error_type"] == "invalid_archive_read"
+    assert "unexpected" not in unknown_page_result
+
+    oversized_error = {
+        "kind": "archive_read_error",
+        "error_type": "invalid_archive_read",
+        "message": "fixture",
+        "ref": ref.ref,
+        "preview": "x" * (ARCHIVE_PREVIEW_CHARS + 1),
+    }
+    error_result = project_archived_tool_results(
+        _archive_read_messages(oversized_error), capability, budget_bytes=200_000
+    )[1]["content"]
+    assert error_result["error_type"] == "invalid_archive_read"
+    assert "preview" not in error_result
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        {
+            "kind": "archive_page",
+            "ref": "not-an-artifact-ref",
+            "sha256": 123,
+            "size_bytes": -1,
+            "offset": -1,
+            "next_offset": "later",
+            "total_units": 1,
+            "unit": "chars",
+            "has_more": True,
+            "page": {"unexpected": "object"},
+        },
+        {
+            "kind": "archive_read_error",
+            "error_type": 42,
+            "message": {"unexpected": "object"},
+            "ref": 17,
+        },
+    ],
+)
+def test_malformed_archive_read_envelope_becomes_bounded_error(
+    tmp_path: Path, malformed: dict[str, object]
+):
+    capability = ToolResultArchiveCapability(
+        ArtifactArchive(tmp_path / "artifacts"),
+        session_id="session-a",
+        run_id="run-a",
+    )
+    projected = project_archived_tool_results(
+        _archive_read_messages(malformed), capability, budget_bytes=200_000
+    )
+    error = projected[1]["content"]
+    assert error["kind"] == "archive_read_error"
+    assert error["error_type"] == "invalid_archive_read"
+    assert "unexpected" not in json.dumps(error, ensure_ascii=False)
 
 
 @pytest.mark.parametrize(
@@ -555,8 +784,8 @@ def test_same_canonical_result_reuses_logical_ref_across_chat_runs(tmp_path: Pat
         messages, second, budget_bytes=2_000
     )
 
-    assert first_projection[1]["content"] == second_projection[1]["content"]
-    assert first_projection[1]["content"]["ref"].startswith("artifact:tool-result:")
+    assert first_projection[1]["content"] == content
+    assert second_projection[1]["content"] == content
 
     named_replay_messages = (
         messages[0],
@@ -567,9 +796,9 @@ def test_same_canonical_result_reuses_logical_ref_across_chat_runs(tmp_path: Pat
         second,
         budget_bytes=2_000,
     )
-    assert named_replay_projection[1]["content"] == first_projection[1]["content"]
-    assert len(list((tmp_path / "artifacts" / "refs").glob("*.json"))) == 1
-    assert len(list((tmp_path / "artifacts" / "sha256").rglob("*.bin"))) == 1
+    assert named_replay_projection[1]["content"] == content
+    assert len(list((tmp_path / "artifacts" / "refs").glob("*.json"))) == 0
+    assert len(list((tmp_path / "artifacts" / "sha256").rglob("*.bin"))) == 0
 
 
 def test_historical_logical_ref_is_readable_after_run_changes(tmp_path: Path):
@@ -767,7 +996,7 @@ def test_archive_aware_live_pipeline_skips_legacy_result_rewriters(
     ) == before
 
 
-def test_projection_archive_failure_returns_error_without_success_ref(tmp_path: Path):
+def test_projection_archive_failure_keeps_raw_without_success_ref(tmp_path: Path):
     class Failure:
         def check(self, point: str) -> None:
             if point in {"artifact.write", "archive.write"}:
@@ -790,10 +1019,7 @@ def test_projection_archive_failure_returns_error_without_success_ref(tmp_path: 
     )
 
     projected = project_archived_tool_results(messages, capability, budget_bytes=2_000)
-    error = projected[1]["content"]
-    assert error["kind"] == "archive_read_error"
-    assert error["error_type"] == "capability_unavailable"
-    assert "ref" not in error
+    assert projected[1]["content"] == content
     assert not list((tmp_path / "artifacts").rglob("*.json"))
 
 
@@ -970,7 +1196,7 @@ def test_real_agent_replay_reaches_fake_provider_with_archive_projection(
         )
         rescue_value = json.loads(rescue_wire)
         assert rescue_value["kind"] == "bounded_ref"
-        assert rescue_value["preview_chars"] <= 4_000
+        assert "preview" not in rescue_value
         ref = rescue_value["ref"]
         assert archive.inspect(ref).size_bytes > 16_000
         read_back = json.loads(

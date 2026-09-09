@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from ..archive_capability import ToolResultArchiveCapability
-from ..archive_projection import project_archived_tool_results
+from ..archive_projection import (
+    ArchiveProjectionResult,
+    project_archived_tool_results_outcome,
+)
 from .model_replay_projection import ModelReplayProjection, ModelReplayResult
+from .replay_metadata import ReplayMessageMeta
+from .base import ProjectionDiagnostic
 from ..provider_content import materialize_tool_result
 from ..provider_capacity import ProviderCapacityError
 from ..runtime_event import canonical_json_bytes
@@ -27,12 +33,87 @@ class ProviderContext:
     request_size_bytes: int = 0
     request_budget_bytes: int | None = None
     request_fits: bool = True
+    projection_phase: str = "ordinary"
+    emergency_used: bool = False
+    cycle_identity: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ProviderRequestCycleIdentity:
+    """Stable identity for one Agent-owned Provider request projection."""
+
+    session_id: str
+    provider_request_id: str
+    source_digest: str
+    source_high_water: int
+    provider: str
+    active_turn_id: str | None
+    system_tools_digest: str
+    request_budget_bytes: int | None
+
+    @property
+    def digest(self) -> str:
+        return hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "session_id": self.session_id,
+                    "provider_request_id": self.provider_request_id,
+                    "source_digest": self.source_digest,
+                    "source_high_water": self.source_high_water,
+                    "provider": self.provider,
+                    "active_turn_id": self.active_turn_id,
+                    "system_tools_digest": self.system_tools_digest,
+                    "request_budget_bytes": self.request_budget_bytes,
+                }
+            )
+        ).hexdigest()
+
+
+@dataclass(slots=True)
+class ProviderRequestCycle:
+    """Mutable state owned by Agent, with immutable identity and pass cache."""
+
+    identity: ProviderRequestCycleIdentity
+    emergency_used: bool = False
+    cached_outcome: ArchiveProjectionResult | None = None
+    cached_phase: str | None = None
+
+    @property
+    def identity_digest(self) -> str:
+        return self.identity.digest
 
 
 def _without_runtime_id(message: dict[str, Any]) -> dict[str, Any]:
-    value = dict(message)
-    value.pop("runtime_event_id", None)
-    value.pop("context_type", None)
+    """Project the explicit neutral-to-Provider allowlist.
+
+    Runtime ids, context metadata, replay sidecars, and future internal keys
+    are intentionally not copied through this boundary.  Tool-call fields are
+    rebuilt from the neutral contract instead of forwarding arbitrary nested
+    dictionaries.
+    """
+
+    value: dict[str, Any] = {}
+    role = message.get("role")
+    if role in {"user", "assistant", "tool", "system"}:
+        value["role"] = role
+    if "content" in message:
+        value["content"] = message.get("content")
+    if role == "tool" and "tool_call_id" in message:
+        value["tool_call_id"] = message.get("tool_call_id")
+    if role == "assistant" and isinstance(message.get("tool_calls"), list):
+        calls: list[dict[str, Any]] = []
+        for call in message["tool_calls"]:
+            if not isinstance(call, Mapping):
+                continue
+            calls.append(
+                {
+                    "id": call.get("id"),
+                    "name": call.get("name"),
+                    "arguments": call.get("arguments", {}),
+                }
+            )
+        if calls:
+            value["tool_calls"] = calls
     return value
 
 
@@ -92,8 +173,32 @@ def _provider_tool_definitions(
 
     if provider_tools is None:
         return None
+    # Tool definitions may carry runtime-only flags such as ``deferred`` or
+    # test metadata.  Rebuild the provider contract from its explicit fields
+    # instead of forwarding arbitrary mappings across the wire boundary.
+    normalized: list[dict[str, Any]] = []
+    for tool in provider_tools:
+        if not isinstance(tool, Mapping):
+            continue
+        name = tool.get("name")
+        description = tool.get("description")
+        input_schema = tool.get("input_schema")
+        if not (
+            isinstance(name, str)
+            and name
+            and isinstance(description, str)
+            and isinstance(input_schema, Mapping)
+        ):
+            continue
+        normalized.append(
+            {
+                "name": name,
+                "description": description,
+                "input_schema": dict(input_schema),
+            }
+        )
     if provider == "anthropic":
-        return [dict(tool) for tool in provider_tools]
+        return normalized
     if provider == "openai":
         return [
             {
@@ -104,7 +209,7 @@ def _provider_tool_definitions(
                     "parameters": tool["input_schema"],
                 },
             }
-            for tool in provider_tools
+            for tool in normalized
         ]
     raise ValueError(f"unsupported provider {provider!r}")
 
@@ -155,6 +260,70 @@ def provider_request_size_bytes(
             )
         )
     )
+
+
+def _bounded_diagnostic(item: Any) -> ProjectionDiagnostic:
+    """Copy a diagnostic without raw content or exception details."""
+
+    code = str(getattr(item, "code", "projection_diagnostic"))[:96]
+    severity = str(getattr(item, "severity", "warning"))[:16]
+    messages = {
+        "provider_capacity_exhausted": "final Provider context exceeds the local request budget",
+        "invalid_context_transition": "canonical context transition is invalid",
+        "unmatched_tool_call": "a canonical tool call has no durable result",
+        "unmatched_tool_result": "a canonical tool result has no matching call",
+        "call_identity_conflict": "canonical tool-call identity is conflicting",
+        "missing_call_id": "canonical tool call has no identity",
+        "invalid_tool_order": "canonical tool result order is invalid",
+        "non_final_function_call": "a non-final canonical function call was ignored",
+    }
+    message = messages.get(
+        code,
+        "projection diagnostic",
+    )[:256]
+    return ProjectionDiagnostic(
+        code,
+        message,
+        severity,
+        getattr(item, "event_id", None),
+        getattr(item, "run_id", None),
+        getattr(item, "call_id", None),
+    )
+
+
+def _merge_diagnostics(
+    canonical: Sequence[Any],
+    archive: Sequence[Any],
+    *,
+    metadata: Sequence[ReplayMessageMeta],
+    capacity: Any | None = None,
+) -> tuple[ProjectionDiagnostic, ...]:
+    """Merge stable bounded diagnostics in canonical encounter order."""
+
+    ordinal_by_event = {
+        item.runtime_event_id: item.canonical_ordinal
+        for item in metadata
+        if item.runtime_event_id and item.canonical_ordinal is not None
+    }
+    values = [*canonical, *archive]
+    if capacity is not None:
+        values.append(capacity)
+    indexed: list[tuple[tuple[int, int], ProjectionDiagnostic]] = []
+    for encounter, item in enumerate(values):
+        diagnostic = _bounded_diagnostic(item)
+        ordinal = ordinal_by_event.get(diagnostic.event_id)
+        indexed.append(((int(ordinal) if ordinal is not None else 2**63, encounter), diagnostic))
+    result: list[ProjectionDiagnostic] = []
+    seen: set[tuple[str, str | None, str | None]] = set()
+    for _sort_key, diagnostic in sorted(indexed, key=lambda item: item[0]):
+        key = (diagnostic.code, diagnostic.event_id, diagnostic.call_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(diagnostic)
+        if len(result) >= 32:
+            break
+    return tuple(result)
 
 
 def _openai_user_content(value: Any) -> str | list[Any]:
@@ -382,6 +551,10 @@ class CanonicalModelContextAdapter:
         provider_tools: Sequence[Mapping[str, Any]] | None = None,
         archive_capability: ToolResultArchiveCapability | None = None,
         budget_bytes: int | None = None,
+        session_id: str | None = None,
+        request_id: str | None = None,
+        active_turn_id: str | None = None,
+        request_cycle: ProviderRequestCycle | None = None,
     ) -> ProviderContext:
         result: ModelReplayResult = self.projection.build(source, high_water=high_water)
         return self.build_result(
@@ -391,6 +564,10 @@ class CanonicalModelContextAdapter:
             provider_tools=provider_tools,
             archive_capability=archive_capability,
             budget_bytes=budget_bytes,
+            session_id=session_id,
+            request_id=request_id,
+            active_turn_id=active_turn_id,
+            request_cycle=request_cycle,
         )
 
     def build_result(
@@ -402,6 +579,10 @@ class CanonicalModelContextAdapter:
         provider_tools: Sequence[Mapping[str, Any]] | None = None,
         archive_capability: ToolResultArchiveCapability | None = None,
         budget_bytes: int | None = None,
+        session_id: str | None = None,
+        request_id: str | None = None,
+        active_turn_id: str | None = None,
+        request_cycle: ProviderRequestCycle | None = None,
     ) -> ProviderContext:
         """Adapt an already materialized neutral result without rereading it."""
 
@@ -431,12 +612,47 @@ class CanonicalModelContextAdapter:
                 provider_tools=frozen_tools,
             )
 
-        neutral_messages = project_archived_tool_results(
-            result.messages,
-            archive_capability,
-            budget_bytes=budget_bytes,
-            size_fn=final_message_size,
+        active_turn_id = active_turn_id or (
+            request_cycle.identity.active_turn_id if request_cycle is not None else None
         )
+        if request_cycle is None and request_id is not None and session_id is not None:
+            system_tools_digest = hashlib.sha256(
+                canonical_json_bytes(
+                    {"system": system_prompt, "tools": frozen_tools}
+                )
+            ).hexdigest()
+            request_cycle = ProviderRequestCycle(
+                ProviderRequestCycleIdentity(
+                    session_id=str(session_id),
+                    provider_request_id=str(request_id),
+                    source_digest=result.source_digest,
+                    source_high_water=result.high_water,
+                    provider=provider,
+                    active_turn_id=active_turn_id,
+                    system_tools_digest=system_tools_digest,
+                    request_budget_bytes=budget_bytes,
+                )
+            )
+
+        def cached_or_project(include_latest_active: bool) -> ArchiveProjectionResult:
+            if request_cycle is not None and request_cycle.cached_outcome is not None:
+                return request_cycle.cached_outcome
+            outcome = project_archived_tool_results_outcome(
+                result.messages,
+                archive_capability,
+                message_metadata=result.message_metadata,
+                active_turn_id=active_turn_id,
+                include_latest_active=include_latest_active,
+                budget_bytes=budget_bytes,
+                size_fn=final_message_size,
+            )
+            if request_cycle is not None:
+                request_cycle.cached_outcome = outcome
+                request_cycle.cached_phase = outcome.projection_phase
+            return outcome
+
+        outcome = cached_or_project(False)
+        neutral_messages = outcome.messages
         messages = convert(neutral_messages)
         request_size_bytes = provider_request_size_bytes(
             provider,
@@ -445,22 +661,86 @@ class CanonicalModelContextAdapter:
             provider_tools=frozen_tools,
         )
         request_fits = budget_bytes is None or request_size_bytes <= budget_bytes
+
+        active_metadata_available = bool(
+            active_turn_id
+            and len(result.message_metadata) == len(result.messages)
+            and any(
+                meta.has_active_identity and meta.turn_id == active_turn_id
+                for meta in result.message_metadata
+            )
+        )
+        if (
+            not request_fits
+            and budget_bytes is not None
+            and active_metadata_available
+            and request_cycle is not None
+            and not request_cycle.emergency_used
+        ):
+            # The Agent-owned cycle permits exactly one emergency pass.  Mark
+            # the state before calling the projector so a retry cannot publish
+            # a second archive set after an exception or a failed write.
+            request_cycle.emergency_used = True
+            outcome = project_archived_tool_results_outcome(
+                result.messages,
+                archive_capability,
+                message_metadata=result.message_metadata,
+                active_turn_id=active_turn_id,
+                include_latest_active=True,
+                budget_bytes=budget_bytes,
+                size_fn=final_message_size,
+            )
+            request_cycle.cached_outcome = outcome
+            request_cycle.cached_phase = outcome.projection_phase
+            neutral_messages = outcome.messages
+            messages = convert(neutral_messages)
+            request_size_bytes = provider_request_size_bytes(
+                provider,
+                messages,
+                system_prompt=system_prompt,
+                provider_tools=frozen_tools,
+            )
+            request_fits = request_size_bytes <= budget_bytes
+
+        capacity_diagnostic = None
+        if not request_fits and budget_bytes is not None:
+            capacity_diagnostic = ProjectionDiagnostic(
+                "provider_capacity_exhausted",
+                "final Provider context exceeds the local request budget",
+                "error",
+            )
+        diagnostics = _merge_diagnostics(
+            result.diagnostics,
+            outcome.diagnostics,
+            metadata=result.message_metadata,
+            capacity=capacity_diagnostic,
+        )
         return ProviderContext(
             provider=provider,
             high_water=result.high_water,
             source_digest=result.source_digest,
             projection_digest=result.digest,
             messages=messages,
-            diagnostics=result.diagnostics,
+            diagnostics=diagnostics,
             context_epoch=result.context_epoch,
             request_size_bytes=request_size_bytes,
             request_budget_bytes=budget_bytes,
             request_fits=request_fits,
+            projection_phase=outcome.projection_phase,
+            emergency_used=bool(
+                outcome.emergency_used
+                or (request_cycle is not None and request_cycle.emergency_used)
+            ),
+            cycle_identity=(
+                request_cycle.identity_digest if request_cycle is not None else None
+            ),
         )
 
 
 __all__ = [
     "CanonicalModelContextAdapter",
+    "ProviderRequestCycle",
+    "ProviderRequestCycleIdentity",
     "ProviderCapacityError",
     "ProviderContext",
     "provider_request_size_bytes",
