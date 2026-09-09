@@ -248,9 +248,10 @@ class ToolResultArchiveCapability:
     def register_ref(self, ref: ArtifactRef | Mapping[str, Any] | str) -> str:
         """Authorize a ref observed in the current canonical lineage.
 
-        This is the compatibility bridge for old metadata that predates
-        session/lineage fields. New archive writes include those fields and
-        are still checked independently.
+        Canonical history registration is also the stable authorization bridge
+        for a logical ref reused by later chat runs.  Session and scope remain
+        checked independently; unregistered refs with run lineage must still
+        match the capability's allowed run set.
         """
 
         value = ref.ref if isinstance(ref, ArtifactRef) else (
@@ -323,10 +324,13 @@ class ToolResultArchiveCapability:
             max_inline_bytes=MAX_TOOL_RESULT_BYTES,
             max_string_chars=MAX_TOOL_RESULT_BYTES,
         )
+        # The logical ref identifies one canonical tool-result fact.  The
+        # current chat run is intentionally excluded: projection may revisit
+        # the same canonical result on every later user turn.  Run lineage is
+        # retained in metadata above for authorization and diagnostics, while
+        # session/event/call/tool/body/rewrite identity stays cache-stable.
         logical_identity = {
             "session_id": self.session_id,
-            "run_id": self._run_id or "",
-            "parent_run_id": self._parent_run_id or "",
             "runtime_event_id": str(runtime_event_id or ""),
             "tool_call_id": str(call_id or ""),
             "tool_name": str(tool_name or "tool-result"),
@@ -532,14 +536,20 @@ class ToolResultArchiveCapability:
         session_id = _metadata_scope_value(metadata, "session_id")
         if session_id is not None and str(session_id) != self.session_id:
             raise ArchiveReadSessionError(_safe_message("session_mismatch"))
-        run_id = _metadata_scope_value(metadata, "run_id")
-        parent_run_id = _metadata_scope_value(metadata, "parent_run_id")
-        if run_id is not None or parent_run_id is not None:
-            lineage = {str(value) for value in (run_id, parent_run_id) if value}
-            if not lineage.intersection(self._allowed_run_ids):
-                raise ArchiveReadScopeError(_safe_message("scope_denied"))
-        elif item.ref not in self._authorized_refs:
-            raise ArchiveReadSessionError(_safe_message("session_mismatch"))
+        # A ref registered from canonical history is already authorized for
+        # this session's historical lineage.  This is required when a stable
+        # logical ref was first published by an earlier chat run and is later
+        # replayed with a fresh run id.  Direct/unregistered refs retain the
+        # stricter run/parent lineage check.
+        if item.ref not in self._authorized_refs:
+            run_id = _metadata_scope_value(metadata, "run_id")
+            parent_run_id = _metadata_scope_value(metadata, "parent_run_id")
+            if run_id is not None or parent_run_id is not None:
+                lineage = {str(value) for value in (run_id, parent_run_id) if value}
+                if not lineage.intersection(self._allowed_run_ids):
+                    raise ArchiveReadScopeError(_safe_message("scope_denied"))
+            else:
+                raise ArchiveReadSessionError(_safe_message("session_mismatch"))
         if expected_sha256 is not None and str(expected_sha256) != item.sha256:
             raise ArtifactIntegrityError("expected sha256 does not match artifact metadata")
         if expected_size_bytes is not None and int(expected_size_bytes) != item.size_bytes:

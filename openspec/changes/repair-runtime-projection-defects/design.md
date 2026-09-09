@@ -18,6 +18,8 @@
 - 让 Provider 在首请求能容纳时使用完整安全结果；只有最终 request envelope fit 失败时才使用前缀 preview + ref + 可调用 `ArchiveRead`；stale placeholder 不因后续 suffix 或整体预算变化而反复变形，且无 capability 时不制造不可恢复成功态。
 - 让 canonical tool-result boundary 在所有入口统一先完成值规范化，再按最终 canonical JSON 的 UTF-8 字节数执行公共 16 MiB（16,777,216 字节）上限；不让原始 bytes 的字符替换计数绕过 Base64/JSON 膨胀。
 - 让新工具结果归档的逻辑 identity 与内容完整性 digest 分离，支持相同 blob 的安全去重而不复用跨 session 的授权 metadata。
+- 让同一 session 的相同 canonical event/tool call/body 在不同 `chat()` run 中复用稳定 logical ref；当前 run 只作为授权/诊断上下文，不改变 ref identity。
+- 让历史 placeholder 缺少 continuation hint 时保留已有分页进度和合法 limit，避免续读退回第一页。
 - 让 artifact 发布在本地内容、逻辑 metadata 和 runtime-store mirror 任一阶段失败时不返回成功 ref，并清理本次创建的文件或留下明确 recovery-required 诊断。
 - 让 terminal 对 bounded reference、ArchiveRead page 和 ArchiveRead error 单独做正文优先的有界格式化。
 - 修复 run/invocation metrics 的时间边界，并增加多 invocation 单调性不变量。
@@ -127,7 +129,9 @@ redacted capture 只保留 provider、route、message kind、长度、hash 和�
 
 ### D8：逻辑 artifact identity 与内容完整性分离
 
-新工具结果归档使用独立的逻辑 artifact identity。identity 的稳定输入为 `session_id`、`run_id`、`parent_run_id`、可用的 `runtime_event_id`、`tool_call_id`、`tool_name`、发布后内容的 `body_sha256` 和 `rewrite_version`；当没有 runtime event id 时，run id 仍提供同一 session 内的隔离。其派生结果只用于生成新的逻辑 ref。内容文件仍按 `sha256` 存储并可跨逻辑 artifact 去重。
+新工具结果归档使用独立且跨 chat run 稳定的逻辑 artifact identity。identity 的稳定输入为 `session_id`、可用的 `runtime_event_id`（或不依赖当前 run 的稳定 canonical event key）、`tool_call_id`、规范化解析后的 `tool_name`、发布后内容的 `body_sha256` 和 `rewrite_version`；`run_id` 与 `parent_run_id` 不参与 logical ref 派生。归档时优先使用 tool message 自带的 `name`，缺失时从同一投影中的 assistant `tool_calls` 按 `tool_call_id` 回退解析；两种 replay 形状必须得到相同 tool name。其派生结果只用于生成新的逻辑 ref。内容文件仍按 `sha256` 存储并可跨逻辑 artifact 去重。
+
+`run_id`、`parent_run_id` 可以继续写入首次发布的 metadata 并参与 lineage 诊断，但不能使同一 session 的同一 canonical result 在后续 `chat()` run 中产生新 ref。对已从当前 canonical history 注册的 ref，授权检查先确认 session/scope/integrity，再允许其作为历史 lineage 读取；未注册的 ref 仍必须满足当前允许的 run/parent lineage。不同 session 即使 event/call/body 完全相同，也必须因 `session_id` 不同而得到不同 logical ref。
 
 新的逻辑 ref 使用独立前缀并在 metadata 中同时保存 `artifact_id`、`sha256` 和 `size_bytes`。capability 授权以逻辑 ref 的 metadata 为准，因此同一内容在 session A/B 中会得到不同 ref；A 的 ref 不能因为内容相同而读取 B 的 metadata。旧 `artifact:sha256:<digest>` ref 不迁移、不重写，仅保留原有只读解析路径。
 

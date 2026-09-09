@@ -80,7 +80,7 @@ Session, Model Replay, resume, metrics and other canonical-derived projections S
 
 ### Requirement: Provider archive projection SHALL be recoverable and separate from terminal projection
 
-Provider request projection SHALL preserve the Maka-aligned lifecycle: a newly completed safe result SHALL be materialized when the first Provider-specific projected request context can contain it; capacity rescue SHALL use a bounded prefix preview with its actual continuation offset, ref and callable `ArchiveRead` instruction; stale results SHALL use an actionable stable placeholder. The fit decision SHALL use the complete final Provider context envelope (system, messages, Provider-specific tools and tool-result shapes) and the frozen local formula `effective_window=int(model_context_window*0.70)`, `budget_bytes=max(0, effective_window*4)`. Binary previews MAY be base64 on the wire, but their continuation offset SHALL remain a byte offset. A result SHALL NOT become a successful opaque reference when the current Agent has no scoped capability that can read it.
+Provider request projection SHALL preserve the Maka-aligned lifecycle: a newly completed safe result SHALL be materialized when the first Provider-specific projected request context can contain it; capacity rescue SHALL use a bounded prefix preview with its actual continuation offset, ref and callable `ArchiveRead` instruction; stale results SHALL use an actionable stable placeholder. The fit decision SHALL use the complete final Provider context envelope (system, messages, Provider-specific tools and tool-result shapes) and the frozen local formula `effective_window=int(model_context_window*0.70)`, `budget_bytes=max(0, effective_window*4)`. Binary previews MAY be base64 on the wire, but their continuation offset SHALL remain a byte offset. When a historical placeholder lacks `read_instructions`, the projection SHALL derive its instruction offset from `next_offset`, then `offset`, then `0`, and SHALL preserve a valid existing `limit`. A result SHALL NOT become a successful opaque reference when the current Agent has no scoped capability that can read it.
 
 #### Scenario: The first Provider request has sufficient capacity
 
@@ -199,10 +199,10 @@ Provider hydration, terminal formatting, historical deduplication and ArchiveRea
 - **WHEN** a ref is missing, out of scope, integrity-invalid, or bound to a closed store
 - **THEN** the projection returns a structured bounded error or a safe inline result when available, and does not claim successful recoverability
 
-#### Scenario: Historical artifact compatibility is needed
+#### Scenario: Historical artifact compatibility preserves continuation
 
-- **WHEN** an old valid `bounded_ref` lacks a `read_instructions` field
-- **THEN** the Provider projection derives a safe default ArchiveRead instruction without rewriting the historical artifact
+- **WHEN** an old valid `bounded_ref` lacks a `read_instructions` field but contains `next_offset=512`, `offset=256`, and `limit=64`
+- **THEN** the Provider projection derives an ArchiveRead instruction with `offset=512` and `limit=64`, without rewriting the historical artifact
 
 ### Requirement: Canonical tool-result serialization SHALL use a normalized UTF-8 byte boundary
 
@@ -228,14 +228,24 @@ All tool-result ingress paths SHALL normalize the result before measuring it. Ra
 - **WHEN** a tool returns a circular or otherwise non-JSON-serializable value
 - **THEN** the boundary returns a stable `result_not_serializable` error without using `str(value)` as an under-counting substitute
 
-### Requirement: New tool-result artifacts SHALL separate logical identity from content digest
+### Requirement: New tool-result artifacts SHALL separate stable logical identity from content digest
 
-New capability-owned tool-result artifacts SHALL derive a logical `artifact_id` from session/run/parent-lineage/event/call/tool/body-digest/rewrite identity and SHALL expose a ref that is distinct from the content `sha256`. The underlying content blob MAY be shared by digest, but logical metadata SHALL remain separate and authorization SHALL validate the logical ref's session and lineage metadata. Legacy `artifact:sha256:<digest>` refs SHALL remain readable through their existing metadata without being rewritten.
+New capability-owned tool-result artifacts SHALL derive a stable logical `artifact_id` from session, a stable canonical event key, tool call, normalized tool name, body digest and rewrite identity, and SHALL expose a ref that is distinct from the content `sha256`. When the tool message has no `name`, the projection SHALL resolve the tool name from the assistant `tool_calls` entry with the same `tool_call_id` before falling back to the neutral tool-result name. The current `run_id` and `parent_run_id` SHALL NOT participate in the logical ref identity, but MAY remain in metadata for authorization and diagnostics. The underlying content blob MAY be shared by digest, but logical metadata SHALL remain separate and authorization SHALL validate session/scope/integrity; a ref observed and registered from the current canonical history MAY be read across later runs in the same session, while an unregistered ref SHALL still require the allowed run/parent lineage. Legacy `artifact:sha256:<digest>` refs SHALL remain readable through their existing metadata without being rewritten.
 
 #### Scenario: Identical content is archived in two sessions
 
 - **WHEN** session A and session B archive the same tool-result body
 - **THEN** they receive different logical refs with the same content digest, each session can read its own ref, and neither session can read the other's ref
+
+#### Scenario: The same canonical result is projected in two chat runs
+
+- **WHEN** the same session reprojects identical canonical tool-result content with the same runtime event ID, tool call ID and tool name under `run-a` and `run-b`
+- **THEN** both projections receive the same logical ref and identical placeholder content, only one logical metadata record is created, and the second run can read the ref after it is registered from canonical history
+
+#### Scenario: Replay shape omits tool name on the tool message
+
+- **WHEN** two projections contain the same assistant `tool_calls` entry and canonical tool result, but one tool message omits `name` while the other includes it
+- **THEN** both projections resolve the same tool name and receive the same logical ref and placeholder content
 
 #### Scenario: A logical ref fails integrity validation
 

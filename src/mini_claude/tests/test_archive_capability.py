@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from mini_claude.archive_capability import (
+    ArchiveReadScopeError,
     ToolResultArchiveCapability,
 )
 from mini_claude.artifact_archive import (
@@ -189,6 +190,69 @@ def test_projection_archive_writer_separates_logical_identity_from_content_diges
 
     child = capability.derive(run_id="child-a", parent_run_id="run-a")
     assert child.inspect(first.ref)["ref"] == first.ref
+
+
+def test_same_canonical_tool_result_reuses_logical_ref_across_chat_runs(
+    tmp_path: Path,
+) -> None:
+    archive = ArtifactArchive(tmp_path / "artifacts")
+    first = ToolResultArchiveCapability(archive, session_id="session-a", run_id="run-a")
+    second = ToolResultArchiveCapability(archive, session_id="session-a", run_id="run-b")
+    value = {"same": "canonical body🙂"}
+    identity = {
+        "call_id": "call-a",
+        "tool_name": "read_file",
+        "runtime_event_id": "event-a",
+    }
+
+    first_ref = first.archive_result(value, **identity)
+    second_ref = second.archive_result(value, **identity)
+
+    assert second_ref.ref == first_ref.ref
+    assert second_ref.artifact_id == first_ref.artifact_id
+    assert second.inspect(second_ref.ref)["ref"] == first_ref.ref
+    assert second.inspect(second_ref.ref)["metadata"]["run_id"] == "run-a"
+    assert len(list((tmp_path / "artifacts" / "refs").glob("*.json"))) == 1
+    assert len(list((tmp_path / "artifacts" / "sha256").rglob("*.bin"))) == 1
+
+
+def test_registered_historical_ref_keeps_integrity_checks_across_chat_runs(
+    tmp_path: Path,
+) -> None:
+    archive = ArtifactArchive(tmp_path / "artifacts")
+    source = ToolResultArchiveCapability(
+        archive,
+        session_id="session-a",
+        run_id="run-a",
+    )
+    later = ToolResultArchiveCapability(
+        archive,
+        session_id="session-a",
+        run_id="run-b",
+    )
+    ref = source.archive_result(
+        "historical body",
+        call_id="call-a",
+        tool_name="fixture",
+        runtime_event_id="event-a",
+    )
+
+    with pytest.raises(ArchiveReadScopeError):
+        later.read(ref.ref, limit=4)
+
+    later.register_ref(ref)
+    page = later.read(
+        ref.ref,
+        limit=4,
+        expected_sha256=ref.sha256,
+        expected_size_bytes=ref.size_bytes,
+    )
+    assert page["page"] == "hist"
+
+    with pytest.raises(ArtifactIntegrityError):
+        later.read(ref.ref, expected_sha256="0" * 64)
+    with pytest.raises(ArtifactIntegrityError):
+        later.read(ref.ref, expected_size_bytes=ref.size_bytes + 1)
 
 
 def test_identical_tool_result_in_two_sessions_has_independent_authorization(

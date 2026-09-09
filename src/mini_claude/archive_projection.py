@@ -137,12 +137,43 @@ def _ensure_read_instructions(
     capability: ToolResultArchiveCapability,
     ref: str,
 ) -> dict[str, Any]:
-    """Preserve a historical placeholder, filling only a missing hint."""
+    """Preserve a historical placeholder, filling only a missing hint.
+
+    Historical placeholders can outlive the request that produced them.  If
+    their hint was omitted by an older writer, continue from the furthest
+    recorded page boundary instead of silently restarting at offset zero.
+    """
 
     result = dict(value)
     instructions = result.get("read_instructions")
     if not isinstance(instructions, str) or not instructions:
-        result["read_instructions"] = capability.read_instructions(ref)
+        def non_negative_int(candidate: Any) -> int | None:
+            if isinstance(candidate, bool) or not isinstance(candidate, int):
+                return None
+            return candidate if candidate >= 0 else None
+
+        next_offset = non_negative_int(result.get("next_offset"))
+        offset = non_negative_int(result.get("offset"))
+        continuation_offset = (
+            next_offset if next_offset is not None
+            else offset if offset is not None
+            else 0
+        )
+        existing_limit = result.get("limit")
+        limit = (
+            existing_limit
+            if (
+                isinstance(existing_limit, int)
+                and not isinstance(existing_limit, bool)
+                and 1 <= existing_limit <= capability.max_limit
+            )
+            else None
+        )
+        result["read_instructions"] = capability.read_instructions(
+            ref,
+            offset=continuation_offset,
+            limit=limit,
+        )
     return result
 
 
@@ -661,7 +692,11 @@ def project_archived_tool_results(
             archived = capability.archive_result(
                 message.get("content"),
                 call_id=tool_call_id if isinstance(tool_call_id, str) else None,
-                tool_name=message.get("name") if isinstance(message.get("name"), str) else None,
+                tool_name=(
+                    message.get("name")
+                    if isinstance(message.get("name"), str) and message.get("name")
+                    else tool_names.get(str(tool_call_id))
+                ),
                 runtime_event_id=(
                     message.get("runtime_event_id")
                     if isinstance(message.get("runtime_event_id"), str)

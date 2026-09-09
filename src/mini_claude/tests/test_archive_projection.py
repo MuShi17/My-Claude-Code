@@ -477,6 +477,7 @@ def test_historical_archive_read_bounded_ref_fills_missing_read_hint(tmp_path: P
     )
     ref = capability.archive_result("historical body\n" * 20, call_id="call-source")
     placeholder = ref.placeholder()
+    placeholder.update({"offset": 256, "next_offset": 512, "limit": 64})
     placeholder.pop("read_instructions", None)
     messages = (
         *_archive_read_messages(placeholder),
@@ -488,6 +489,115 @@ def test_historical_archive_read_bounded_ref_fills_missing_read_hint(tmp_path: P
     repaired = projected[1]["content"]
     assert repaired["ref"] == ref.ref
     assert "ArchiveRead" in repaired["read_instructions"]
+    assert '"offset":512' in repaired["read_instructions"]
+    assert '"limit":64' in repaired["read_instructions"]
+
+
+@pytest.mark.parametrize(
+    ("placeholder_updates", "expected_offset"),
+    [
+        ({"offset": 256}, 256),
+        ({}, 0),
+    ],
+)
+def test_historical_archive_read_missing_hint_falls_back_to_continuation_offset(
+    tmp_path: Path,
+    placeholder_updates: dict[str, int],
+    expected_offset: int,
+):
+    archive = ArtifactArchive(tmp_path / "artifacts")
+    capability = ToolResultArchiveCapability(
+        archive,
+        session_id="session-a",
+        run_id="run-a",
+    )
+    ref = capability.archive_result("historical body\n" * 20, call_id="call-source")
+    placeholder = ref.placeholder()
+    placeholder.update(placeholder_updates)
+    placeholder.pop("read_instructions", None)
+    messages = (
+        *_archive_read_messages(placeholder),
+        {"role": "user", "content": "next"},
+    )
+
+    projected = project_archived_tool_results(messages, capability, budget_bytes=1)
+
+    repaired = projected[1]["content"]
+    assert f'"offset":{expected_offset}' in repaired["read_instructions"]
+
+
+def test_same_canonical_result_reuses_logical_ref_across_chat_runs(tmp_path: Path):
+    archive = ArtifactArchive(tmp_path / "artifacts")
+    first = ToolResultArchiveCapability(archive, session_id="session-a", run_id="run-a")
+    second = ToolResultArchiveCapability(archive, session_id="session-a", run_id="run-b")
+    content = "canonical body🙂\n" * 5_000
+    messages = (
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call-read", "name": "read_file", "arguments": {}}
+            ],
+            "runtime_event_id": "event-assistant",
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-read",
+            "content": content,
+            "runtime_event_id": "event-tool",
+        },
+    )
+
+    first_projection = project_archived_tool_results(
+        messages, first, budget_bytes=2_000
+    )
+    second_projection = project_archived_tool_results(
+        messages, second, budget_bytes=2_000
+    )
+
+    assert first_projection[1]["content"] == second_projection[1]["content"]
+    assert first_projection[1]["content"]["ref"].startswith("artifact:tool-result:")
+
+    named_replay_messages = (
+        messages[0],
+        {**messages[1], "name": "read_file"},
+    )
+    named_replay_projection = project_archived_tool_results(
+        named_replay_messages,
+        second,
+        budget_bytes=2_000,
+    )
+    assert named_replay_projection[1]["content"] == first_projection[1]["content"]
+    assert len(list((tmp_path / "artifacts" / "refs").glob("*.json"))) == 1
+    assert len(list((tmp_path / "artifacts" / "sha256").rglob("*.bin"))) == 1
+
+
+def test_historical_logical_ref_is_readable_after_run_changes(tmp_path: Path):
+    archive = ArtifactArchive(tmp_path / "artifacts")
+    first = ToolResultArchiveCapability(archive, session_id="session-a", run_id="run-a")
+    second = ToolResultArchiveCapability(archive, session_id="session-a", run_id="run-b")
+    ref = first.archive_result(
+        "historical body\n" * 20,
+        call_id="call-read",
+        tool_name="read_file",
+        runtime_event_id="event-tool",
+    )
+    messages = (
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call-read", "name": "read_file", "arguments": {}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call-read", "content": ref.placeholder()},
+        {"role": "user", "content": "next"},
+    )
+
+    projected = project_archived_tool_results(messages, second, budget_bytes=1)
+
+    assert projected[1]["content"]["kind"] == "bounded_ref"
+    assert projected[1]["content"]["ref"] == ref.ref
 
 
 def test_stale_projection_reuses_existing_placeholder_shape(tmp_path: Path):

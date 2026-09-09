@@ -53,7 +53,7 @@
 
 ## Implementation and validation record
 
-本 change 的 P0 实现和验证已完成；8.1–8.3、10.1–10.3 仍是后续 P1，Provider projection 的 11.1–11.5 已在本批次闭合。主要实现落点：
+本 change 的 P0 实现和验证已完成；Provider projection 的 11.1–11.5 以及跨 run archive identity/continuation 的 12.1–12.5 已在本批次闭合。8.1–8.3、10.1–10.3 仍是后续 P1。主要实现落点：
 
 - `src/mini_claude/tool_call_identity.py`、`event_sink.py`、`runtime_lifecycle.py`：统一 final-call identity，按 `(run_id, call_id)` 幂等去重和跨 invocation operation 复用。
 - `src/mini_claude/artifact_archive.py`、`archive_capability.py`、`archive_projection.py`：固定 Unicode/bytes range、合法 EOF、越界错误、容量救援和 `capacity_exhausted`，并分离 Provider/terminal projection。
@@ -96,7 +96,7 @@
 - fresh-process/local consumer 回归及全量 Python tests：`python -m pytest src\\mini_claude\\tests -q --disable-warnings --tb=short`，297 passed，2 个既有 warning。
 - `python -m compileall -q src\\mini_claude` 通过；本 change 通过 `openspec validate repair-runtime-projection-defects --type change --strict --no-interactive`；`git diff --check` 通过（仅有 Git 的换行符提示）。
 - 根目录 `python -m pytest -q` 未作为通过证据：benchmark 测试收集阶段缺少可选依赖 `harbor`（`ModuleNotFoundError`），与本次 Python 包实现无关。
-- 仍保留的 P1 边界：8.1–8.3、10.1–10.3；包括父子 Agent close barrier、更多历史版本兼容、真正的增量/range 读取，以及 ArchiveRead 最终 JSON envelope 的完整响应字节预算。本轮 11.x 的 Provider projection 单调性和最终容量 gate 已实现，独立 Gap Closure 证据见 `implementation-validation.md`。
+- 仍保留的 P1 边界：8.1–8.3、10.1–10.3；包括父子 Agent close barrier、更多历史版本兼容、真正的增量/range 读取和 ArchiveRead 最终 JSON envelope 的完整响应字节预算。本轮 11.x 的 Provider projection 单调性和最终容量 gate、12.x 的跨 run ref/continuation 修复均已实现，独立 Gap Closure 证据见 `implementation-validation.md`。
 
 ## 10. Deferred P1 scope
 
@@ -111,3 +111,18 @@
 - [x] 11.3 让 first-use tool-level fallback 先通过完整候选 `size_fn`；fallback 自身不 fit 时返回 bounded `ProviderCapacityError`，projection 完成后再由 final capacity gate 阻止 aggregate 超限 SDK dispatch，不把已有 placeholder 改成 `capacity_exhausted`，不回写 canonical
 - [x] 11.4 补齐 G-STR-01～G-STR-04：suffix 临界预算单调性、fallback/error exact-fit 与 impossible-fit、system/messages/tools 完整预算、first-use prune 后 final verdict 顺序；覆盖 Anthropic/OpenAI adapter
 - [x] 11.5 通过实际 Agent -> 本地 fake SDK/loopback consumer 验证完整 context envelope 与 no-dispatch，并回写 implementation validation、Gap Closure 和残余风险；不执行 Git 交付
+
+## 12. P1 Cross-run archive identity and continuation
+
+- [x] 12.1 更新 archive identity 与授权设计：稳定 ref 只使用 session、stable event/call/tool/body/rewrite identity；run/parent run 仅用于 lineage/诊断，明确旧 ref 与跨 session 兼容边界
+- [x] 12.2 修改 `ToolResultArchiveCapability.archive_result()`，使同一 session 的同一 canonical result 在不同 `chat()` run 复用 logical ref 和底层 blob，不产生新的 logical metadata；tool message 缺少 `name` 时从 assistant `tool_calls` 按 call id 回退解析；旧 logical/hash-only ref 保持只读兼容
+- [x] 12.3 调整历史 ref 注册后的授权检查：已由当前 canonical history 注册的同 session ref 可跨后续 run 读取；未注册 ref 仍执行 run/parent lineage 校验，跨 session 继续拒绝
+- [x] 12.4 修复 `_ensure_read_instructions()`，按 `next_offset → offset → 0` 选择 continuation offset，并保留合法已有 `limit`
+- [x] 12.5 增加跨 run 双 projection、单 metadata 文件、跨 session 隔离、旧 ref 兼容和带 `next_offset`/`limit` 的历史 placeholder 回归测试；运行 focused/full Python、compileall、OpenSpec strict validate 和 `git diff --check`，回写本 change 验证记录
+
+验证记录（2026-09-09，本轮 Delta Gap Closure）：
+
+- `test_archive_capability.py` 与 `test_archive_projection.py` focused 回归：`48 passed`；覆盖跨 run 注册后真实 `read`、正确/错误 sha 与 size 校验、未注册 lineage 拒绝，以及仅 `offset`/无 offset 时的 continuation fallback。
+- Provider projection、完整 request budget 和本地消费者回归：`67 passed`；`src/mini_claude/tests` Python 测试全集：`303 passed`，存在既有 warning。
+- 根目录 `python -m pytest -q` 仍在 benchmark 收集阶段因缺少可选 `harbor` 包失败；因此 `303 passed` 仅表示 `src/mini_claude/tests` 全量通过，不表示全仓库通过。
+- 独立 `test-strategy-agent` 对 G-STR-05～G-STR-07 执行实施后 Delta Gap Closure；主 Agent 仅采纳有代码/测试证据的缺口补项，不将“缺测试”误判为产品缺陷。本轮另补 replay 形状缺失 tool name 的稳定 identity 回归，按同一工具调用映射验证。
