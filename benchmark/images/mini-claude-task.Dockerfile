@@ -14,7 +14,8 @@ COPY src/ /tmp/mini-claude-py/
 
 RUN set -eux; \
     if ! (command -v python3 >/dev/null 2>&1 && \
-           python3 -m venv --help >/dev/null 2>&1); then \
+           python3 -m venv --help >/dev/null 2>&1 && \
+           python3 -c "import ensurepip" >/dev/null 2>&1); then \
         apt-get update; \
         DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             python3 python3-venv; \

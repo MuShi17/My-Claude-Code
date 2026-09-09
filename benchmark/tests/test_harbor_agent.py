@@ -44,6 +44,22 @@ class _Environment:
         return _Result(0)
 
 
+class _SetupEnvironment:
+    task_env_config = SimpleNamespace(workdir="/app")
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    async def upload_dir(self, source, destination) -> None:
+        del source, destination
+
+    async def exec(self, command: str, **kwargs) -> _Result:
+        del kwargs
+        self.calls.append(command)
+        # The first call is the prebuilt-runtime probe; force the fallback.
+        return _Result(1 if len(self.calls) == 1 else 0)
+
+
 def _agent() -> MiniClaudeHarborAgent:
     agent = object.__new__(MiniClaudeHarborAgent)
     agent.model_name = "deepseek-v4-flash"
@@ -112,3 +128,23 @@ def test_usage_is_recorded_before_a_nonzero_agent_exit_is_raised():
     assert context.n_input_tokens == 30
     assert context.n_cache_tokens == 20
     assert context.n_output_tokens == 3
+
+
+def test_setup_uses_configured_apt_and_pip_mirrors():
+    agent = _agent()
+    settings = {
+        "MINI_CLAUDE_APT_MIRROR": "https://mirrors.tuna.tsinghua.edu.cn/ubuntu/",
+        "MINI_CLAUDE_PIP_INDEX_URL": "https://pypi.tuna.tsinghua.edu.cn/simple",
+    }
+    agent._get_setting = settings.get
+    environment = _SetupEnvironment()
+
+    asyncio.run(agent.setup(environment))
+
+    bootstrap = environment.calls[1]
+    pip_install = environment.calls[2]
+    assert "https://mirrors.tuna.tsinghua.edu.cn/ubuntu" in bootstrap
+    assert "python3 -c 'import ensurepip'" in bootstrap
+    assert "Acquire::Retries=3" in bootstrap
+    assert "--index-url https://pypi.tuna.tsinghua.edu.cn/simple" in pip_install
+    assert "--retries 3 --timeout 30" in pip_install

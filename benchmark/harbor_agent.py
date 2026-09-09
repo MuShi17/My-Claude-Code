@@ -25,11 +25,46 @@ PREBUILT_RUNTIME_IMPORT_CHECK = (
 )
 DEFAULT_MODEL = "claude-sonnet-4-5"
 DEFAULT_TIMEOUT_SEC = 1800
+BENCHMARK_PROMPT_PROFILE = "benchmark-autonomous-execution-v1"
+BENCHMARK_EXECUTION_PROMPT = """You are operating autonomously inside an isolated benchmark task container; no user is available to answer questions. Follow the task instruction and environment constraints, and perform the work directly with the available tools.
+
+When files, dependencies, program behavior, or environment state are uncertain, use a low-cost tool operation to gather evidence instead of repeatedly reasoning through unobserved possibilities. If you have enough information, take the next implementation action immediately.
+
+First produce the smallest working result that satisfies the core requirement. Then use the actual output or errors to correct it. Use specialized tools when they fit; use shell commands when combining observations, scripting, or interacting with a terminal is more effective.
+
+Before stopping, check the required files, paths, and behavior, and run relevant verification available in the task environment. Do not merely describe a solution: make the requested changes. Only report completion when the artifact and verification evidence support it."""
 PRICE_PER_MILLION_TOKENS = {
     "cache_read_input": 0.007,
     "uncached_input": 0.22,
     "output": 0.66,
 }
+
+
+def _apt_mirror_setup_command(apt_mirror: str | None) -> str:
+    """Return shell code that rewrites Ubuntu sources when a mirror is set."""
+
+    if not apt_mirror:
+        return ""
+
+    mirror = apt_mirror.rstrip("/")
+    return (
+        f"APT_MIRROR={shlex.quote(mirror)}; "
+        "for source in /etc/apt/sources.list "
+        "/etc/apt/sources.list.d/*.list "
+        "/etc/apt/sources.list.d/*.sources; do "
+        '[ -f "$source" ] || continue; '
+        'sed -i -E "s#https?://(archive|security).ubuntu.com/ubuntu/?#${APT_MIRROR}#g" '
+        '"$source"; '
+        "done; "
+    )
+
+
+def _pip_index_option(index_url: str | None) -> str:
+    """Return the optional pip index argument for the setup command."""
+
+    if not index_url:
+        return ""
+    return f" --index-url {shlex.quote(index_url)}"
 
 # Canonical runtime data is redirected into Harbor's bind-mounted agent log
 # directory by _runtime_env().  This keeps already-committed events available
@@ -199,6 +234,11 @@ class MiniClaudeHarborAgent(BaseAgent):
             f"({command}) >> {stdout_path} 2>> {stderr_path}"
         )
 
+    @staticmethod
+    def _benchmark_instruction(instruction: str) -> str:
+        """Add the autonomous execution contract only to Harbor task prompts."""
+        return f"{BENCHMARK_EXECUTION_PROMPT}\n\n--- Task instruction ---\n{instruction}"
+
     def _local_log_text(self, filename: str) -> str:
         """Read a live-mounted log for useful errors after exec returns."""
 
@@ -303,6 +343,7 @@ class MiniClaudeHarborAgent(BaseAgent):
         context.metadata = {
             "workdir": workdir,
             "model": model,
+            "prompt_profile": BENCHMARK_PROMPT_PROFILE,
             "return_code": return_code,
             "usage_source": "canonical-session-v2-or-sqlite",
             "usage_available": usage is not None,
@@ -348,11 +389,16 @@ class MiniClaudeHarborAgent(BaseAgent):
         if await self._prebuilt_runtime_ready(environment):
             return
 
+        apt_mirror_setup = _apt_mirror_setup_command(
+            self._get_setting("MINI_CLAUDE_APT_MIRROR")
+        )
         bootstrap = (
             "if ! (command -v python3 >/dev/null 2>&1 && "
-            "python3 -m venv --help >/dev/null 2>&1); then "
-            "apt-get update && "
-            "DEBIAN_FRONTEND=noninteractive apt-get install -y "
+            "python3 -m venv --help >/dev/null 2>&1 && "
+            "python3 -c 'import ensurepip' >/dev/null 2>&1); then "
+            + apt_mirror_setup
+            + "apt-get -o Acquire::Retries=3 update && "
+            "DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=3 install -y "
             "--no-install-recommends python3 python3-venv; "
             "fi && "
             f"python3 -m venv {shlex.quote(REMOTE_VENV)}"
@@ -379,7 +425,10 @@ class MiniClaudeHarborAgent(BaseAgent):
             self._logged_command(
                 (
                     f"{shlex.quote(REMOTE_PYTHON)} -m pip install "
-                    f"--disable-pip-version-check --no-cache-dir -e "
+                    f"--disable-pip-version-check --no-cache-dir "
+                    f"--retries 3 --timeout 30"
+                    f"{_pip_index_option(self._get_setting('MINI_CLAUDE_PIP_INDEX_URL'))} "
+                    f"-e "
                     f"{shlex.quote(REMOTE_ROOT)}"
                 ),
                 stdout_name="setup.stdout.txt",
@@ -469,10 +518,11 @@ class MiniClaudeHarborAgent(BaseAgent):
                 raise RuntimeError("Unable to determine the task work directory")
             workdir = pwd_result.stdout.strip().splitlines()[-1]
 
+        benchmark_instruction = self._benchmark_instruction(instruction)
         agent_command = (
             f"{shlex.quote(REMOTE_PYTHON)} -u -m mini_claude --yolo "
             f"--model {shlex.quote(self._get_cli_model())} "
-            f"{shlex.quote(instruction)} < /dev/null"
+            f"{shlex.quote(benchmark_instruction)} < /dev/null"
         )
         result = None
         primary_error: BaseException | None = None

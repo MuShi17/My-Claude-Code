@@ -63,6 +63,15 @@ $runDir = "benchmark_runs/$(Get-Date -Format 'yyyy-MM-dd__HH-mm-ss')"
 
 运行前确认 `.env` 已填写 `ANTHROPIC_API_KEY`、`ANTHROPIC_BASE_URL`、`MINI_CLAUDE_MODEL` 和 `MINI_CLAUDE_THINKING_EFFORT`。DeepSeek Anthropic 配置示例：`ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic`、`MINI_CLAUDE_MODEL=deepseek-v4-flash`、`MINI_CLAUDE_THINKING_EFFORT=max`。
 
+如果任务镜像中的 Python/venv 需要在线安装，可为 Adapter 配置国内软件源，setup 会替换 Ubuntu APT 源并将 pip 指向对应镜像；不配置时保持系统默认源：
+
+```dotenv
+MINI_CLAUDE_APT_MIRROR=http://mirrors.tuna.tsinghua.edu.cn/ubuntu
+MINI_CLAUDE_PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+```
+
+APT 示例使用 HTTP，因为部分原始 Ubuntu 任务镜像尚未安装 `ca-certificates`；APT 仍会校验仓库签名。若基础镜像已包含证书包，也可以将 APT 地址改为 HTTPS。
+
 `--dataset` 使用完整数据集标识，`--task` 使用完整任务标识；`--n-concurrent 1` 便于单任务调试和查看日志。结果保存在 `benchmark_runs/<时间戳>/`，其中 `result.json` 包含 Harbor 结果和 usage 信息。
 
 ### 预构建 Mini Claude 运行时镜像
