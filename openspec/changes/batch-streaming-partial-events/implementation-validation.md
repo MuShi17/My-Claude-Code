@@ -41,13 +41,13 @@ provider delta
 
 补充边界：优化 batch 对缺少正整数 `partial_seq` 的输入在开启 SQLite 事务前 fail-closed；旧 sequence-less 读取和直接 `append(partial)` 兼容路径不受影响。timer flush 成功恢复全部 pending buffer 后清除失败 marker，并在分配下一个 `partial_seq` 前检查 marker，避免已恢复错误重复抛出或失败调用制造序号 gap。旧 sink fallback 维护 pending partial 的全局 arrival-order，并在 `usage`、retry、普通生命周期及 final/terminal 边界前完成全量 flush；SQLite 优化路径仍按 stream key selective flush/cleanup。
 
-- `src/mini_claude/runtime_store.py`
-- `src/mini_claude/runtime_lifecycle.py`
-- `src/mini_claude/event_sink.py`
-- `src/mini_claude/agent.py`
-- `src/mini_claude/recovery.py`
-- `src/mini_claude/tests/test_streaming_partial_persistence.py`
-- `src/mini_claude/tests/test_local_consumers.py`
+- `src/rollo/runtime_store.py`
+- `src/rollo/runtime_lifecycle.py`
+- `src/rollo/event_sink.py`
+- `src/rollo/agent.py`
+- `src/rollo/recovery.py`
+- `src/rollo/tests/test_streaming_partial_persistence.py`
+- `src/rollo/tests/test_local_consumers.py`
 
 ## 独立审查与主 Agent 判断
 
@@ -65,15 +65,15 @@ provider delta
 
 | 命令 | 结果 | 证明范围 |
 | --- | --- | --- |
-| `python -B -m pytest src\\mini_claude\\tests\\test_streaming_partial_persistence.py -q --disable-warnings --tb=short` | 25 passed | snapshot、batch、timer、故障回滚、sequence conflict、budget、fallback、迁移、旧 sink 顺序 |
-| `python -B -m pytest src\\mini_claude\\tests\\test_local_consumers.py -q --disable-warnings --tb=short` | 23 passed | 真实本地 Agent + Anthropic/OpenAI SDK transport、thinking/reasoning、final cleanup、Provider request 语义 |
-| `python -B -m pytest src\\mini_claude\\tests\\test_streaming_partial_persistence.py src\\mini_claude\\tests\\test_local_consumers.py src\\mini_claude\\tests\\test_runtime_lifecycle.py src\\mini_claude\\tests\\test_runtime_store.py src\\mini_claude\\tests\\test_recovery_resume.py src\\mini_claude\\tests\\test_projections.py src\\mini_claude\\tests\\test_incremental_replay.py -q --disable-warnings --tb=short` | 93 passed | 本 change 专项、旧 sink 顺序、真实本地 consumer 与既有 runtime/projection focused 回归 |
-| `python -B -m pytest src\\mini_claude\\tests -q --tb=short` | 330 passed，1 个既有 Proactor transport warning | Python 包全量测试；不等同于根目录全仓库测试 |
-| `python -m compileall -q src\\mini_claude` | passed | Python 编译检查 |
+| `python -B -m pytest src\\rollo\\tests\\test_streaming_partial_persistence.py -q --disable-warnings --tb=short` | 25 passed | snapshot、batch、timer、故障回滚、sequence conflict、budget、fallback、迁移、旧 sink 顺序 |
+| `python -B -m pytest src\\rollo\\tests\\test_local_consumers.py -q --disable-warnings --tb=short` | 23 passed | 真实本地 Agent + Anthropic/OpenAI SDK transport、thinking/reasoning、final cleanup、Provider request 语义 |
+| `python -B -m pytest src\\rollo\\tests\\test_streaming_partial_persistence.py src\\rollo\\tests\\test_local_consumers.py src\\rollo\\tests\\test_runtime_lifecycle.py src\\rollo\\tests\\test_runtime_store.py src\\rollo\\tests\\test_recovery_resume.py src\\rollo\\tests\\test_projections.py src\\rollo\\tests\\test_incremental_replay.py -q --disable-warnings --tb=short` | 93 passed | 本 change 专项、旧 sink 顺序、真实本地 consumer 与既有 runtime/projection focused 回归 |
+| `python -B -m pytest src\\rollo\\tests -q --tb=short` | 330 passed，1 个既有 Proactor transport warning | Python 包全量测试；不等同于根目录全仓库测试 |
+| `python -m compileall -q src\\rollo` | passed | Python 编译检查 |
 | `openspec validate batch-streaming-partial-events --type change --strict --no-interactive` | passed | OpenSpec 工件结构/一致性 |
 | `git diff --check` | passed | 差异空白；Git 仅提示 LF/CRLF 转换 |
 
-已完成的证据：streaming 专项测试 25 passed；local consumers 23 passed；联合 focused/runtime 测试 93 passed；`src/mini_claude/tests` 全量 330 passed。此前在 invocation 校验修正前，local consumers 出现 15 个失败；修正后 local consumers 23 passed，说明该阻断点已被真实本地调用链复现并修复。focused 测试曾出现一次既有 Windows CLI subprocess/resume 的 `WinError 5` 原子替换瞬态失败，单独重跑和随后完整 focused 运行均通过。全量测试中的 1 个 Proactor transport warning 出现在既有 `test_compaction_artifacts.py`，不是本 change 新增失败。旧 sink fallback 的两个交错顺序回归已通过；最终独立 delta 审查判定 `sufficient`，既有 G-01～G-13 无剩余 gap。
+已完成的证据：streaming 专项测试 25 passed；local consumers 23 passed；联合 focused/runtime 测试 93 passed；`src/rollo/tests` 全量 330 passed。此前在 invocation 校验修正前，local consumers 出现 15 个失败；修正后 local consumers 23 passed，说明该阻断点已被真实本地调用链复现并修复。focused 测试曾出现一次既有 Windows CLI subprocess/resume 的 `WinError 5` 原子替换瞬态失败，单独重跑和随后完整 focused 运行均通过。全量测试中的 1 个 Proactor transport warning 出现在既有 `test_compaction_artifacts.py`，不是本 change 新增失败。旧 sink fallback 的两个交错顺序回归已通过；最终独立 delta 审查判定 `sufficient`，既有 G-01～G-13 无剩余 gap。
 
 ## 证据边界与残余风险
 

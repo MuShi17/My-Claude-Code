@@ -29,12 +29,12 @@
 
 | 命令 | 结果 | 证据 |
 | --- | --- | --- |
-| `python -m pytest src\\mini_claude\\tests\\test_archive_capability.py src\\mini_claude\\tests\\test_archive_projection.py -q --disable-warnings --tb=short` | 48 passed | 跨 run identity、历史授权完整性、continuation offset 及原有 ArchiveRead/projection 回归 |
-| `python -B -m pytest src\\mini_claude\\tests\\test_archive_projection.py src\\mini_claude\\tests\\test_provider_content.py src\\mini_claude\\tests\\test_local_consumers.py -q --disable-warnings --tb=short` | 67 passed | projection 单调性、fallback、system/tools、Anthropic/OpenAI local consumer 和 no-dispatch |
-| `python -m pytest src\\mini_claude\\tests\\test_archive_projection.py -q --disable-warnings --tb=short` | 32 passed | ArchiveRead exact-fit/impossible-fit、非递归、稳定 placeholder |
-| `python -B -m pytest src\\mini_claude\\tests -q --disable-warnings --tb=short` | 303 passed，存在既有 warning | `src/mini_claude/tests` 全量 Python 包回归；不等同于根目录 pytest |
+| `python -m pytest src\\rollo\\tests\\test_archive_capability.py src\\rollo\\tests\\test_archive_projection.py -q --disable-warnings --tb=short` | 48 passed | 跨 run identity、历史授权完整性、continuation offset 及原有 ArchiveRead/projection 回归 |
+| `python -B -m pytest src\\rollo\\tests\\test_archive_projection.py src\\rollo\\tests\\test_provider_content.py src\\rollo\\tests\\test_local_consumers.py -q --disable-warnings --tb=short` | 67 passed | projection 单调性、fallback、system/tools、Anthropic/OpenAI local consumer 和 no-dispatch |
+| `python -m pytest src\\rollo\\tests\\test_archive_projection.py -q --disable-warnings --tb=short` | 32 passed | ArchiveRead exact-fit/impossible-fit、非递归、稳定 placeholder |
+| `python -B -m pytest src\\rollo\\tests -q --disable-warnings --tb=short` | 303 passed，存在既有 warning | `src/rollo/tests` 全量 Python 包回归；不等同于根目录 pytest |
 | `python -m pytest -q` | benchmark 收集阶段因缺少可选 `harbor` 包失败 | 根目录全仓库验证边界；未将其表述为全仓库通过 |
-| `python -m compileall -q src\\mini_claude` | passed | 编译检查 |
+| `python -m compileall -q src\\rollo` | passed | 编译检查 |
 | `openspec validate repair-runtime-projection-defects --type change --strict --no-interactive` | passed | OpenSpec 严格校验 |
 | `git diff --check` | passed | 差异空白检查；仅有 Git 的 LF/CRLF 提示 |
 

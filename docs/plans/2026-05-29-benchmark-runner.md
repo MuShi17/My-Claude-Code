@@ -4,7 +4,7 @@
 
 **Goal:** 实现 benchmark 自动化评估系统 — runner.py 编排执行 + reporter.py 生成性能报告。
 
-**Architecture:** `benchmark/` 独立模块，subprocess 调用 `mini-claude-py --yolo`，串行执行 task，从 trace JSONL 提取指标生成 `benchmark_runs/{timestamp}/report.json`。
+**Architecture:** `benchmark/` 独立模块，subprocess 调用 `rollo --yolo`，串行执行 task，从 trace JSONL 提取指标生成 `benchmark_runs/{timestamp}/report.json`。
 
 **Tech Stack:** Python 3.11+, subprocess, json, tempfile, shutil, 无第三方依赖
 
@@ -31,7 +31,7 @@
 ```json
 {
   "schema_version": 2,
-  "description": "Benchmark tasks for Mini Claude Code regression testing and performance tracking.",
+  "description": "Benchmark tasks for Rollo Code regression testing and performance tracking.",
   "tasks": [
     {
       "id": "readme_intro_locked",
@@ -476,17 +476,17 @@ git commit -m "feat: add benchmark reporter — trace-to-report aggregation"
 
 **Files:**
 - Create: `benchmark/runner.py`
-- Modify: `src/mini_claude/__main__.py` (need to check entry point)
+- Modify: `src/rollo/__main__.py` (need to check entry point)
 
 **Step 1: 确认 CLI 入口**
 
-先检查当前 `__main__.py` 的 CLI 入口方式，确认 `mini-claude-py` 命令的实际调用方式：
+先检查当前 `__main__.py` 的 CLI 入口方式，确认 `rollo` 命令的实际调用方式：
 
 ```bash
-cd D:/PycharmProjects/pythonProject/claude-code-from-scratch && grep -n "def main\|argparse\|parse_args" src/mini_claude/__main__.py | head -20
+cd D:/PycharmProjects/pythonProject/claude-code-from-scratch && grep -n "def main\|argparse\|parse_args" src/rollo/__main__.py | head -20
 ```
 
-如果 `mini-claude-py` 命令因 Windows 锁而无法使用，则改为 `python -m mini_claude` 作为 runner 的调用方式。
+如果 `rollo` 命令因 Windows 锁而无法使用，则改为 `python -m rollo` 作为 runner 的调用方式。
 
 **Step 2: 编写 runner.py**
 
@@ -582,9 +582,9 @@ def run_task(task: dict[str, Any], workspace: Path, run_id: str) -> dict[str, An
 
 
 def _build_agent_cmd(prompt: str, step_budget: int) -> list[str]:
-    """构建 agent 调用命令。优先使用 python -m mini_claude。"""
+    """构建 agent 调用命令。优先使用 python -m rollo。"""
     return [
-        sys.executable, "-m", "mini_claude",
+        sys.executable, "-m", "rollo",
         "--yolo",
         "--max-turns", str(step_budget),
         prompt,
@@ -593,7 +593,7 @@ def _build_agent_cmd(prompt: str, step_budget: int) -> list[str]:
 
 def _find_latest_session_traces_dir() -> Path | None:
     """查找最近一次会话的 traces 目录。"""
-    sessions_dir = Path.home() / ".mini-claude" / "sessions"
+    sessions_dir = Path.home() / ".rollo" / "sessions"
     if not sessions_dir.exists():
         return None
 

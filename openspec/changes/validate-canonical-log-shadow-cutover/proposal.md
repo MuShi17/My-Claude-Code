@@ -22,6 +22,6 @@ Canonical event、SQLite、Agent Loop、生命周期、投影、归档和 resume
 
 ## Impact
 
-- 影响 `src/mini_claude` 的 feature flags/CLI、C02 测试 harness、projection/recovery/store diagnostics 和交付文档。
+- 影响 `src/rollo` 的 feature flags/CLI、C02 测试 harness、projection/recovery/store diagnostics 和交付文档。
 - 依赖 C01～C10 全部完成；这是任何 authority 切换或交付动作前的最终 Gate。
 - 不执行 commit、push、merge、发布、删除旧数据或清理用户工作区。

@@ -30,7 +30,7 @@
 “真实本地消费者”至少包括两个层次：
 
 - 最终 SDK 边界：通过本地 fake Anthropic/OpenAI SDK 或 loopback transport 接收实际 Agent 发送的最终 request，断言 wire content，而不是直接调用 projection helper。
-- CLI 新进程：启动实际 `mini-claude-py`/`python -m mini_claude` 子进程，使用本地协议 stub，不访问外部 Provider，断言 stdout、session 持久化和 resume。
+- CLI 新进程：启动实际 `rollo`/`python -m rollo` 子进程，使用本地协议 stub，不访问外部 Provider，断言 stdout、session 持久化和 resume。
 
 测试夹具、fake/stub、redacted capture 和临时 session 只能证明本地行为；不能写成外部 Provider、部署或 Git 交付证据。P1 的父子 Agent 完整 close barrier、跨进程 capability 传递和更广泛历史兼容继续列在任务清单中；本次只推进 Provider projection 的单调性和最终容量 gate。
 
@@ -60,8 +60,8 @@
 
 ## Impact
 
-- 影响 `src/mini_claude/agent.py`、`runtime_lifecycle.py`、`artifact_archive.py`、`archive_capability.py`、`archive_projection.py`、`ui.py` 以及 `projections/` 下的 runtime、session、model replay、provider context 和 metrics 投影；本次增量重点落在 `archive_capability.py`、`archive_projection.py` 及其定向测试。
-- 影响 `src/mini_claude/tests/` 的回归测试、最终本地 fake SDK/loopback consumer、CLI 子进程夹具和临时 session 输出。
+- 影响 `src/rollo/agent.py`、`runtime_lifecycle.py`、`artifact_archive.py`、`archive_capability.py`、`archive_projection.py`、`ui.py` 以及 `projections/` 下的 runtime、session、model replay、provider context 和 metrics 投影；本次增量重点落在 `archive_capability.py`、`archive_projection.py` 及其定向测试。
+- 影响 `src/rollo/tests/` 的回归测试、最终本地 fake SDK/loopback consumer、CLI 子进程夹具和临时 session 输出。
 - 不改变 `D:/workspace/maka`，不扩大普通子 Agent allowlist；将公共工具结果安全上限统一为 16 MiB（16,777,216）canonical JSON UTF-8 字节，但不把它当作 Provider 容量方案；不删除或重写历史 artifact/event，旧 `artifact:sha256:*` ref 保持只读兼容。
 - 本批次不执行 commit、push、MR、merge、release、deployment 或真实外部 Provider 调用。
 

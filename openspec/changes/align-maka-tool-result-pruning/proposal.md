@@ -41,8 +41,8 @@
 
 ## Impact
 
-- 影响 `src/mini_claude/archive_projection.py`、`src/mini_claude/archive_capability.py`、`src/mini_claude/projections/model_replay_projection.py`、`src/mini_claude/projections/incremental_replay.py`、`src/mini_claude/projections/provider_context.py`、`src/mini_claude/agent.py` 以及必要的 artifact 测试；需要为 archive projection outcome/diagnostics、replay sidecar 和 request-cycle state 定义内部契约。
-- 增加或调整 `src/mini_claude/tests/` 中的 Provider projection、archive capability、incremental replay 和本地 SDK consumer 测试。
+- 影响 `src/rollo/archive_projection.py`、`src/rollo/archive_capability.py`、`src/rollo/projections/model_replay_projection.py`、`src/rollo/projections/incremental_replay.py`、`src/rollo/projections/provider_context.py`、`src/rollo/agent.py` 以及必要的 artifact 测试；需要为 archive projection outcome/diagnostics、replay sidecar 和 request-cycle state 定义内部契约。
+- 增加或调整 `src/rollo/tests/` 中的 Provider projection、archive capability、incremental replay 和本地 SDK consumer 测试。
 - 不修改 `D:/workspace/maka`，不改变 canonical SQLite/event 写入，不增加外部依赖，不执行 Provider、部署或 Git 交付。
 
 ## Execution Boundary

@@ -29,7 +29,7 @@
 
 ## 5. 验证与知识库回写
 
-- [x] 5.1 运行 streaming focused tests、`src/mini_claude/tests` 全量测试、compileall、`git diff --check` 和 OpenSpec strict validate，记录最终命令与边界
+- [x] 5.1 运行 streaming focused tests、`src/rollo/tests` 全量测试、compileall、`git diff --check` 和 OpenSpec strict validate，记录最终命令与边界
 - [x] 5.2 对照 Maka 的源码重新核对 80 ms/8 KiB/partial snapshot/final ledger 语义；只记录可复现的本地证据，不宣称外部 Provider 或生产性能
 - [x] 5.3 更新 `D:/software/obsidian/MuShiKnowlegde/04_Projects/my-coding-agent/work/2026-09-09-Maka流式增量与CanonicalSQLite落盘边界.md`，写入根因、变更文件、验证结果、残余风险和本 change 链接
 - [x] 5.4 更新 `implementation-validation.md`，确认代码、OpenSpec、问题记录和测试结果一致；本轮不执行 commit、push、MR、merge、release 或 deployment

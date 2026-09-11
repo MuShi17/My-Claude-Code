@@ -33,4 +33,4 @@ C01 已定义 event envelope、ordinal/high-water、partial/terminal、redaction
 
 ## Migration Plan
 
-先创建离线 contract suite 与 builders，再由 C03～C10 逐步使其转绿；C11 复用同一场景集合进行 shadow parity、回滚和 CLI smoke。测试资产不读取或修改用户的真实 `~/.mini-claude` 数据。
+先创建离线 contract suite 与 builders，再由 C03～C10 逐步使其转绿；C11 复用同一场景集合进行 shadow parity、回滚和 CLI smoke。测试资产不读取或修改用户的真实 `~/.rollo` 数据。

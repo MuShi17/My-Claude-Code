@@ -5,7 +5,7 @@
 
 - [ ] 1.1 登记本 Change 的 actual_id、contract_revision 与 execution_root/branch/base（main@21b9bdf），确认唯一 writer=main-agent、无 mode_switch。
 - [x] 1.2 复核前置门：`agent-harness project-verify` 返回 ok；C01 的 openspec_authorized 与 implementation_authorized 已登记为 true；GAP-I02-01 在本 Change 内闭合。
-- [ ] 1.3 冻结并记录基线：`& $runtimePython -m pytest -q src/mini_claude/tests`，必须记录 runtimePython 绝对路径、Python 与 pytest 版本、执行目录、collected 数与 passed 数、warning 数，以及冻结时刻的工作树逐字 `git status --porcelain` 与全部新增文件 SHA256。**基线当前值：396 collected / 396 passed / 2 warning。**
+- [ ] 1.3 冻结并记录基线：`& $runtimePython -m pytest -q src/rollo/tests`，必须记录 runtimePython 绝对路径、Python 与 pytest 版本、执行目录、collected 数与 passed 数、warning 数，以及冻结时刻的工作树逐字 `git status --porcelain` 与全部新增文件 SHA256。**基线当前值：396 collected / 396 passed / 2 warning。**
 
 #### 1.3 冻结基线快照（落盘，2026-09-10）
 
@@ -14,7 +14,7 @@
 | runtimePython | `C:\Users\Administrator\AppData\Local\Python\pythoncore-3.14-64\python.exe` |
 | Python / pytest | 3.14.6 / 9.1.1 |
 | 执行目录 | `D:\workspace\My-Claude-Code`（仓库根） |
-| 命令 | `& $runtimePython -m pytest -q src/mini_claude/tests` |
+| 命令 | `& $runtimePython -m pytest -q src/rollo/tests` |
 | 结果 | 396 collected / 396 passed / 2 warning；`openspec validate introduce-project-context-isolation --strict` → valid（exit 0；**注意**裸 `openspec validate --strict` 在非交互下会因"Nothing to validate"返回 exit 1，须带 change id）；`git diff --check` exit 0 |
 | HEAD | `21b9bdfbb7c0bf3b2f2f47f13890724cff76a5bc`（branch=main，无提交/无推送） |
 
@@ -22,19 +22,19 @@
 
 ```
  M AGENTS.md
- M src/mini_claude/__main__.py
- M src/mini_claude/agent.py
- M src/mini_claude/mcp_client.py
- M src/mini_claude/memory.py
- M src/mini_claude/prompt.py
- M src/mini_claude/skills.py
- M src/mini_claude/subagent.py
- M src/mini_claude/tools.py
+ M src/rollo/__main__.py
+ M src/rollo/agent.py
+ M src/rollo/mcp_client.py
+ M src/rollo/memory.py
+ M src/rollo/prompt.py
+ M src/rollo/skills.py
+ M src/rollo/subagent.py
+ M src/rollo/tools.py
  M src/pyproject.toml
 ?? openspec/changes/introduce-project-context-isolation/
-?? src/mini_claude/project_context.py
-?? src/mini_claude/tests/conftest.py
-?? src/mini_claude/tests/test_project_context.py
+?? src/rollo/project_context.py
+?? src/rollo/tests/conftest.py
+?? src/rollo/tests/test_project_context.py
 ```
 
 SHA256（前 16，**闭合第四轮 A—D 判据缺陷后重冻**）：project_context.py `7D2C5AC18B907295`｜conftest.py `391F88EECEA419F1`｜test_project_context.py `7944364E9062D76C`｜tools.py `FD3E4F28B909F9BA`｜prompt.py `548066DDFDCC5BBB`｜agent.py `111AFB25C6663CD3`｜__main__.py `E75C016DE0DC2233`｜memory.py `FAFF598CBE2E302C`｜mcp_client.py `16E1E8B1D2E2D3DB`｜skills.py `32D35AF887EAB010`｜subagent.py `E58682197621D909`｜pyproject.toml `5AF20B72517167E6`｜AGENTS.md `AFC431B9306C0AE2`（**范围外**：项目契约 marker）｜spec.md `174927B12D53B25F`｜design.md `525D8494FF6C7AC1`｜proposal.md `FE172E3C3F6DA76E`。
@@ -53,7 +53,7 @@ SHA256（前 16，**闭合第四轮 A—D 判据缺陷后重冻**）：project_c
 
 ## 2. 测试隔离基础设施（闭合 GAP-I02-01）
 
-- [ ] 2.1 新增 `src/mini_claude/tests/conftest.py`：模块顶层设置 `PYTHON_DOTENV_DISABLED`（早于任何 mini_claude 导入），每个测试获得临时 HOME/USERPROFILE/`MINI_CLAUDE_RUNTIME_DIR`，并显式 monkeypatch 导入期常量 `session.SESSION_DIR`。
+- [ ] 2.1 新增 `src/rollo/tests/conftest.py`：模块顶层设置 `PYTHON_DOTENV_DISABLED`（早于任何 rollo 导入），每个测试获得临时 HOME/USERPROFILE/`ROLLO_RUNTIME_DIR`，并显式 monkeypatch 导入期常量 `session.SESSION_DIR`。
 - [ ] 2.2 守卫测试：位于**被收集的测试模块**（`tests/test_project_context.py`，不是 conftest.py——conftest 中的 test 函数不会被 pytest 收集），断言 `PYTHON_DOTENV_DISABLED` 已强制置 1、`load_dotenv() is False`、且 `.env` 可能注入的全部键（API key/base URL/model/effort）都不在进程环境中。
 - [ ] 2.3 依赖下限同步：`src/pyproject.toml` 的 `python-dotenv` 由 `>=1.0.1` 提到 `>=1.2.0`（该开关引入版本）。
 - [ ] 2.4 改造既有依赖真实 HOME/cwd 的测试以复用隔离点；不新增产品侧配置开关。同时**重冻结基线**（conftest 会改变每个测试的环境，旧数字作废）。
@@ -62,7 +62,7 @@ SHA256（前 16，**闭合第四轮 A—D 判据缺陷后重冻**）：project_c
 
 ## 3. ProjectContext 核心
 
-- [ ] 3.1 新增 `src/mini_claude/project_context.py`：实现 `resolve_workspace_root()`（realpath 单一规范化来源、要求根存在）与四类失败（不存在、空输入、含 NUL、驱动器相对），并在进程当前目录不可读取时转换为可诊断的 ProjectContext 错误。
+- [ ] 3.1 新增 `src/rollo/project_context.py`：实现 `resolve_workspace_root()`（realpath 单一规范化来源、要求根存在）与四类失败（不存在、空输入、含 NUL、驱动器相对），并在进程当前目录不可读取时转换为可诊断的 ProjectContext 错误。
 - [ ] 3.2 实现不可变 ProjectContext：`workspace_id`（realpath 派生，与历史取值一致）、`root`、`config_root`、`runtime_data_dir`、规则/技能/agents/MCP/memory 来源与工具 cwd 在构造时一次解析；不提供进程级可变当前 workspace，也不保留任何历史身份回退分支。
 - [ ] 3.3 memory 目录在构造时**冻结**为字段，`resolve_memory_dir()` 为纯访问器（不重新判定文件系统），保证同一 workspace 只有一个 memory 根。
 - [ ] 3.4 实现按 `workspace_id` 分键的派生缓存，替换模块级无键缓存，并保留既有 `reset_*_cache()` 语义与「同一 context 两次调用返回同一对象」契约。
@@ -70,8 +70,8 @@ SHA256（前 16，**闭合第四轮 A—D 判据缺陷后重冻**）：project_c
 ## 4. 消费方接线
 
 - [ ] 4.1 `tools.py`：项目 settings 与 `_cached_rules` 从 context 读取（`check_permission`/`_check_permission_rules` 均带 context）；`_run_shell` 显式传 `cwd=`；`list_files`/`grep_search` 与**文件三工具**（`read_file`/`write_file`/`edit_file`）的默认相对路径以 `context.tool_cwd` 解析（显式绝对路径优先）；`commit_tool_state` 的先读后改状态键同样以 context 解析；**调度路径必须把 context 传下去**——`execute_tool_value`/`execute_tool`/`commit_tool_state` 均带 keyword-only `context`，`agent.py` 调用点必须传 `self.context`（禁止只改底层函数而调度层回退 `Path.cwd()`）。
-- [ ] 4.2 `mcp_client.py`：项目 `.claude/settings.json` 与 `.mcp.json` 从 context 读取；MCP 缓存按 context 分键。
-- [ ] 4.3 `prompt.py`：CLAUDE.md 向上遍历、rules 目录、`{{cwd}}` 与 `get_git_context()` 的 `cwd=` 全部改用 context。
+- [ ] 4.2 `mcp_client.py`：项目 `.rollo/settings.json` 与 `.mcp.json` 从 context 读取；MCP 缓存按 context 分键。
+- [ ] 4.3 `prompt.py`：ROLLO.md 向上遍历、rules 目录、`{{cwd}}` 与 `get_git_context()` 的 `cwd=` 全部改用 context。
 - [ ] 4.4 `skills.py`、`subagent.py`：项目 skills/agents 目录改用 context；`_cached_skills`、`_cached_custom_agents` 按 `workspace_id` 分键。
 - [ ] 4.5 `memory.py`：memory 目录改用 `context.resolve_memory_dir()`（冻结字段访问器，禁止用静态字段另行推导建目录）。
 - [ ] 4.6 `agent.py`：构造与传递 context；子 Agent 继承 workspace 上下文并保留自身 run/context 身份。
@@ -87,8 +87,8 @@ SHA256（前 16，**闭合第四轮 A—D 判据缺陷后重冻**）：project_c
 - [ ] 5.5 覆盖子 Agent：`test_skill_fork_subagent_inherits_parent_context` 已用哨兵异常捕获子 Agent 构造参数，断言 `project_context.root == 父 context.root` 且子 `runtime_run_id` 带父 session 前缀；普通的 `agent` 工具分支（`_execute_agent_tool`）另需补一条同形态用例。
 - [ ] 5.6 覆盖旧会话只读，**断言口径**（GAP-I03-14）：比较 `{相对路径: sha256(内容)}` 与路径集合，**排除** `session.v2.json` 的字节与全部 mtime（该文件在 load/resume 路径必然被原子重写，属既有显示缓存行为）；对 `session.v2.json` 只断言其派生字段（high-water、message count、projection/source digest）不变；run 数与 store high-water 不变；"未认领"以 A/B 两会话下 list 与 load 结果及磁盘摘要完全相同来证明。禁止用 mtime 证明"未改写"。**当前状态：未覆盖**——按本 Change 的 Non-Goals，workspace 绑定字段排在 C03 冻结，因此 R9-S1/S2 在此只能验证"既有行为未被本 Change 破坏"，完整认领语义应由 C03 承接；若把该用例留在 C01，须在 C03 变更准备时重新指定责任 Item。
 - [ ] 5.7 覆盖入口失败契约：进程当前目录不可读取时以 ProjectContext 类错误失败（可诊断消息、非裸 `OSError`）；入口侧非零退出码与无堆栈由 4.7 接线后补验。
-- [ ] 5.8a 既有集合（现在即可执行）：`& $runtimePython -m pytest -q src/mini_claude/tests`，期望 passed ≥ §1.3 冻结基线且无 failed/error。**warning 判据按家族**（`PytestUnraisableExceptionWarning`：asyncio proactor/subprocess transport 析构期告警），且**必须逐次记录数量与归属文件**；不得按"某个固定文件是唯一来源"豁免，也不得据此豁免其它家族。
-- [ ] 5.8b 新增/聚焦集合（5.1—5.7 落地后执行）：`& $runtimePython -m pytest -q src/mini_claude/tests/test_project_context.py src/mini_claude/tests/test_skills.py src/mini_claude/tests/test_tool_result_boundary.py src/mini_claude/tests/test_canonical_event_fixtures.py src/mini_claude/tests/test_canonical_acceptance.py src/mini_claude/tests/test_cli_smoke.py src/mini_claude/tests/test_recovery_resume.py src/mini_claude/tests/test_local_consumers.py`，期望全绿。**该集合同样会命中 `WinError 5` flake**（实测 7 次中 2 次失败；`test_archive_projection.py` 不在本集合内，说明同一根因在不同集合上的表现），判据见 §1.3：核对错误类型为 `WinError 5` 后按「同一用例重跑 3 次全绿」放行。**期望收集数 = 132**（本集合实测，用于自检集合本身没写错）；其中守卫用例 ID 为 `test_project_context.py::test_dotenv_is_disabled_for_test_runs`，生产调度路径用例为 `test_project_context.py::test_tool_dispatch_uses_context_not_process_cwd`。
+- [ ] 5.8a 既有集合（现在即可执行）：`& $runtimePython -m pytest -q src/rollo/tests`，期望 passed ≥ §1.3 冻结基线且无 failed/error。**warning 判据按家族**（`PytestUnraisableExceptionWarning`：asyncio proactor/subprocess transport 析构期告警），且**必须逐次记录数量与归属文件**；不得按"某个固定文件是唯一来源"豁免，也不得据此豁免其它家族。
+- [ ] 5.8b 新增/聚焦集合（5.1—5.7 落地后执行）：`& $runtimePython -m pytest -q src/rollo/tests/test_project_context.py src/rollo/tests/test_skills.py src/rollo/tests/test_tool_result_boundary.py src/rollo/tests/test_canonical_event_fixtures.py src/rollo/tests/test_canonical_acceptance.py src/rollo/tests/test_cli_smoke.py src/rollo/tests/test_recovery_resume.py src/rollo/tests/test_local_consumers.py`，期望全绿。**该集合同样会命中 `WinError 5` flake**（实测 7 次中 2 次失败；`test_archive_projection.py` 不在本集合内，说明同一根因在不同集合上的表现），判据见 §1.3：核对错误类型为 `WinError 5` 后按「同一用例重跑 3 次全绿」放行。**期望收集数 = 132**（本集合实测，用于自检集合本身没写错）；其中守卫用例 ID 为 `test_project_context.py::test_dotenv_is_disabled_for_test_runs`，生产调度路径用例为 `test_project_context.py::test_tool_dispatch_uses_context_not_process_cwd`。
 - [ ] 5.9 运行 `git diff --check`（期望无输出，exit 0）。**覆盖面声明**：该命令不检查 untracked 文件，本轮新增的 project_context.py / conftest.py / test_project_context.py 不在其覆盖内；如需覆盖，先 `git add --intent-to-add` 再检查，或另行声明未跟踪文件不参与本检查。
 - [ ] 5.10 完成 V(C01)：独立冻结差异审查 + 风险对应 GapClosure，记录 contract_revision、accepted_result 与 contract_handoff，逐字记录 `git status --porcelain` 与全量 SHA256，并同步唯一台账。
 
@@ -98,17 +98,17 @@ SHA256（前 16，**闭合第四轮 A—D 判据缺陷后重冻**）：project_c
 
 | 文件 | 状态 | 对应任务 | 说明 |
 | --- | --- | --- | --- |
-| `src/mini_claude/project_context.py` | 新增（untracked） | 3.1—3.3 | 模块级可变单例与 cwd 回退已在评审后移除；realpath 为唯一规范化来源 |
-| `src/mini_claude/tests/conftest.py` | 新增（untracked） | 2.1、2.4 | 隔离强制点（顶层无条件置 dotenv 开关 + 临时 HOME/RUNTIME_DIR + monkeypatch 导入期常量） |
-| `src/mini_claude/tests/test_project_context.py` | 新增（untracked） | 2.2、5.1、5.3、5.5、5.7 及部分 5.2 | 守卫测试（N2 修复载体）、身份独立复算与负向绑定、等价类归一、拒绝输入、`must_exist=False`、memory 冻结与索引、skills/agents/memory 隔离、调度路径（工具/文件/权限）、子 Agent 继承、入口失败契约 |
-| `src/mini_claude/skills.py` | 修改 | 4.4 | context 参数 + 按 workspace_id 分键缓存 |
-| `src/mini_claude/memory.py` | 修改 | 4.5 | memory 目录改由 `context.resolve_memory_dir()`；数据根随 `runtime_data_dir` |
-| `src/mini_claude/subagent.py` | 修改 | 4.4 | 项目 agents 目录改由 context；缓存按 workspace_id 分键 |
-| `src/mini_claude/prompt.py` | 修改 | 4.3 | CLAUDE.md 遍历、rules、`{{cwd}}`、git 子进程 `cwd=` 全部改用 context |
-| `src/mini_claude/tools.py` | 修改 | 4.1 | `_run_shell` 显式 `cwd=`；文件三工具与 `list_files`/`grep_search` 按 context 解析相对路径；`load_permission_rules`/`check_permission`/`commit_tool_state`/`_auto_update_memory_index` 全部接 context |
-| `src/mini_claude/mcp_client.py` | 修改 | 4.2 | `McpManager` 持 context 快照，项目配置从 `context.settings_path` / `context.mcp_config_path` 读取 |
-| `src/mini_claude/agent.py` | 修改 | 4.6 | 构造 context 并贯穿提示词/技能/子 Agent/记忆预取/MCP；工具与权限调用点传 `context=self.context`；skill-fork 构造移入 `try` |
-| `src/mini_claude/__main__.py` | 修改 | 4.7 | 入口一次性构造 context 并注入 Agent；`_entry_workspace()` 把 cwd 失败转为可诊断错误并以 exit 2 退出 |
+| `src/rollo/project_context.py` | 新增（untracked） | 3.1—3.3 | 模块级可变单例与 cwd 回退已在评审后移除；realpath 为唯一规范化来源 |
+| `src/rollo/tests/conftest.py` | 新增（untracked） | 2.1、2.4 | 隔离强制点（顶层无条件置 dotenv 开关 + 临时 HOME/RUNTIME_DIR + monkeypatch 导入期常量） |
+| `src/rollo/tests/test_project_context.py` | 新增（untracked） | 2.2、5.1、5.3、5.5、5.7 及部分 5.2 | 守卫测试（N2 修复载体）、身份独立复算与负向绑定、等价类归一、拒绝输入、`must_exist=False`、memory 冻结与索引、skills/agents/memory 隔离、调度路径（工具/文件/权限）、子 Agent 继承、入口失败契约 |
+| `src/rollo/skills.py` | 修改 | 4.4 | context 参数 + 按 workspace_id 分键缓存 |
+| `src/rollo/memory.py` | 修改 | 4.5 | memory 目录改由 `context.resolve_memory_dir()`；数据根随 `runtime_data_dir` |
+| `src/rollo/subagent.py` | 修改 | 4.4 | 项目 agents 目录改由 context；缓存按 workspace_id 分键 |
+| `src/rollo/prompt.py` | 修改 | 4.3 | ROLLO.md 遍历、rules、`{{cwd}}`、git 子进程 `cwd=` 全部改用 context |
+| `src/rollo/tools.py` | 修改 | 4.1 | `_run_shell` 显式 `cwd=`；文件三工具与 `list_files`/`grep_search` 按 context 解析相对路径；`load_permission_rules`/`check_permission`/`commit_tool_state`/`_auto_update_memory_index` 全部接 context |
+| `src/rollo/mcp_client.py` | 修改 | 4.2 | `McpManager` 持 context 快照，项目配置从 `context.settings_path` / `context.mcp_config_path` 读取 |
+| `src/rollo/agent.py` | 修改 | 4.6 | 构造 context 并贯穿提示词/技能/子 Agent/记忆预取/MCP；工具与权限调用点传 `context=self.context`；skill-fork 构造移入 `try` |
+| `src/rollo/__main__.py` | 修改 | 4.7 | 入口一次性构造 context 并注入 Agent；`_entry_workspace()` 把 cwd 失败转为可诊断错误并以 exit 2 退出 |
 | `src/pyproject.toml` | 修改 | 2.3 | `python-dotenv>=1.2.0` |
 | `AGENTS.md` | 修改 | 范围外（项目契约初始化） | 用户授权写入的 Harness Project overlay marker |
 

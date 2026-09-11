@@ -7,7 +7,7 @@
 
 ## 2. Application 控制面
 
-- [ ] 2.1 新增 `src/mini_claude/application.py` 的结构化请求/响应、错误和生命周期类型，要求严格调用方显式提供 `ProjectContext`，并拒绝通过当前目录补推 workspace
+- [ ] 2.1 新增 `src/rollo/application.py` 的结构化请求/响应、错误和生命周期类型，要求严格调用方显式提供 `ProjectContext`，并拒绝通过当前目录补推 workspace
 - [ ] 2.2 实现 `session.create`/`session.list` 的 workspace 绑定和 canonical session 只读适配，验证返回稳定 session 身份且列表不跨 workspace 泄露
 - [ ] 2.3 实现 `run.start` 的命令接受、root owner 申请、run 记录提交和 Agent supervisor dispatch 顺序，验证 commit 成功前不调用模型/工具
 - [ ] 2.4 实现 `run.status` 结构化查询和集中 lifecycle guard，验证每个 run 只有一个终态且未确认的取消/关闭不被报告为成功
@@ -17,7 +17,7 @@
 
 ## 3. Workspace owner 与执行监督
 
-- [ ] 3.1 新增 `src/mini_claude/workspace_lock.py` 的统一锁工厂和平台后端，以规范化 `workspace_id` 为键，使用 OS 持有句柄而不是 PID 文件存在性
+- [ ] 3.1 新增 `src/rollo/workspace_lock.py` 的统一锁工厂和平台后端，以规范化 `workspace_id` 为键，使用 OS 持有句柄而不是 PID 文件存在性
 - [ ] 3.2 实现 root owner token、owner metadata 和 child owner tree 的创建/授权/释放校验，验证 foreign caller 不能取消或释放他人的 child
 - [ ] 3.3 将模型 task、InteractionRegistry 等待、child Agent 和 managed shell 注册到同一 root supervisor，并为每个 execution 保存 parent/root/owner 身份
 - [ ] 3.4 为 `tools.py` 的受管理 shell 接入异步 execution handle，绑定 `ProjectContext.tool_cwd` 和 owner，并持续 drain stdout/stderr

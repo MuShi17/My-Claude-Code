@@ -1,6 +1,6 @@
 ## Context
 
-C08 projection 已确定 high-water/version/digest 和 bounded replay，C05 预留 `llm_captures`，当前 `agent.py` 的 `_persist_large_result` 单独写 `~/.mini-claude/tool-results`，没有统一 hash/ref/atomic protocol。C09 需要兼容该旧目录的只读数据，但为新 archive 建立明确边界。
+C08 projection 已确定 high-water/version/digest 和 bounded replay，C05 预留 `llm_captures`，当前 `agent.py` 的 `_persist_large_result` 单独写 `~/.rollo/tool-results`，没有统一 hash/ref/atomic protocol。C09 需要兼容该旧目录的只读数据，但为新 archive 建立明确边界。
 
 ## Goals / Non-Goals
 

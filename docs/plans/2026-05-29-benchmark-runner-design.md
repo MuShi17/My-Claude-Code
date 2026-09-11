@@ -2,7 +2,7 @@
 
 > **For Claude:** 实现时使用 superpowers:writing-plans 生成实现计划。
 
-**Goal:** 建立 benchmark 评估体系，对 Mini Claude Code 进行自动化回归测试和性能基准追踪。
+**Goal:** 建立 benchmark 评估体系，对 Rollo Code 进行自动化回归测试和性能基准追踪。
 
 **Architecture:** `benchmark/` 独立模块 — `runner.py` 负责任务编排执行，`reporter.py` 负责从 trace 提取指标生成结构化报告。
 
@@ -17,7 +17,7 @@
 | 目的 | 回归测试（pass/fail）+ 性能基准（全指标追踪） |
 | Task 类型 | 文本编辑（保留现有）+ 简单编程任务（新增） |
 | Runner 架构 | benchmark/ 独立模块 + 结构化 JSON 报告 |
-| Agent 调用 | subprocess CLI `mini-claude-py --yolo` |
+| Agent 调用 | subprocess CLI `rollo --yolo` |
 | 报告输出 | `benchmark_runs/{timestamp}/report.json` |
 
 ---
@@ -48,7 +48,7 @@ benchmark_runs/
 ```json
 {
   "schema_version": 2,
-  "description": "Benchmark tasks for Mini Claude Code regression testing",
+  "description": "Benchmark tasks for Rollo Code regression testing",
   "tasks": [
     {
       "id": "unique_id",
@@ -81,9 +81,9 @@ benchmark_runs/
 ```
 for each task in coding_tasks.json:
   1. 复制 fixture 到临时目录
-  2. cd 工作区 && mini-claude-py --yolo --max-turns {step_budget} "{prompt}"
+  2. cd 工作区 && rollo --yolo --max-turns {step_budget} "{prompt}"
   3. 在工作区运行 task.verifier → pass/fail
-  4. 从 ~/.mini-claude/sessions/{id}/traces/ 复制 trace 到 benchmark_runs/
+  4. 从 ~/.rollo/sessions/{id}/traces/ 复制 trace 到 benchmark_runs/
   5. 清理临时工作区
 ```
 

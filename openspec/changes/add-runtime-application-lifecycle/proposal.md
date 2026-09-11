@@ -26,7 +26,7 @@ C02 已将 runtime 的输出与人工交互从终端渲染中解耦，但当前�
 
 ## Impact
 
-- 新增 `src/mini_claude/application.py`、`src/mini_claude/workspace_lock.py` 及对应的 Application/TUI 测试。
+- 新增 `src/rollo/application.py`、`src/rollo/workspace_lock.py` 及对应的 Application/TUI 测试。
 - 修改 `session.py`、`runtime_store.py`、`run_lifecycle.py`、`agent.py`、`tools.py`、`tui_adapter.py`、`__main__.py` 的运行控制、取消、关闭和历史 session 接线；复用 C02 的 `OutputPort`/`InteractionPort`，不重写 Rich 渲染。
 - 可能扩展现有本地 runtime 数据目录中的控制表和迁移逻辑；必须保持旧 canonical/partial 数据可读，敏感值不进入控制记录。
 - 不引入新的第三方依赖；验证使用临时 workspace/runtime 目录、受控本地子进程和离线 Provider/worker 替身，分别标注 mock、真实 Python 进程和 CLI/TUI consumer 证据。

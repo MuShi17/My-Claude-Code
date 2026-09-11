@@ -117,14 +117,14 @@ workspace 解析失败时，入口 MUST 以可诊断方式失败：返回非零�
 
 #### Scenario: 环境变量属构造期输入而非稳定量（已声明行为）
 
-- **WHEN** 在同一进程内，先以环境变量 A 构造 context，再改变 `MINI_CLAUDE_RUNTIME_DIR` 后以环境变量 B 重新构造同一 workspace 的 context
+- **WHEN** 在同一进程内，先以环境变量 A 构造 context，再改变 `ROLLO_RUNTIME_DIR` 后以环境变量 B 重新构造同一 workspace 的 context
 - **THEN** 两次得到的 `runtime_data_dir` 与 memory 根分别取自各自构造期的环境快照；这是**已声明行为**（环境变量属构造期显式输入），不视为违反本 requirement。同一 context 对象内部仍必须保持其构造期取值不变。
 
 ### Requirement: 数据根由上下文统一派生
 
 由本 Change 负责的数据根 MUST 由同一 ProjectContext 派生，MUST NOT 各自独立读取环境变量或 HOME 而形成不同来源。消费方 MUST 通过 `resolve_memory_dir()`（或其冻结字段）取得 memory 目录，MUST NOT 用其它推导另建 memory 目录。
 
-行为声明：本 Change 后 memory 根随 `runtime_data_dir`（含 `MINI_CLAUDE_RUNTIME_DIR`）而非固定 HOME；这是对既有不一致（session 读环境变量、memory 固定 HOME）的**有意统一**，在各工件中如实声明。
+行为声明：本 Change 后 memory 根随 `runtime_data_dir`（含 `ROLLO_RUNTIME_DIR`）而非固定 HOME；这是对既有不一致（session 读环境变量、memory 固定 HOME）的**有意统一**，在各工件中如实声明。
 
 **范围排除（显式声明）**：canonical session 数据根（`session.SESSION_DIR` 为导入期常量）与 artifacts 数据根（`runtime_data_dir()` 直读环境）**不在本 Change 的统一范围内**，分别移交 C03（应用层数据根）与 C05（host 启动时传入数据目录）。本 Change MUST NOT 被理解为已统一这三个数据根。
 
@@ -144,7 +144,7 @@ workspace 解析失败时，入口 MUST 以可诊断方式失败：返回非零�
 
 #### Scenario: A/B workspace 的同名定义分别解析
 
-- **WHEN** workspace A 与 workspace B 各自存在 `.claude/skills/<同名>/SKILL.md`，且 A 与 B 各自存在 `.claude/agents/<同名>.md`
+- **WHEN** workspace A 与 workspace B 各自存在 `.rollo/skills/<同名>/SKILL.md`，且 A 与 B 各自存在 `.rollo/agents/<同名>.md`
 - **THEN** 在 A 的 context 下只解析出 A 的 skills 与 agents 定义，在 B 的 context 下只解析出 B 的定义
 
 #### Scenario: 先 A 后 B 再回 A 均得到各自结果

@@ -22,6 +22,6 @@
 
 ## Impact
 
-- 影响 `src/mini_claude/agent.py`、`subagent.py`、session/CLI 生命周期、C05 store 的 seal API 和 C06 recorder。
+- 影响 `src/rollo/agent.py`、`subagent.py`、session/CLI 生命周期、C05 store 的 seal API 和 C06 recorder。
 - 为 C08 projection、C10 recovery 提供 parent/attempt/terminal 事实。
 - 公开 Ctrl+C、权限和预算行为保持语义兼容；仅增加可恢复的记录和防止重复写。

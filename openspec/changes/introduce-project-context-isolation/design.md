@@ -4,11 +4,11 @@
 
 当前 runtime 用进程全局状态表达「项目位置」，实测到的依赖点包括：
 
-- `tools.py:672`（项目 settings）、`mcp_client.py:251,255`（项目 settings 与 `.mcp.json`）、`subagent.py:90`（项目 agents）、`prompt.py:171`（CLAUDE.md 向上遍历）、`prompt.py:186`（`.claude/rules`）、`prompt.py:229`（`{{cwd}}`）、`skills.py:49`（项目 skills）、`memory.py:46`（memory 目录哈希）均直接调用 `Path.cwd()`。
+- `tools.py:672`（项目 settings）、`mcp_client.py:251,255`（项目 settings 与 `.mcp.json`）、`subagent.py:90`（项目 agents）、`prompt.py:171`（ROLLO.md 向上遍历）、`prompt.py:186`（`.rollo/rules`）、`prompt.py:229`（`{{cwd}}`）、`skills.py:49`（项目 skills）、`memory.py:46`（memory 目录哈希）均直接调用 `Path.cwd()`。
 - `prompt.get_git_context()`（`prompt.py:193-207`）的 `git` 子进程未传 `cwd=`，继承进程当前目录。
 - `tools.grep_search` 的 `path="."`（`tools.py:455,520`）与 `_run_shell`（`tools.py:538-544`）同样依赖进程 cwd（`_run_shell` 不传 `cwd=`）。
 - 模块级缓存无 workspace 键：`skills.py:30 _cached_skills`、`subagent.py:78 _cached_custom_agents`、`tools.py:655 _cached_rules`。
-- `session.py:24` 的 `SESSION_DIR` 是导入期常量，`runtime_data_dir()` 只读 `MINI_CLAUDE_RUNTIME_DIR` 或 HOME。
+- `session.py:24` 的 `SESSION_DIR` 是导入期常量，`runtime_data_dir()` 只读 `ROLLO_RUNTIME_DIR` 或 HOME。
 - 测试侧原本无任何 `conftest.py`；`PYTHON_DOTENV_DISABLED` 由 python-dotenv 1.2.0 起支持（实测 1.2.2 下 `load_dotenv()` 返回 `False` 且不注入仓库根 `.env` 中的真实密钥），但它在**导入期**判定，`monkeypatch.setenv` 在测试体内设置已太晚。
 
 约束：CLI/TUI 与 Harbor 入口的既有 flags 与默认路径语义必须保持；不得移动历史数据目录；本 Change 不引入 owner 锁与 Application API（属 C03）。本设计同时承担 Item02 独立评审结论中 GAP-I02-01 的闭合。
@@ -43,7 +43,7 @@
 
 `workspace_id = sha256(str(realpath(root)))[:16]`。本机 Python 3.14.6 实测：`os.path.realpath` 已把大小写等价形式、尾分隔符、`..` 段与 8.3 短名解析为真实长名，因此 `D:\workspace\My-Claude-Code`、`d:/workspace/My-Claude-Code/`、`D:\workspace\My-Claude-Code\src\..`、`D:\WORKSPACE\MY-CLAUDE-CODE` 全部得到 `D:\workspace\My-Claude-Code`，其身份 `514fed37912aa299` **正是历史算法 `sha256(str(Path.cwd()))[:16]` 的取值** → 既有 memory 目录无缝、无需任何回退分支。
 
-早期草案曾用 `normcase(realpath)` 做身份并配 `legacy_workspace_id` 回退，评审发现该回退在实现层恒不生效（`resolve_workspace_root()` 返回的已是折叠后路径，legacy 哈希被同一路径喂入），且 `MINI_CLAUDE_RUNTIME_DIR` 场景下回退基址与历史实现（`Path.home()/".mini-claude"`）不一致。已整体删除该机制：**规范化的唯一来源是 realpath，身份推导 MUST NOT 做 normcase 折叠**（见 spec R1 的可判定关系式）。同一性判据也改为 realpath-only；`normcase` 不再出现在判据或身份推导中。
+早期草案曾用 `normcase(realpath)` 做身份并配 `legacy_workspace_id` 回退，评审发现该回退在实现层恒不生效（`resolve_workspace_root()` 返回的已是折叠后路径，legacy 哈希被同一路径喂入），且 `ROLLO_RUNTIME_DIR` 场景下回退基址与历史实现（`Path.home()/".rollo"`）不一致。已整体删除该机制：**规范化的唯一来源是 realpath，身份推导 MUST NOT 做 normcase 折叠**（见 spec R1 的可判定关系式）。同一性判据也改为 realpath-only；`normcase` 不再出现在判据或身份推导中。
 
 memory 路径在 `ProjectContext` 构造时**冻结**为字段，`resolve_memory_dir()` 退化为纯访问器：不会因文件系统变化改判，从而结构上不可能出现「同一 workspace 两个 memory 根」。
 
@@ -57,10 +57,10 @@ C01 只承诺三件事：不依据当前 workspace 猜测归属、不写入绑�
 
 ### D6 测试隔离用 conftest 强制点 + 上游 dotenv 开关（备选：新增自定义开关）
 
-新增 `src/mini_claude/tests/conftest.py` 作为唯一强制隔离点：
+新增 `src/rollo/tests/conftest.py` 作为唯一强制隔离点：
 
-- **模块顶层**（任何 `mini_claude` 导入之前）无条件赋值 `os.environ["PYTHON_DOTENV_DISABLED"] = "1"`（不用 `setdefault`：外部若给 `0`/`false` 会静默关闭隔离）；因为 `mini_claude.__main__` 在导入期调用 `load_dotenv()`，fixture 内设置已太晚。开关沿用 python-dotenv 上游名字，**不新增产品侧配置**；`src/pyproject.toml` 的 `python-dotenv` 下限由 `>=1.0.1` 提到 `>=1.2.0`（该开关自 1.2.0 引入）。
-- 每个测试获得临时 HOME / USERPROFILE / `MINI_CLAUDE_RUNTIME_DIR`；显式 monkeypatch 导入期常量（`session.SESSION_DIR`），因为导入后改环境变量不会重定向已固化的常量。
+- **模块顶层**（任何 `rollo` 导入之前）无条件赋值 `os.environ["PYTHON_DOTENV_DISABLED"] = "1"`（不用 `setdefault`：外部若给 `0`/`false` 会静默关闭隔离）；因为 `rollo.__main__` 在导入期调用 `load_dotenv()`，fixture 内设置已太晚。开关沿用 python-dotenv 上游名字，**不新增产品侧配置**；`src/pyproject.toml` 的 `python-dotenv` 下限由 `>=1.0.1` 提到 `>=1.2.0`（该开关自 1.2.0 引入）。
+- 每个测试获得临时 HOME / USERPROFILE / `ROLLO_RUNTIME_DIR`；显式 monkeypatch 导入期常量（`session.SESSION_DIR`），因为导入后改环境变量不会重定向已固化的常量。
 - 守卫测试断言 `load_dotenv() is False` 且进程内无 `ANTHROPIC_API_KEY`/`OPENAI_API_KEY`：在旧版 dotenv 下显式红灯，而不是静默读真实密钥。
 - 数据根统一：测试内所有数据根由同一组环境变量与常量替换决定；`runtime_data_dir()` 为**函数**，需要时按调用期语义 patch，而不是只 patch 常量。
 

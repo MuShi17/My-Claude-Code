@@ -22,6 +22,6 @@
 
 ## Impact
 
-- 影响 `src/mini_claude/agent.py`、`logger.py`、`tracer.py`、`session.py` 及未来的 runtime event/store/projection 模块。
+- 影响 `src/rollo/agent.py`、`logger.py`、`tracer.py`、`session.py` 及未来的 runtime event/store/projection 模块。
 - 影响 JSONL/session 的 shadow 兼容、SQLite 存储 schema、CLI `--resume` 以及测试夹具。
 - 不引入第三方依赖；持久化阶段仅允许使用 Python 标准库 `sqlite3`。

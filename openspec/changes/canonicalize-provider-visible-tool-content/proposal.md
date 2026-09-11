@@ -22,8 +22,8 @@ Canonical Runtime Event 已经能够保存 bounded tool result，但首次 Provi
 
 ## Impact
 
-- 影响 `src/mini_claude/agent.py` 的工具结果 materialization 路径；
-- 影响 `src/mini_claude/projections/model_replay_projection.py` 和 `provider_context.py` 的工具结果投影与 Provider 适配；
+- 影响 `src/rollo/agent.py` 的工具结果 materialization 路径；
+- 影响 `src/rollo/projections/model_replay_projection.py` 和 `provider_context.py` 的工具结果投影与 Provider 适配；
 - 复用现有 redaction、artifact archive 和 Runtime Event，不改变 Canonical Event 作为事实来源的原则；
 - 增加 Agent integration tests 和 wire-level serialization assertions；
 - 不改变已有合法文本、thinking/signature 或 tool-call 的对外语义。

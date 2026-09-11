@@ -5,7 +5,7 @@
 ## 当前边界
 
 - RuntimeEvent v2 是唯一运行时事实格式；SQLite 是唯一运行时事实源。
-- 每个 session 使用 `~/.mini-claude/sessions/{session_id}/runtime.sqlite`。
+- 每个 session 使用 `~/.rollo/sessions/{session_id}/runtime.sqlite`。
 - Session、Model Replay、Run Trace、Metrics、Compaction 和 Recovery 都是可删除、可重建的 Canonical projection。
 - 工具遵循 durable dispatch → side effect → outcome；dispatch 无 outcome 时只标记 uncertain，不自动重做副作用。
 - LLM body capture 仅由 `off`、`metadata-only`、`redacted` 策略控制，不经日志写入路径。
@@ -46,7 +46,7 @@ git diff --check
 - terminality 只由 typed terminal status 决定；`end_run` 无 terminal status、partial opening 均被拒绝。
 - Model Replay 只接受 call 之后的 function response；逆序结果保留诊断但不会进入 provider context。
 - Anthropic adapter 将 signed thinking 转为 provider-native `type/thinking/signature` block；OpenAI adapter 不发送不受支持的 neutral thinking block。
-- `mini_claude_py.egg-info/SOURCES.txt` 已移除已删除 logger/tracer 并补齐当前 runtime/projection 文件清单。
+- `rollo_code.egg-info/SOURCES.txt` 已移除已删除 logger/tracer 并补齐当前 runtime/projection 文件清单。
 - follow-up 独立只读复核确认上述缺口均已关闭；未签名或外部 provider 的 thinking 在 Anthropic adapter 中会被过滤，不再以 neutral `kind` 结构流入 API。
 
 评审中关于旧第一批 `139 passed/22 passed`、shadow route 和 `--log-authority` 的意见，已核实为历史批次文档，不是当前 Canonical-only 批次的实现证据；当前批次文档已单独记录最新状态。未采纳超出本批次边界的生产 Provider、多实例部署和 SLO 要求。

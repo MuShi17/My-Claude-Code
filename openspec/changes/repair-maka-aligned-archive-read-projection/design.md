@@ -38,7 +38,7 @@ Maka 对照快照 D:/workspace/maka@57e08d83497d1d7ace7d6eff88e4e5267a0345b5 的
 
 ### 1. 以现有 ArtifactArchive 为事实存储，新增运行时 capability
 
-新增 src/mini_claude/archive_capability.py，定义 ToolResultArchiveCapability 及其受限 reader/decoder；ArtifactArchive 继续负责 content-addressed 文件、metadata、redaction 和低层完整性校验。
+新增 src/rollo/archive_capability.py，定义 ToolResultArchiveCapability 及其受限 reader/decoder；ArtifactArchive 继续负责 content-addressed 文件、metadata、redaction 和低层完整性校验。
 
 Capability 至少携带：
 

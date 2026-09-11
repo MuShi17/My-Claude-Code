@@ -22,6 +22,6 @@ Canonical events只有在能稳定投影为 session 消息、provider 请求和 
 
 ## Impact
 
-- 新增 `src/mini_claude/projections/session_projection.py`、`model_replay_projection.py`、`run_trace_projection.py`。
+- 新增 `src/rollo/projections/session_projection.py`、`model_replay_projection.py`、`run_trace_projection.py`。
 - 影响 `session.py`、Agent Loop context construction、Tracer compatibility 和 C05 high-water read API。
 - 依赖 C01、C02、C04～C07；不允许反向修改冻结事件语义。

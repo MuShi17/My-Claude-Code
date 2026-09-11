@@ -22,6 +22,6 @@ None.
 
 ## Impact
 
-- Affects `src/mini_claude/projections/provider_context.py`, provider request construction in `agent.py`, replay integration, and provider-focused tests.
+- Affects `src/rollo/projections/provider_context.py`, provider request construction in `agent.py`, replay integration, and provider-focused tests.
 - Changes only the outbound wire representation; canonical event and neutral projection identities remain internal and unchanged.
 - Covers both OpenAI-compatible and Anthropic adapters without adding a provider SDK dependency.

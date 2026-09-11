@@ -15,7 +15,7 @@
 ### Task 1: 实现 logger.py
 
 **Files:**
-- Create: `src/mini_claude/logger.py`
+- Create: `src/rollo/logger.py`
 
 **Step 1: 编写 AgentLogger 类**
 
@@ -30,7 +30,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-SESSION_DIR = Path.home() / ".mini-claude" / "sessions"
+SESSION_DIR = Path.home() / ".rollo" / "sessions"
 
 
 class AgentLogger:
@@ -176,11 +176,11 @@ class AgentLogger:
 cd D:/PycharmProjects/pythonProject/claude-code-from-scratch && PYTHONPATH=src python -c "
 import tempfile, json, shutil, os
 from pathlib import Path
-from mini_claude.logger import AgentLogger
+from rollo.logger import AgentLogger
 
 # 用临时目录模拟 session
 tmp = Path(tempfile.mkdtemp())
-real_session = Path.home() / '.mini-claude' / 'sessions'
+real_session = Path.home() / '.rollo' / 'sessions'
 try:
     # 创建假 session 目录
     sid = 'test_logger_001'
@@ -236,10 +236,10 @@ finally:
 cd D:/PycharmProjects/pythonProject/claude-code-from-scratch && PYTHONPATH=src python -c "
 import json, shutil
 from pathlib import Path
-from mini_claude.logger import AgentLogger
+from rollo.logger import AgentLogger
 
 sid = 'test_logger_parent'
-sdir = Path.home() / '.mini-claude' / 'sessions' / sid
+sdir = Path.home() / '.rollo' / 'sessions' / sid
 sdir.mkdir(parents=True, exist_ok=True)
 
 main_logger = AgentLogger(sid, agent_id='main')
@@ -261,7 +261,7 @@ print('PASS')
 **Step 4: Commit**
 
 ```bash
-git add src/mini_claude/logger.py
+git add src/rollo/logger.py
 git commit -m "feat: add AgentLogger — real-time JSONL logging for agent observability"
 ```
 
@@ -270,7 +270,7 @@ git commit -m "feat: add AgentLogger — real-time JSONL logging for agent obser
 ### Task 2: 改造 tracer.py 为实时写入
 
 **Files:**
-- Modify: `src/mini_claude/tracer.py:76-94`
+- Modify: `src/rollo/tracer.py:76-94`
 
 **Step 1: 修改 tracer 的 finalize 方法**
 
@@ -327,11 +327,11 @@ class SessionTracer:
 cd D:/PycharmProjects/pythonProject/claude-code-from-scratch && PYTHONPATH=src python -c "
 import json, time, tempfile, shutil
 from pathlib import Path
-from mini_claude.logger import AgentLogger
-from mini_claude.tracer import SessionTracer
+from rollo.logger import AgentLogger
+from rollo.tracer import SessionTracer
 
 sid = 'test_tracer_realtime'
-sdir = Path.home() / '.mini-claude' / 'sessions' / sid
+sdir = Path.home() / '.rollo' / 'sessions' / sid
 sdir.mkdir(parents=True, exist_ok=True)
 
 logger = AgentLogger(sid)
@@ -364,7 +364,7 @@ print('PASS')
 **Step 3: Commit**
 
 ```bash
-git add src/mini_claude/tracer.py
+git add src/rollo/tracer.py
 git commit -m "refactor: real-time tracer writing — write turn/ask lines immediately"
 ```
 
@@ -373,7 +373,7 @@ git commit -m "refactor: real-time tracer writing — write turn/ask lines immed
 ### Task 3: 集成 logger 到 agent.py
 
 **Files:**
-- Modify: `src/mini_claude/agent.py` — 多处插入 logger 调用
+- Modify: `src/rollo/agent.py` — 多处插入 logger 调用
 
 **Step 1: 在 agent.py 导入 logger**
 
@@ -470,13 +470,13 @@ PYTHON = r'D:/Anaconda/envs/ai/python.exe'
 
 ws = Path(tempfile.mkdtemp(prefix='logtest_'))
 shutil.copytree('test/fixtures/bench_repo_patch', ws, dirs_exist_ok=True)
-cmd = [PYTHON, '-B', '-m', 'mini_claude', '--yolo', '--max-turns', '2',
+cmd = [PYTHON, '-B', '-m', 'rollo', '--yolo', '--max-turns', '2',
        'Read sample.txt and replace beta with beta-locked.']
 proc = subprocess.run(cmd, cwd=str(ws), capture_output=True, encoding='utf-8', timeout=300,
     env={**os.environ, 'PYTHONPATH': str(PROJECT_ROOT/'src'), 'PYTHONIOENCODING': 'utf-8'})
 
 # 找最新的 session 日志
-sessions = sorted(Path.home().glob('.mini-claude/sessions/*'), key=lambda p: p.stat().st_mtime, reverse=True)
+sessions = sorted(Path.home().glob('.rollo/sessions/*'), key=lambda p: p.stat().st_mtime, reverse=True)
 latest = sessions[0]
 log_file = latest / 'logs' / '001.jsonl'
 llm_file = latest / 'llm' / f'{latest.name}.jsonl'
@@ -501,7 +501,7 @@ print('PASS')
 **Step 6: Commit**
 
 ```bash
-git add src/mini_claude/agent.py
+git add src/rollo/agent.py
 git commit -m "feat: integrate logger into agent — API calls, tools, sub-agents"
 ```
 
@@ -527,12 +527,12 @@ ws = Path(tempfile.mkdtemp(prefix='e2e_log_'))
 shutil.copytree('test/fixtures/multi_file', ws, dirs_exist_ok=True)
 
 # 这个 task 需要 grep_search（可能触发 skill）
-cmd = [PYTHON, '-B', '-m', 'mini_claude', '--yolo', '--max-turns', '4',
+cmd = [PYTHON, '-B', '-m', 'rollo', '--yolo', '--max-turns', '4',
        'Search for TODO in all files under this directory and replace with DONE']
 proc = subprocess.run(cmd, cwd=str(ws), capture_output=True, encoding='utf-8', timeout=300,
     env={**os.environ, 'PYTHONPATH': str(PROJECT_ROOT/'src'), 'PYTHONIOENCODING': 'utf-8'})
 
-sessions = sorted(Path.home().glob('.mini-claude/sessions/*'), key=lambda p: p.stat().st_mtime, reverse=True)
+sessions = sorted(Path.home().glob('.rollo/sessions/*'), key=lambda p: p.stat().st_mtime, reverse=True)
 latest = sessions[0]
 log_file = latest / 'logs' / '001.jsonl'
 llm_file = latest / 'llm' / f'{latest.name}.jsonl'
@@ -578,7 +578,7 @@ ws = Path(tempfile.mkdtemp(prefix='crash_'))
 shutil.copytree('test/fixtures/bench_repo_patch', ws, dirs_exist_ok=True)
 
 # 用 5 秒 timeout，agent 的 first token 通常要 900ms，足够拿到 api_response
-cmd = [PYTHON, '-B', '-m', 'mini_claude', '--yolo', '--max-turns', '2',
+cmd = [PYTHON, '-B', '-m', 'rollo', '--yolo', '--max-turns', '2',
        'Read sample.txt']
 try:
     proc = subprocess.run(cmd, cwd=str(ws), capture_output=True, encoding='utf-8',
@@ -588,7 +588,7 @@ except subprocess.TimeoutExpired:
 
 time.sleep(0.5)
 
-sessions = sorted(Path.home().glob('.mini-claude/sessions/*'), key=lambda p: p.stat().st_mtime, reverse=True)
+sessions = sorted(Path.home().glob('.rollo/sessions/*'), key=lambda p: p.stat().st_mtime, reverse=True)
 latest = sessions[0]
 log_file = latest / 'logs' / '001.jsonl'
 if log_file.exists():

@@ -3,7 +3,7 @@
 Harbor passes the task short name to the environment constructor.  This class
 uses that name to replace the task's Docker build with an image selected in a
 local JSON file.  The image must already contain both the task environment and
-the Mini Claude runtime; the Adapter still uploads the current ``src`` tree
+the Rollo Code runtime; the Adapter still uploads the current ``src`` tree
 before checking the prebuilt virtual environment.
 """
 
@@ -23,7 +23,7 @@ DEFAULT_IMAGE_MAP = PROJECT_ROOT / "benchmark" / "prebuilt-images.json"
 
 
 def _image_map_path() -> Path:
-    configured_path = os.environ.get("MINI_CLAUDE_IMAGE_MAP", "").strip()
+    configured_path = os.environ.get("ROLLO_IMAGE_MAP", "").strip()
     return Path(configured_path) if configured_path else DEFAULT_IMAGE_MAP
 
 
@@ -54,7 +54,7 @@ def load_prebuilt_image_map() -> dict[str, str]:
     return mapping
 
 
-class MiniClaudePrebuiltDockerEnvironment(DockerEnvironment):
+class RolloPrebuiltDockerEnvironment(DockerEnvironment):
     """Use an explicitly mapped prebuilt image for selected Harbor tasks.
 
     Without a matching mapping entry this behaves exactly like Harbor's normal

@@ -1,6 +1,6 @@
 ## Why
 
-当前 Mini Claude Code 会在 Provider 首次请求前把大工具结果替换为 bounded_ref 元数据，但 Provider 和子 Agent 没有可消费该引用的 ArchiveRead 能力，因此模型只能看到 ref、size 和 hash，无法获得文件正文或继续读取。Maka 的流程是最新结果首次请求优先保留完整正文，只有容量确实不足或结果变 stale 时才使用带读取指引的归档占位符；本变更补齐这一闭环。
+当前 Rollo Code 会在 Provider 首次请求前把大工具结果替换为 bounded_ref 元数据，但 Provider 和子 Agent 没有可消费该引用的 ArchiveRead 能力，因此模型只能看到 ref、size 和 hash，无法获得文件正文或继续读取。Maka 的流程是最新结果首次请求优先保留完整正文，只有容量确实不足或结果变 stale 时才使用带读取指引的归档占位符；本变更补齐这一闭环。
 
 ## What Changes
 
@@ -24,7 +24,7 @@
 
 ## Impact
 
-- 影响 src/mini_claude/artifact_archive.py、runtime_lifecycle.py、provider_content.py、projections/、agent.py、subagent.py、tools.py、ui.py 及其测试。
+- 影响 src/rollo/artifact_archive.py、runtime_lifecycle.py、provider_content.py、projections/、agent.py、subagent.py、tools.py、ui.py 及其测试。
 - 影响 Anthropic 和 OpenAI-compatible Provider 的工具结果消息内容，但不改变工具执行和副作用调度协议。
 - 需要复用现有 artifact store、Canonical Runtime Event、redaction 和模型 replay；不新增外部依赖，不迁移或删除既有 artifact。
 - 参考 D:/workspace/maka@57e08d83497d1d7ace7d6eff88e4e5267a0345b5，仅复制行为语义，不修改参考仓库。

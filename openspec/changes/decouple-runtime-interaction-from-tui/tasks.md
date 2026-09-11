@@ -1,4 +1,4 @@
-﻿> 状态说明：C02 实现已完成端口接线（全量 **446 passed**；套件含已知 flake，回归门见 §1.3）。输出端口、
+> 状态说明：C02 实现已完成端口接线（全量 **446 passed**；套件含已知 flake，回归门见 §1.3）。输出端口、
 > 交互端口、终端适配器、夹具与安全边界均已落地；实现缺口已由当前回归与独立 Gate 复核闭合。
 > checklist 只勾选已按证据完成的事项。
 
@@ -10,7 +10,7 @@
 
 - [x] 1.1 绑定执行基线：execution_root=D:\workspace\My-Claude-Code、branch=main、base=21b9bdfbb7c0bf3b2f2f47f13890724cff76a5bc；runtimePython=`C:\Users\Administrator\AppData\Local\Python\pythoncore-3.14-64\python.exe`，Python 3.14.6 / pytest 9.1.1；唯一 writer=main-agent、无 mode_switch（2026-09-11 复核）。
 - [x] 1.2 前置门复核：C01 的 accepted_result 与 contract_handoff 已登记（change_registry.C01），交接物为 C01 tasks §7 接口清单；C02 的 openspec_authorized / implementation_authorized 已由用户明确授权（2026-09-10）。
-- [x] 1.3 冻结 C02 起始基线：`& $runtimePython -m pytest -q src/mini_claude/tests` 于 2026-09-11 退出码 0，`449 collected / 449 passed / 1 warning`；逐字状态与全部 SHA256 已记录于本任务文件 §1.3 证据块及移交快照。warning 家族为 `PytestUnraisableExceptionWarning`（`test_compaction_artifacts.py::test_artifact_archive_is_redacted_atomic_content_addressed_and_bounded`）。**套件非确定**：保留 3 条既有 flake 清单（`test_archive_projection` close、`test_local_consumers` CLI resume、`test_runtime_artifact_store_lifecycle` 大结果），回归门 MUST 采用"N 次重复全量 + flake 清单"，不得以单次全绿为唯一判据；禁止沿用 396/407 作为回归门。
+- [x] 1.3 冻结 C02 起始基线：`& $runtimePython -m pytest -q src/rollo/tests` 于 2026-09-11 退出码 0，`449 collected / 449 passed / 1 warning`；逐字状态与全部 SHA256 已记录于本任务文件 §1.3 证据块及移交快照。warning 家族为 `PytestUnraisableExceptionWarning`（`test_compaction_artifacts.py::test_artifact_archive_is_redacted_atomic_content_addressed_and_bounded`）。**套件非确定**：保留 3 条既有 flake 清单（`test_archive_projection` close、`test_local_consumers` CLI resume、`test_runtime_artifact_store_lifecycle` 大结果），回归门 MUST 采用"N 次重复全量 + flake 清单"，不得以单次全绿为唯一判据；禁止沿用 396/407 作为回归门。
 - [x] 1.4 产出并记录 C02 独立测试策略：首轮双角色评审给出的 `GAP-C02-01`—`GAP-C02-15` 已逐条落到本 Item 与本文件；post-implementation 独立 delta 已完成代码与测试审查，证据包补齐后的正式 Gate 返回 `sufficient`。
 
 ### §1.3 冻结证据（2026-09-11）
@@ -18,30 +18,30 @@
 ```text
 git status --porcelain=v1:
  M AGENTS.md
- M src/mini_claude/__main__.py
- M src/mini_claude/agent.py
- M src/mini_claude/mcp_client.py
- M src/mini_claude/memory.py
- M src/mini_claude/prompt.py
- M src/mini_claude/skills.py
- M src/mini_claude/subagent.py
- M src/mini_claude/tools.py
- M src/mini_claude/ui.py
+ M src/rollo/__main__.py
+ M src/rollo/agent.py
+ M src/rollo/mcp_client.py
+ M src/rollo/memory.py
+ M src/rollo/prompt.py
+ M src/rollo/skills.py
+ M src/rollo/subagent.py
+ M src/rollo/tools.py
+ M src/rollo/ui.py
  M src/pyproject.toml
 ?? openspec/changes/decouple-runtime-interaction-from-tui/
 ?? openspec/changes/introduce-project-context-isolation/
-?? src/mini_claude/interactions.py
-?? src/mini_claude/project_context.py
-?? src/mini_claude/runtime_ports.py
-?? src/mini_claude/tests/conftest.py
-?? src/mini_claude/tests/provider_fixtures.py
-?? src/mini_claude/tests/test_interaction_safety.py
-?? src/mini_claude/tests/test_interactions.py
-?? src/mini_claude/tests/test_project_context.py
-?? src/mini_claude/tests/test_runtime_ports.py
-?? src/mini_claude/tests/test_tui_adapter.py
-?? src/mini_claude/tests/tool_fixtures.py
-?? src/mini_claude/tui_adapter.py
+?? src/rollo/interactions.py
+?? src/rollo/project_context.py
+?? src/rollo/runtime_ports.py
+?? src/rollo/tests/conftest.py
+?? src/rollo/tests/provider_fixtures.py
+?? src/rollo/tests/test_interaction_safety.py
+?? src/rollo/tests/test_interactions.py
+?? src/rollo/tests/test_project_context.py
+?? src/rollo/tests/test_runtime_ports.py
+?? src/rollo/tests/test_tui_adapter.py
+?? src/rollo/tests/tool_fixtures.py
+?? src/rollo/tui_adapter.py
 
 SHA256:
 AFC431B9306C0AE25880A854BD97EEF6A6544BA46DCC713E68B1D569F783195D  AGENTS.md
@@ -58,27 +58,27 @@ FE172E3C3F6DA76E4813B2D8814FAAF21EE4D1A49CC493F547F8E5585D74E500  openspec/chang
 FEE0E9D901009C74B0B6AD325839FF9AA3BC95CCE9AFF599D088E0F9C9AFFCF2  openspec/changes/introduce-project-context-isolation/README.md
 174927B12D53B25FFE70B60B16B98510CF337C40A6622089DB1FD43E5FA71101  openspec/changes/introduce-project-context-isolation/specs/project-context/spec.md
 5FE8B66F4626ED8876B58BB7A1F66B91FCB0389323B5153682F917CB965CF5E7  openspec/changes/introduce-project-context-isolation/tasks.md
-BDD718E7BC9CA109E12AE0B776DF9A457DA570E62FABAF0E7465F69D11A8CB58  src/mini_claude/__main__.py
-31CB53481F95F38B14F3514B002978DAE406EE386368FE6CC72046A77861087A  src/mini_claude/agent.py
-DE7A27A4FB9417D76CC61D92F570F119A1FB46A4111ABA269896768CB51FE15E  src/mini_claude/interactions.py
-687F51DD7C6128B44E3AAECB2C323B39FCA6FE9531AECF0F21F375E739DC5D6E  src/mini_claude/mcp_client.py
-1D0B01F40A9C2A4ADCC5D27CEA1A6F8B72584E76C628498D21D9A155924EAEDF  src/mini_claude/memory.py
-7D2C5AC18B907295D12BB5D0B31B8BF03D0B469C69E8CBCF4BC5F4CE9A95ED66  src/mini_claude/project_context.py
-548066DDFDCC5BBB2E78436609B44A06D99DF8B2FAE995B6A71931EBD54CBED6  src/mini_claude/prompt.py
-5E816492DCB716996ECA7FD5436696ACB36C035C0800A5B8C6F0CAC5ACB22266  src/mini_claude/runtime_ports.py
-32D35AF887EAB0108A099B2486B193EA3C0A918EFC4A3D925FB187BED1852CAC  src/mini_claude/skills.py
-E58682197621D9093BE3DF3EB9839CEFE1D379EA8A51B06D2CEDCAA05A860C50  src/mini_claude/subagent.py
-391F88EECEA419F14A2D539908EEAED5499D67A2DCE143A0C2DC620E74458BEB  src/mini_claude/tests/conftest.py
-118827657BCB8E0121A68A6EB12099176DD482DE7D25E6A5A23CF12912C6FA64  src/mini_claude/tests/provider_fixtures.py
-2FF65493E9523F36EEF7B227B34071AE01FC08E475B6B12FBC99A1E4C4653F80  src/mini_claude/tests/test_interaction_safety.py
-B04435085F3BB2BB458C2C0FDC8F98FCBD8D3EA3CFA7101EBC8B7783783BD343  src/mini_claude/tests/test_interactions.py
-6B811779ED89A4D4F094DCF1F2C0765D91B065F6C405D59CCF3FD0BB490CFF20  src/mini_claude/tests/test_project_context.py
-2619C42DA7AAF2FB244A27DE73FC45D6D6F40D0DABF19E9BDF83E7AA106F562C  src/mini_claude/tests/test_runtime_ports.py
-04FF4C15CB39382629C17C67AA1F15A340B28A7279FE95A6DAE80EEA85D95F75  src/mini_claude/tests/test_tui_adapter.py
-DFFE1D8B06CB78F708546161C991C3B69DA19B2F25FFFA3D6A693C8140E8E189  src/mini_claude/tests/tool_fixtures.py
-BCD4D3BF534DD6EDA680D8E6FD5ECAA0665EE165BA4A1AFF039C49430F371E29  src/mini_claude/tools.py
-30A2AD65EEEE14553C86E14813AB8760985FDC50666BE9325B19A1B141C1FDC4  src/mini_claude/tui_adapter.py
-17EBFF2079BC15B81A952A8A864600E70BC9AD1B54054849C85185F5F6BFA7F7  src/mini_claude/ui.py
+BDD718E7BC9CA109E12AE0B776DF9A457DA570E62FABAF0E7465F69D11A8CB58  src/rollo/__main__.py
+31CB53481F95F38B14F3514B002978DAE406EE386368FE6CC72046A77861087A  src/rollo/agent.py
+DE7A27A4FB9417D76CC61D92F570F119A1FB46A4111ABA269896768CB51FE15E  src/rollo/interactions.py
+687F51DD7C6128B44E3AAECB2C323B39FCA6FE9531AECF0F21F375E739DC5D6E  src/rollo/mcp_client.py
+1D0B01F40A9C2A4ADCC5D27CEA1A6F8B72584E76C628498D21D9A155924EAEDF  src/rollo/memory.py
+7D2C5AC18B907295D12BB5D0B31B8BF03D0B469C69E8CBCF4BC5F4CE9A95ED66  src/rollo/project_context.py
+548066DDFDCC5BBB2E78436609B44A06D99DF8B2FAE995B6A71931EBD54CBED6  src/rollo/prompt.py
+5E816492DCB716996ECA7FD5436696ACB36C035C0800A5B8C6F0CAC5ACB22266  src/rollo/runtime_ports.py
+32D35AF887EAB0108A099B2486B193EA3C0A918EFC4A3D925FB187BED1852CAC  src/rollo/skills.py
+E58682197621D9093BE3DF3EB9839CEFE1D379EA8A51B06D2CEDCAA05A860C50  src/rollo/subagent.py
+391F88EECEA419F14A2D539908EEAED5499D67A2DCE143A0C2DC620E74458BEB  src/rollo/tests/conftest.py
+118827657BCB8E0121A68A6EB12099176DD482DE7D25E6A5A23CF12912C6FA64  src/rollo/tests/provider_fixtures.py
+2FF65493E9523F36EEF7B227B34071AE01FC08E475B6B12FBC99A1E4C4653F80  src/rollo/tests/test_interaction_safety.py
+B04435085F3BB2BB458C2C0FDC8F98FCBD8D3EA3CFA7101EBC8B7783783BD343  src/rollo/tests/test_interactions.py
+6B811779ED89A4D4F094DCF1F2C0765D91B065F6C405D59CCF3FD0BB490CFF20  src/rollo/tests/test_project_context.py
+2619C42DA7AAF2FB244A27DE73FC45D6D6F40D0DABF19E9BDF83E7AA106F562C  src/rollo/tests/test_runtime_ports.py
+04FF4C15CB39382629C17C67AA1F15A340B28A7279FE95A6DAE80EEA85D95F75  src/rollo/tests/test_tui_adapter.py
+DFFE1D8B06CB78F708546161C991C3B69DA19B2F25FFFA3D6A693C8140E8E189  src/rollo/tests/tool_fixtures.py
+BCD4D3BF534DD6EDA680D8E6FD5ECAA0665EE165BA4A1AFF039C49430F371E29  src/rollo/tools.py
+30A2AD65EEEE14553C86E14813AB8760985FDC50666BE9325B19A1B141C1FDC4  src/rollo/tui_adapter.py
+17EBFF2079BC15B81A952A8A864600E70BC9AD1B54054849C85185F5F6BFA7F7  src/rollo/ui.py
 5AF20B72517167E6084E9846EB51FF839629B67887119B01B5DD7FB4ABAAEF79  src/pyproject.toml
 ```
 
@@ -98,16 +98,16 @@ GapClosure 补测（2026-09-11）：新增 public `Agent.chat()` 端口失败与
 
 ## 2. 输出端口（I04）
 
-- [x] 2.1 新增 `src/mini_claude/runtime_ports.py`：定义 `OutputEvent`（携带 `session_id`/`run_id`/可选 `attempt_id`/`tool_call_id`/`stream`）、`OutputPort` 协议、`NullOutputPort`（不写业务输出）、`RecordingOutputPort`（语义序列记录）与 `emit_safely`（端口失败隔离 + 有界诊断环）。**终端实现不在此文件**：Rich 渲染由 I09A 的 `tui_adapter.py` 承载（见 §4.1）。
+- [x] 2.1 新增 `src/rollo/runtime_ports.py`：定义 `OutputEvent`（携带 `session_id`/`run_id`/可选 `attempt_id`/`tool_call_id`/`stream`）、`OutputPort` 协议、`NullOutputPort`（不写业务输出）、`RecordingOutputPort`（语义序列记录）与 `emit_safely`（端口失败隔离 + 有界诊断环）。**终端实现不在此文件**：Rich 渲染由 I09A 的 `tui_adapter.py` 承载（见 §4.1）。
 - [x] 2.2 迁移**全部**输出调用点（范围已按评审 GAP-C02-01/02 扩展）：`agent.py` 的 12 个 `ui.print_*` 家族（43 处）→ `self._out_*`；4 处绕过 `ui.py` 的裸 `print`（`[mcp] Init failed`、`[runtime] … failed`）→ `self._out_raw`；`memory.py`/`mcp_client.py` 的 3 处后台诊断 → `emit_diagnostic`。**runtime 模块（agent/interactions/runtime_ports/tools/memory/mcp_client）已无裸 `print(`**；入口与适配器层（`__main__.py` 的 REPL 提示与 plan 审批选项、`ui.py`）仍保留终端 `print`，属终端层职责；`_emit_text` 的 `_output_buffer` 语义保留（CLI 消费者用例通过）。
 - [x] 2.3 端口只作为观察接口：canonical 持久化仍走既有 emitter/store；端口抛错由 `emit_safely` 捕获并降级为有界诊断环（`port_diagnostics()`），不改写终态与 provider 消息。
-- [x] 2.4 新增 `src/mini_claude/tests/tool_fixtures.py`（承接 GAP-I02-06）：四种夹具均具**真实语义**——`PausableTool` 真正挂起（线程事件 + `wait_started`）、`CancellableShellTool` 持有真实子进程句柄并可真正终止、`LateResultTool` 在后台线程返回不阻塞事件循环、`LongOutputTool` 确定性长输出。用例：`test_pausable_fixture_really_blocks_until_released`、`test_cancellable_shell_fixture_really_terminates_process`、`test_late_result_fixture_does_not_block_caller`。
-- [x] 2.5 新增 `src/mini_claude/tests/test_runtime_ports.py`：已由真实 public `Agent.chat()` 驱动 headless/Provider error/default-port/canonical 等价/子 Agent 归属断言；端口失败不会改变 canonical 业务形状或 Provider 请求，夹具语义与敏感标记均有回归。证据：`test_runtime_ports.py`、`test_local_consumers.py`，C02 focused 65 passed。
+- [x] 2.4 新增 `src/rollo/tests/tool_fixtures.py`（承接 GAP-I02-06）：四种夹具均具**真实语义**——`PausableTool` 真正挂起（线程事件 + `wait_started`）、`CancellableShellTool` 持有真实子进程句柄并可真正终止、`LateResultTool` 在后台线程返回不阻塞事件循环、`LongOutputTool` 确定性长输出。用例：`test_pausable_fixture_really_blocks_until_released`、`test_cancellable_shell_fixture_really_terminates_process`、`test_late_result_fixture_does_not_block_caller`。
+- [x] 2.5 新增 `src/rollo/tests/test_runtime_ports.py`：已由真实 public `Agent.chat()` 驱动 headless/Provider error/default-port/canonical 等价/子 Agent 归属断言；端口失败不会改变 canonical 业务形状或 Provider 请求，夹具语义与敏感标记均有回归。证据：`test_runtime_ports.py`、`test_local_consumers.py`，C02 focused 65 passed。
 - [x] 2.6 新增可控 **Provider** 注入点（承接 items/02 的 C02 义务，GAP-C02-10）：`Agent(provider_client=...)` 保持 SDK-compatible 构造点，`tests/provider_fixtures.py` 提供可暂停/抛错/长输出/晚到结果四形态；public 双 Provider 路径通过本地 MockTransport，OpenAI 顺序工具 ID 另有 mutation-killer 断言。证据：`test_runtime_ports.py`、`test_local_consumers.py`，不调用真实远端 Provider。
 
 ## 3. 交互端口（I05）
 
-- [x] 3.1 新增 `src/mini_claude/interactions.py`：`InteractionRequest`（不可变身份）、`InteractionReply`、`InteractionRegistry`（**同步**状态转移 → 单一控制序列化边界）。
+- [x] 3.1 新增 `src/rollo/interactions.py`：`InteractionRequest`（不可变身份）、`InteractionReply`、`InteractionRegistry`（**同步**状态转移 → 单一控制序列化边界）。
 - [x] 3.2 异步等待：`InteractionPort.request` 为 awaitable（`RecordingInteractionPort(hold=True)` 模拟挂起）；取消由 `Agent.cancel_pending_interactions()` 提供，等待期间取消会把请求转 `cancelled` 并重新抛出 `CancelledError`；用例 `test_hold_port_wait_is_cancellable_without_blocking_control_plane`、`test_cancel_pending_interactions_is_the_control_plane_entry`。
 - [x] 3.3 移除 runtime 内终端 `input` fallback：`_confirm_dangerous` 改为「显式 `confirm_fn` → 交互端口（默认 `DenyingInteractionPort`）」；全仓库 runtime 模块已无 `input(`（实测扫描为空）；用例 `test_agent_confirm_does_not_fall_back_to_terminal`（monkeypatch `builtins.input` 为断言失败）。
 - [x] 3.4 幂等与冲突：相同回复返回原对象（幂等）、冲突回复 `ReplyConflictError`、参数摘要不匹配拒绝且状态不变；`cancel_all` 只影响 pending，不改写已 resolved。
@@ -117,17 +117,17 @@ GapClosure 补测（2026-09-11）：新增 public `Agent.chat()` 端口失败与
 
 ## 4. TUI 适配（I09A）
 
-- [x] 4.1 新增 `src/mini_claude/tui_adapter.py`：`TerminalOutputPort`（13 类事件 → 既有 `ui.*` 渲染；诊断走 stderr）与 `TerminalInteractionPort`（终端提示 + **可取消的等待**：阻塞读取经 executor，事件循环侧轮询 `cancel_event`，取消可在有限时间内解除等待且不阻塞事件循环；`input_fn` 可注入）。
+- [x] 4.1 新增 `src/rollo/tui_adapter.py`：`TerminalOutputPort`（13 类事件 → 既有 `ui.*` 渲染；诊断走 stderr）与 `TerminalInteractionPort`（终端提示 + **可取消的等待**：阻塞读取经 executor，事件循环侧轮询 `cancel_event`，取消可在有限时间内解除等待且不阻塞事件循环；`input_fn` 可注入）。
 - [x] 4.2 `__main__.py` 在 REPL 与 one-shot 两种模式都注入输出/交互端口；CLI flags、one-shot/REPL/resume 与既有权限模式保持不变（CLI `--help`/`--list` exit 0，CLI smoke 与本地消费者用例全绿）。
-- [x] 4.3 新增 `src/mini_claude/tests/test_tui_adapter.py`（12 项）：逐类事件路由的语义断言（非 ANSI 快照）、诊断走 stderr、Agent 缺省端口静默、注入端口后事件可观察、裸诊断不经 stdout、工具事件带 `tool_call_id`、预算超限发 `error`、思考/生命周期事件辅助、终端交互不阻塞事件循环、非 y 拒绝、EOF 安全拒绝、**取消解除等待**。
+- [x] 4.3 新增 `src/rollo/tests/test_tui_adapter.py`（12 项）：逐类事件路由的语义断言（非 ANSI 快照）、诊断走 stderr、Agent 缺省端口静默、注入端口后事件可观察、裸诊断不经 stdout、工具事件带 `tool_call_id`、预算超限发 `error`、思考/生命周期事件辅助、终端交互不阻塞事件循环、非 y 拒绝、EOF 安全拒绝、**取消解除等待**。
 - [x] 4.4 补书面手工 TUI 验证脚本与预期观察清单（承接 GAP-I02-09）：见 items/09 的「手工 TUI 验证脚本」小节（T1—T10 与 A1—A4，含启动命令、输入、预期观察与失败判定）。
 
 ## 5. 验证与局部验收
 
-- [x] 5.1 `& $runtimePython -m pytest -q src/mini_claude/tests/test_runtime_ports.py src/mini_claude/tests/test_local_consumers.py src/mini_claude/tests/test_provider_content.py`：退出码 0，65 passed，23.15s。
-- [x] 5.2 `& $runtimePython -m pytest -q src/mini_claude/tests/test_interactions.py src/mini_claude/tests/test_tool_result_boundary.py`：退出码 0，40 passed，4.02s。
-- [x] 5.3 `& $runtimePython -m pytest -q src/mini_claude/tests/test_cli_smoke.py src/mini_claude/tests/test_tui_adapter.py src/mini_claude/tests/test_local_consumers.py`：退出码 0，56 passed，2 warnings，25.03s；告警为 Windows Proactor 管道析构，未出现 failed/error。
-- [x] 5.4 全量回归 `& $runtimePython -m pytest -q src/mini_claude/tests`：连续两次均退出码 0，`476 passed / 2 warnings`（48.69s、48.84s），passed 高于 §1.3 的 449；告警均为同一 `test_compaction_artifacts.py::test_artifact_archive_is_redacted_atomic_content_addressed_and_bounded` 的 `PytestUnraisableExceptionWarning` 家族，无 failed/error。
+- [x] 5.1 `& $runtimePython -m pytest -q src/rollo/tests/test_runtime_ports.py src/rollo/tests/test_local_consumers.py src/rollo/tests/test_provider_content.py`：退出码 0，65 passed，23.15s。
+- [x] 5.2 `& $runtimePython -m pytest -q src/rollo/tests/test_interactions.py src/rollo/tests/test_tool_result_boundary.py`：退出码 0，40 passed，4.02s。
+- [x] 5.3 `& $runtimePython -m pytest -q src/rollo/tests/test_cli_smoke.py src/rollo/tests/test_tui_adapter.py src/rollo/tests/test_local_consumers.py`：退出码 0，56 passed，2 warnings，25.03s；告警为 Windows Proactor 管道析构，未出现 failed/error。
+- [x] 5.4 全量回归 `& $runtimePython -m pytest -q src/rollo/tests`：连续两次均退出码 0，`476 passed / 2 warnings`（48.69s、48.84s），passed 高于 §1.3 的 449；告警均为同一 `test_compaction_artifacts.py::test_artifact_archive_is_redacted_atomic_content_addressed_and_bounded` 的 `PytestUnraisableExceptionWarning` 家族，无 failed/error。
 - [x] 5.5 `git diff --check` 与两个 OpenSpec change 的 `--type change --strict` 均通过；另对 37 个当前 tracked/untracked 文件完成 SHA256 清单与未跟踪文件边界核验。`git diff --check` 仅报告 Git 的 LF→CRLF 提示，不是 whitespace error。
 - [x] 5.6 完成 V(C02)：独立冻结差异审查、风险对应 GapClosure、`contract_handoff` 与唯一台账回写均已完成；Hooke 的独立 delta Gate 返回 `sufficient`，test_gap_closure_result=`closed`。result_identity、product diff provenance、changed-item mapping、retained Gap inventory 见 §7，交付动作保持 none。
 
@@ -154,28 +154,28 @@ GapClosure 补测（2026-09-11）：新增 public `Agent.chat()` 端口失败与
 - **manifest serialization**：按 `git status --porcelain=v1 -z` 解析路径；仅保留 `src/` 路径；若记录是未跟踪目录则递归展开其中的文件；按仓库相对路径（统一 `/`）去重并按字典序排序；每条记录为 `relative/path|UPPERCASE_SHA256`；以单个 LF 连接且末尾无 LF；对该 UTF-8 字节串计算 SHA256。下面是本次 `files=23` 的完整明细，可独立复算上面的 digest：
 
 ```text
-src/mini_claude/__main__.py|BDD718E7BC9CA109E12AE0B776DF9A457DA570E62FABAF0E7465F69D11A8CB58
-src/mini_claude/agent.py|CF81B07CF58D6E1B9B602A21317A140C1216C7212720C45C0CF44A4D573A3B5C
-src/mini_claude/interactions.py|9C16972E1FAF208BDC9E805BE6ACAEC4F08949616D626EE478FF0B78057F14E0
-src/mini_claude/mcp_client.py|687F51DD7C6128B44E3AAECB2C323B39FCA6FE9531AECF0F21F375E739DC5D6E
-src/mini_claude/memory.py|1D0B01F40A9C2A4ADCC5D27CEA1A6F8B72584E76C628498D21D9A155924EAEDF
-src/mini_claude/project_context.py|7D2C5AC18B907295D12BB5D0B31B8BF03D0B469C69E8CBCF4BC5F4CE9A95ED66
-src/mini_claude/prompt.py|548066DDFDCC5BBB2E78436609B44A06D99DF8B2FAE995B6A71931EBD54CBED6
-src/mini_claude/runtime_ports.py|5E816492DCB716996ECA7FD5436696ACB36C035C0800A5B8C6F0CAC5ACB22266
-src/mini_claude/skills.py|32D35AF887EAB0108A099B2486B193EA3C0A918EFC4A3D925FB187BED1852CAC
-src/mini_claude/subagent.py|E58682197621D9093BE3DF3EB9839CEFE1D379EA8A51B06D2CEDCAA05A860C50
-src/mini_claude/tests/conftest.py|391F88EECEA419F14A2D539908EEAED5499D67A2DCE143A0C2DC620E74458BEB
-src/mini_claude/tests/provider_fixtures.py|118827657BCB8E0121A68A6EB12099176DD482DE7D25E6A5A23CF12912C6FA64
-src/mini_claude/tests/test_interaction_safety.py|C0377790C0C0DF38DD4185797F96267014ABD838DE343EC1D6DCE6A79653FE7B
-src/mini_claude/tests/test_interactions.py|0FBED25528DA0A752AAA6D20C75825E54050971627B732B235B792E72E8D3087
-src/mini_claude/tests/test_local_consumers.py|C91794250DF306778B633AA7C90F4CC134CD07533131A3AAB41588BB0E6055B7
-src/mini_claude/tests/test_project_context.py|6B811779ED89A4D4F094DCF1F2C0765D91B065F6C405D59CCF3FD0BB490CFF20
-src/mini_claude/tests/test_runtime_ports.py|9933F5993F950F6CBF068609867BDBB91C146801D6253B8A322C6A35F9975F34
-src/mini_claude/tests/test_tui_adapter.py|D4FE5D9EDE8F1AFFD1E02CF4D2170A29AA14E735D8F4C3078ACE59E5E9193B65
-src/mini_claude/tests/tool_fixtures.py|DFFE1D8B06CB78F708546161C991C3B69DA19B2F25FFFA3D6A693C8140E8E189
-src/mini_claude/tools.py|BCD4D3BF534DD6EDA680D8E6FD5ECAA0665EE165BA4A1AFF039C49430F371E29
-src/mini_claude/tui_adapter.py|30A2AD65EEEE14553C86E14813AB8760985FDC50666BE9325B19A1B141C1FDC4
-src/mini_claude/ui.py|17EBFF2079BC15B81A952A8A864600E70BC9AD1B54054849C85185F5F6BFA7F7
+src/rollo/__main__.py|BDD718E7BC9CA109E12AE0B776DF9A457DA570E62FABAF0E7465F69D11A8CB58
+src/rollo/agent.py|CF81B07CF58D6E1B9B602A21317A140C1216C7212720C45C0CF44A4D573A3B5C
+src/rollo/interactions.py|9C16972E1FAF208BDC9E805BE6ACAEC4F08949616D626EE478FF0B78057F14E0
+src/rollo/mcp_client.py|687F51DD7C6128B44E3AAECB2C323B39FCA6FE9531AECF0F21F375E739DC5D6E
+src/rollo/memory.py|1D0B01F40A9C2A4ADCC5D27CEA1A6F8B72584E76C628498D21D9A155924EAEDF
+src/rollo/project_context.py|7D2C5AC18B907295D12BB5D0B31B8BF03D0B469C69E8CBCF4BC5F4CE9A95ED66
+src/rollo/prompt.py|548066DDFDCC5BBB2E78436609B44A06D99DF8B2FAE995B6A71931EBD54CBED6
+src/rollo/runtime_ports.py|5E816492DCB716996ECA7FD5436696ACB36C035C0800A5B8C6F0CAC5ACB22266
+src/rollo/skills.py|32D35AF887EAB0108A099B2486B193EA3C0A918EFC4A3D925FB187BED1852CAC
+src/rollo/subagent.py|E58682197621D9093BE3DF3EB9839CEFE1D379EA8A51B06D2CEDCAA05A860C50
+src/rollo/tests/conftest.py|391F88EECEA419F14A2D539908EEAED5499D67A2DCE143A0C2DC620E74458BEB
+src/rollo/tests/provider_fixtures.py|118827657BCB8E0121A68A6EB12099176DD482DE7D25E6A5A23CF12912C6FA64
+src/rollo/tests/test_interaction_safety.py|C0377790C0C0DF38DD4185797F96267014ABD838DE343EC1D6DCE6A79653FE7B
+src/rollo/tests/test_interactions.py|0FBED25528DA0A752AAA6D20C75825E54050971627B732B235B792E72E8D3087
+src/rollo/tests/test_local_consumers.py|C91794250DF306778B633AA7C90F4CC134CD07533131A3AAB41588BB0E6055B7
+src/rollo/tests/test_project_context.py|6B811779ED89A4D4F094DCF1F2C0765D91B065F6C405D59CCF3FD0BB490CFF20
+src/rollo/tests/test_runtime_ports.py|9933F5993F950F6CBF068609867BDBB91C146801D6253B8A322C6A35F9975F34
+src/rollo/tests/test_tui_adapter.py|D4FE5D9EDE8F1AFFD1E02CF4D2170A29AA14E735D8F4C3078ACE59E5E9193B65
+src/rollo/tests/tool_fixtures.py|DFFE1D8B06CB78F708546161C991C3B69DA19B2F25FFFA3D6A693C8140E8E189
+src/rollo/tools.py|BCD4D3BF534DD6EDA680D8E6FD5ECAA0665EE165BA4A1AFF039C49430F371E29
+src/rollo/tui_adapter.py|30A2AD65EEEE14553C86E14813AB8760985FDC50666BE9325B19A1B141C1FDC4
+src/rollo/ui.py|17EBFF2079BC15B81A952A8A864600E70BC9AD1B54054849C85185F5F6BFA7F7
 src/pyproject.toml|5AF20B72517167E6084E9846EB51FF839629B67887119B01B5DD7FB4ABAAEF79
 ```
 

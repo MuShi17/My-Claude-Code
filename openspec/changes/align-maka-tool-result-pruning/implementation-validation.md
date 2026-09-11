@@ -21,23 +21,23 @@
 
 ## 修改文件
 
-- `src/mini_claude/tool_result.py`
-- `src/mini_claude/projections/replay_metadata.py`
-- `src/mini_claude/projections/model_replay_projection.py`
-- `src/mini_claude/projections/incremental_replay.py`
-- `src/mini_claude/projections/provider_context.py`
-- `src/mini_claude/projections/__init__.py`
-- `src/mini_claude/archive_projection.py`
-- `src/mini_claude/provider_capacity.py`
-- `src/mini_claude/agent.py`
-- `src/mini_claude/runtime_lifecycle.py`
-- `src/mini_claude/tests/test_maka_pruning_contract.py`
-- `src/mini_claude/tests/test_archive_projection.py`
-- `src/mini_claude/tests/test_projections.py`
-- `src/mini_claude/tests/test_provider_content.py`
-- `src/mini_claude/tests/test_incremental_replay.py`
-- `src/mini_claude/tests/test_local_consumers.py`
-- `src/mini_claude/tests/test_runtime_lifecycle.py`
+- `src/rollo/tool_result.py`
+- `src/rollo/projections/replay_metadata.py`
+- `src/rollo/projections/model_replay_projection.py`
+- `src/rollo/projections/incremental_replay.py`
+- `src/rollo/projections/provider_context.py`
+- `src/rollo/projections/__init__.py`
+- `src/rollo/archive_projection.py`
+- `src/rollo/provider_capacity.py`
+- `src/rollo/agent.py`
+- `src/rollo/runtime_lifecycle.py`
+- `src/rollo/tests/test_maka_pruning_contract.py`
+- `src/rollo/tests/test_archive_projection.py`
+- `src/rollo/tests/test_projections.py`
+- `src/rollo/tests/test_provider_content.py`
+- `src/rollo/tests/test_incremental_replay.py`
+- `src/rollo/tests/test_local_consumers.py`
+- `src/rollo/tests/test_runtime_lifecycle.py`
 - `openspec/changes/align-maka-tool-result-pruning/tasks.md`
 - `openspec/changes/align-maka-tool-result-pruning/implementation-validation.md`
 
@@ -65,9 +65,9 @@
 
 | 命令 | 结果 | 证明范围 |
 | --- | --- | --- |
-| `python -m pytest -q src/mini_claude/tests/test_archive_projection.py src/mini_claude/tests/test_local_consumers.py src/mini_claude/tests/test_maka_pruning_contract.py --tb=short` | 82 passed | ArchiveRead 非递归、placeholder 单调性、Maka stale/active/semantic、双 Provider 本地 consumer、capacity gate、OpenAI JSON-string 真实 loopback consumer，以及本轮 invalid bounded_ref/page provenance 回归 |
-| `python -m pytest -q src/mini_claude/tests --tb=short` | 358 passed，1 warning | `src/mini_claude/tests` Python 包全量回归；1 个 Windows Proactor unraisable transport warning，未形成测试失败 |
-| `python -m compileall -q src/mini_claude` | passed | Python 编译检查 |
+| `python -m pytest -q src/rollo/tests/test_archive_projection.py src/rollo/tests/test_local_consumers.py src/rollo/tests/test_maka_pruning_contract.py --tb=short` | 82 passed | ArchiveRead 非递归、placeholder 单调性、Maka stale/active/semantic、双 Provider 本地 consumer、capacity gate、OpenAI JSON-string 真实 loopback consumer，以及本轮 invalid bounded_ref/page provenance 回归 |
+| `python -m pytest -q src/rollo/tests --tb=short` | 358 passed，1 warning | `src/rollo/tests` Python 包全量回归；1 个 Windows Proactor unraisable transport warning，未形成测试失败 |
+| `python -m compileall -q src/rollo` | passed | Python 编译检查 |
 | `openspec validate align-maka-tool-result-pruning --strict` | passed | OpenSpec change 工件严格校验 |
 | `git diff --check` | passed | 差异空白检查；Git 仅提示部分工作树文件的 LF/CRLF 转换 |
 
@@ -99,6 +99,6 @@
 
 - `/3` 只是裁剪启发式，不等同于 Provider tokenizer；Provider capacity 仍使用完整 context-bearing envelope 的 canonical UTF-8 bytes 和既有 output reserve policy。
 - 本轮未执行真实外部 Anthropic/OpenAI 请求、部署、生产网关或跨进程多 writer 验证；fake SDK 只证明本地 Agent 到请求构造/dispatch gate 的链路。
-- 根目录全仓库 pytest 未作为通过依据；本轮验收范围是 `src/mini_claude/tests`，benchmark/Harbor 等可选外部依赖未纳入。
+- 根目录全仓库 pytest 未作为通过依据；本轮验收范围是 `src/rollo/tests`，benchmark/Harbor 等可选外部依赖未纳入。
 - `run_shell` snapshot 仍只接受无 shell 元字符的前台只读 git 查询；任意副作用 shell 不做 snapshot supersession，`failure_resolved` 语义另行处理。
 - ArchiveRead 最终 JSON envelope 的动态 page 缩短和真正文件 range streaming 不在本 change 内；本轮只确保现有 page/continuation 在 projection 中不递归、不变形。

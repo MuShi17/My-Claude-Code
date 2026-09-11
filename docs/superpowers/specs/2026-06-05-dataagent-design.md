@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Build a local DataAgent on top of the existing Mini Claude Code architecture. The first version connects to a local PostgreSQL database, exposes a controlled data catalog to the main agent, lets the model write SQL for analyst questions, executes SQL through a safe backend path, and optionally delegates visualization to a plot sub-agent.
+Build a local DataAgent on top of the existing Rollo Code architecture. The first version connects to a local PostgreSQL database, exposes a controlled data catalog to the main agent, lets the model write SQL for analyst questions, executes SQL through a safe backend path, and optionally delegates visualization to a plot sub-agent.
 
 The system is for fast analyst-style querying and lightweight analysis. It is not a data ingestion platform, migration tool, BI semantic layer replacement, or general database admin agent.
 
@@ -16,7 +16,7 @@ In scope:
 - Expose `get_data_catalog` and `execute_sql` as DataAgent tools.
 - Let the model generate SQL itself after reading catalog context.
 - Enforce SQL validation, read-only execution, timeout, row cap, and table allowlist inside the `execute_sql` backend.
-- Add a project custom sub-agent type named `plot` via `.claude/agents/plot.md`.
+- Add a project custom sub-agent type named `plot` via `.rollo/agents/plot.md`.
 - Let the plot sub-agent create charts from already returned query results or result artifacts.
 
 Out of scope for the first version:
@@ -37,7 +37,7 @@ The current codebase already has:
 
 - A main agent loop with tool calling.
 - A tool registry in `tools.py`.
-- Custom sub-agent discovery through `.claude/agents/*.md`.
+- Custom sub-agent discovery through `.rollo/agents/*.md`.
 - Web and CLI entry points.
 - Session, logging, and tracing infrastructure.
 
@@ -135,7 +135,7 @@ joins:
 Catalog files should live in a project-controlled directory such as:
 
 ```text
-.claude/data_catalog/*.yaml
+.rollo/data_catalog/*.yaml
 ```
 
 The registry is the authority for both model context and SQL allowlist checks. The model should not see tables that the backend would reject.
@@ -223,7 +223,7 @@ The database role is a second security boundary. The application validator is th
 Use the existing custom sub-agent mechanism. Add:
 
 ```text
-.claude/agents/plot.md
+.rollo/agents/plot.md
 ```
 
 The plot agent system prompt should say:
@@ -262,7 +262,7 @@ The prompt should not include full table definitions once the catalog registry e
 ## Suggested Module Layout
 
 ```text
-src/mini_claude/dataagent/
+src/rollo/dataagent/
   __init__.py
   catalog.py          # load and validate catalog YAML files
   config.py           # database and safety settings
@@ -271,10 +271,10 @@ src/mini_claude/dataagent/
   artifacts.py        # save query results and chart outputs
   tools.py            # get_data_catalog and execute_sql tool definitions/handlers
 
-.claude/data_catalog/
+.rollo/data_catalog/
   sales.yaml          # example domain catalog
 
-.claude/agents/
+.rollo/agents/
   plot.md             # plotting sub-agent system prompt
 ```
 
@@ -291,12 +291,12 @@ DATAAGENT_PG_DSN=postgresql://readonly_user:password@localhost:5432/dbname
 Use non-secret project config for behavior:
 
 ```yaml
-catalog_dir: .claude/data_catalog
+catalog_dir: .rollo/data_catalog
 default_row_limit: 200
 max_row_limit: 1000
 statement_timeout_ms: 10000
 lock_timeout_ms: 1000
-artifact_dir: .mini-claude/dataagent/artifacts
+artifact_dir: .rollo/dataagent/artifacts
 ```
 
 If a DSN includes credentials, it must not be committed.
@@ -353,6 +353,6 @@ Agent behavior tests:
 ## Open Decisions
 
 - Which SQL parser library to use for PostgreSQL-aware parsing.
-- Exact catalog config path if `.claude/data_catalog` should not be used.
+- Exact catalog config path if `.rollo/data_catalog` should not be used.
 - Whether first plotting version uses a generic `run_shell` Python script or a dedicated plotting tool.
 - Whether result artifacts are JSON, CSV, or both.

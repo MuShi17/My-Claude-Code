@@ -45,7 +45,7 @@ TUI 适配器测试断言**语义事件序列**（哪些事件、带什么身份
 
 ### D7 GAP-I02-06 夹具归属
 
-可控工具夹具落在 `src/mini_claude/tests/tool_fixtures.py`，由 I04 建立并供 C02 的 I05/I09A 与后续 Change（C03 的取消、C05 的慢消费者）复用；夹具包含可暂停、长输出、可取消 shell、晚到结果四种形态。
+可控工具夹具落在 `src/rollo/tests/tool_fixtures.py`，由 I04 建立并供 C02 的 I05/I09A 与后续 Change（C03 的取消、C05 的慢消费者）复用；夹具包含可暂停、长输出、可取消 shell、晚到结果四种形态。
 
 ### D8 Provider 边界注入
 

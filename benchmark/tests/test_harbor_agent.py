@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 from harbor.models.agent.context import AgentContext
 
-from benchmark.harbor_agent import MiniClaudeHarborAgent
+from benchmark.harbor_agent import RolloHarborAgent
 
 
 class _Result:
@@ -60,8 +60,8 @@ class _SetupEnvironment:
         return _Result(1 if len(self.calls) == 1 else 0)
 
 
-def _agent() -> MiniClaudeHarborAgent:
-    agent = object.__new__(MiniClaudeHarborAgent)
+def _agent() -> RolloHarborAgent:
+    agent = object.__new__(RolloHarborAgent)
     agent.model_name = "deepseek-v4-flash"
     agent._get_cli_model = lambda: "deepseek-v4-flash"
     agent._runtime_env = lambda: {}
@@ -112,7 +112,7 @@ def test_usage_is_recorded_before_a_nonzero_agent_exit_is_raised():
     original_exec = environment.exec
 
     async def failed_agent_exec(command: str, **kwargs) -> _Result:
-        if " -u -m mini_claude " in command:
+        if " -u -m rollo " in command:
             await original_exec(command, **kwargs)
             return _Result(1, stderr="agent failed")
         return await original_exec(command, **kwargs)
@@ -120,7 +120,7 @@ def test_usage_is_recorded_before_a_nonzero_agent_exit_is_raised():
     environment.exec = failed_agent_exec
 
     async def exercise() -> None:
-        with pytest.raises(RuntimeError, match="Mini Claude exited with code 1"):
+        with pytest.raises(RuntimeError, match="Rollo Code exited with code 1"):
             await agent.run("test", environment, context)
 
     asyncio.run(exercise())
@@ -133,8 +133,8 @@ def test_usage_is_recorded_before_a_nonzero_agent_exit_is_raised():
 def test_setup_uses_configured_apt_and_pip_mirrors():
     agent = _agent()
     settings = {
-        "MINI_CLAUDE_APT_MIRROR": "https://mirrors.tuna.tsinghua.edu.cn/ubuntu/",
-        "MINI_CLAUDE_PIP_INDEX_URL": "https://pypi.tuna.tsinghua.edu.cn/simple",
+        "ROLLO_APT_MIRROR": "https://mirrors.tuna.tsinghua.edu.cn/ubuntu/",
+        "ROLLO_PIP_INDEX_URL": "https://pypi.tuna.tsinghua.edu.cn/simple",
     }
     agent._get_setting = settings.get
     environment = _SetupEnvironment()

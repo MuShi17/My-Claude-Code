@@ -1,6 +1,6 @@
 {
   "schema_version": 2,
-  "description": "Benchmark tasks for Mini Claude Code regression testing and performance tracking.",
+  "description": "Benchmark tasks for Rollo Code regression testing and performance tracking.",
   "tasks": [
     {
       "id": "readme_intro_locked",

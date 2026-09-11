@@ -22,6 +22,6 @@
 
 ## Impact
 
-- 主要影响 `src/mini_claude/agent.py`、provider streaming helpers、tools/permissions、logger facade 和 C02 fixtures。
+- 主要影响 `src/rollo/agent.py`、provider streaming helpers、tools/permissions、logger facade 和 C02 fixtures。
 - 要求 C04 domain sink 与 C05 SQLite store 已通过其不变量测试。
 - 公开工具权限语义保持兼容；Canonical event 成为事实输出，legacy 继续 shadow。

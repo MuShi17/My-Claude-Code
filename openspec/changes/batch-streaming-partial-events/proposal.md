@@ -27,7 +27,7 @@
 
 ## Impact
 
-- 主要影响 `src/mini_claude/runtime_lifecycle.py`、`event_sink.py`、`runtime_store.py`、`agent.py` 和对应 Python 测试。
+- 主要影响 `src/rollo/runtime_lifecycle.py`、`event_sink.py`、`runtime_store.py`、`agent.py` 和对应 Python 测试。
 - SQLite schema 版本增加一个向后兼容的表迁移；既有 immutable event、tool operation、上下文快照和归档数据不迁移、不重写。
 - 运行时仍使用单个 Agent/SQLite 连接，不引入线程写入或外部依赖；partial timer 绑定当前 asyncio event loop，无法获得 event loop 时通过显式 flush/最终边界完成持久化。
 - 不修改 `D:/workspace/maka`，不改变 Provider wire message、工具权限、ArchiveRead、归档内容上限或 Git 交付状态。

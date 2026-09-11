@@ -1,10 +1,10 @@
 ## Context
 
-ISS002 要求修正当前“工具执行结果 → durable boundary → Canonical Runtime Event → Provider/终端投影”的边界。目标仓库当前工作树已有 `src/mini_claude/agent.py` 未提交修改，本 change 不覆盖或重置该差异，也不修改 `D:/workspace/maka`。
+ISS002 要求修正当前“工具执行结果 → durable boundary → Canonical Runtime Event → Provider/终端投影”的边界。目标仓库当前工作树已有 `src/rollo/agent.py` 未提交修改，本 change 不覆盖或重置该差异，也不修改 `D:/workspace/maka`。
 
 已核对的实现事实如下：
 
-- `src/mini_claude/tools.py` 的 `MAX_RESULT_CHARS = 50000` 同时影响 `read_file` 和通用 handler 路径，因此不是 read_file 单点限制。
+- `src/rollo/tools.py` 的 `MAX_RESULT_CHARS = 50000` 同时影响 `read_file` 和通用 handler 路径，因此不是 read_file 单点限制。
 - `DurableToolBoundary._bound_result()` 以默认 16 KiB 为界立即写入 `ArtifactArchive` 并把 placeholder 写入 outcome；`_outcome()` 和 `CanonicalSink` 还会执行 redaction。
 - `redact_payload()` 对普通递归字符串的 `max_string_chars=8192` 会生成 `ref=inline:*` 的 `bounded_ref`；该 ref 不保证对应真实 ArtifactArchive 内容。
 - `archive_capability.py`、`archive_projection.py` 和 Provider context adapter 已存在，能够消费已有 artifact ref，但当前 projection 主要从已有 `bounded_ref` 开始，不能从完整 canonical tool result 按需建立归档。

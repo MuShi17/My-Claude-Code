@@ -35,7 +35,7 @@
 - [x] 5.1 在 `archive_projection.py`/`ui.py` 对 `bounded_ref`、`archive_page`、`archive_read_error` 增加 typed、正文优先、有界格式化；未知结果保持通用 fallback
 - [x] 5.2 保持 terminal 总预算 500 字符，测试长 preview/page 仍有界且尽可能保留正文/错误和 continuation/status，不做全文 hydration
 - [x] 5.3 增加 terminal unit/CLI assertions：`read_file` preview、ArchiveRead 成功 page、越界/closed-store error、转义 JSON，以及 path/traceback 不泄漏
-- [x] 5.4 启动真实 `mini-claude-py`/`python -m mini_claude` 新进程连接 loopback protocol stub，断言 stdout、session.v2、ArchiveRead continuation 和一次 resume 行为
+- [x] 5.4 启动真实 `rollo`/`python -m rollo` 新进程连接 loopback protocol stub，断言 stdout、session.v2、ArchiveRead continuation 和一次 resume 行为
 
 ## 6. P0 Metrics Chronology
 
@@ -47,7 +47,7 @@
 
 - [x] 7.1 运行 focused archive/projection/runtime/session-replay/provider/terminal/metrics 测试并记录每个 P0 scenario 的结果
 - [x] 7.2 运行 final local SDK consumers、CLI subprocess 和真正 fresh-process resume；保存仅含必要字段/hash/长度的 in-memory redacted evidence，明确不包含外部 Provider/deployment 证据
-- [x] 7.3 运行全量 `python -m pytest -q`、`python -m compileall -q src/mini_claude`、`openspec validate repair-runtime-projection-defects --type change --strict --no-interactive` 和 `git diff --check`；根目录测试的 Harbor 收集阻断须诚实记录
+- [x] 7.3 运行全量 `python -m pytest -q`、`python -m compileall -q src/rollo`、`openspec validate repair-runtime-projection-defects --type change --strict --no-interactive` 和 `git diff --check`；根目录测试的 Harbor 收集阻断须诚实记录
 - [x] 7.4 主 Agent 对照 `runtime-projection-integrity` 的全部 P0 scenarios 检查实现/测试/证据，复核最终 diff 未修改 Maka、历史 artifact、普通 child allowlist 或无关模块
 - [x] 7.5 回写 canonical task source、任务卡和本 change 的实施验证结果；仅在全部 P0 证据闭合后标记完成，仍不授权归档/提交/推送/MR
 
@@ -55,20 +55,20 @@
 
 本 change 的 P0 实现和验证已完成；Provider projection 的 11.1–11.5 以及跨 run archive identity/continuation 的 12.1–12.5 已在本批次闭合。8.1–8.3、10.1–10.3 仍是后续 P1。主要实现落点：
 
-- `src/mini_claude/tool_call_identity.py`、`event_sink.py`、`runtime_lifecycle.py`：统一 final-call identity，按 `(run_id, call_id)` 幂等去重和跨 invocation operation 复用。
-- `src/mini_claude/artifact_archive.py`、`archive_capability.py`、`archive_projection.py`：固定 Unicode/bytes range、合法 EOF、越界错误、容量救援和 `capacity_exhausted`，并分离 Provider/terminal projection。
-- `src/mini_claude/projections/`、`agent.py`：统一历史 dedup、双 Provider budget/context（有效模型窗口为上下文窗口的 70%）、metrics chronology 和 terminal consumer。
-- `src/mini_claude/tests/test_runtime_projection_integrity.py`、`test_local_consumers.py` 及既有回归：覆盖精确 49,976 字符、Unicode/bytes、fresh-process、实际 SDK mock transport、CLI loopback/resume 和 immutability。
+- `src/rollo/tool_call_identity.py`、`event_sink.py`、`runtime_lifecycle.py`：统一 final-call identity，按 `(run_id, call_id)` 幂等去重和跨 invocation operation 复用。
+- `src/rollo/artifact_archive.py`、`archive_capability.py`、`archive_projection.py`：固定 Unicode/bytes range、合法 EOF、越界错误、容量救援和 `capacity_exhausted`，并分离 Provider/terminal projection。
+- `src/rollo/projections/`、`agent.py`：统一历史 dedup、双 Provider budget/context（有效模型窗口为上下文窗口的 70%）、metrics chronology 和 terminal consumer。
+- `src/rollo/tests/test_runtime_projection_integrity.py`、`test_local_consumers.py` 及既有回归：覆盖精确 49,976 字符、Unicode/bytes、fresh-process、实际 SDK mock transport、CLI loopback/resume 和 immutability。
 
 验证记录（2026-09-07，当前工作树）：
 
 | 命令 | 结果 | 证据层级 |
 | --- | --- | --- |
-| `python -m pytest -q src/mini_claude/tests/test_local_consumers.py` | 17 passed | 实际 Agent -> 本地 Anthropic/OpenAI SDK；CLI loopback 新进程 page/error/resume |
-| `python -m pytest -q src/mini_claude/tests/test_runtime_projection_integrity.py src/mini_claude/tests/test_archive_projection.py` | 21 passed | P0 focused / fresh-process / projection |
-| `python -m pytest -q src/mini_claude/tests` | 249 passed，1 个既有 Windows asyncio proactor transport warning | 本地完整 Python 回归 |
+| `python -m pytest -q src/rollo/tests/test_local_consumers.py` | 17 passed | 实际 Agent -> 本地 Anthropic/OpenAI SDK；CLI loopback 新进程 page/error/resume |
+| `python -m pytest -q src/rollo/tests/test_runtime_projection_integrity.py src/rollo/tests/test_archive_projection.py` | 21 passed | P0 focused / fresh-process / projection |
+| `python -m pytest -q src/rollo/tests` | 249 passed，1 个既有 Windows asyncio proactor transport warning | 本地完整 Python 回归 |
 | `python -m pytest -q` | benchmark 测试收集因当前环境缺少 `harbor` 包停止 | 环境边界，不声称全仓库通过 |
-| `python -m compileall -q src/mini_claude` | passed | 本地编译检查 |
+| `python -m compileall -q src/rollo` | passed | 本地编译检查 |
 | `openspec validate repair-runtime-projection-defects --type change --strict --no-interactive` | passed | OpenSpec 严格校验 |
 | `git diff --check` | passed | 工作树差异检查 |
 
@@ -91,10 +91,10 @@
 
 验证记录（2026-09-08）：
 
-- P0 focused tests：`python -m pytest src\\mini_claude\\tests\\test_tool_result_boundary.py src\\mini_claude\\tests\\test_archive_capability.py src\\mini_claude\\tests\\test_archive_projection.py src\\mini_claude\\tests\\test_compaction_artifacts.py -q --disable-warnings --tb=short`，64 passed。
-- 本轮 Provider projection focused tests：`python -m pytest src\\mini_claude\\tests\\test_archive_projection.py src\\mini_claude\\tests\\test_provider_content.py src\\mini_claude\\tests\\test_local_consumers.py -q --disable-warnings --tb=short`，63 passed。
-- fresh-process/local consumer 回归及全量 Python tests：`python -m pytest src\\mini_claude\\tests -q --disable-warnings --tb=short`，297 passed，2 个既有 warning。
-- `python -m compileall -q src\\mini_claude` 通过；本 change 通过 `openspec validate repair-runtime-projection-defects --type change --strict --no-interactive`；`git diff --check` 通过（仅有 Git 的换行符提示）。
+- P0 focused tests：`python -m pytest src\\rollo\\tests\\test_tool_result_boundary.py src\\rollo\\tests\\test_archive_capability.py src\\rollo\\tests\\test_archive_projection.py src\\rollo\\tests\\test_compaction_artifacts.py -q --disable-warnings --tb=short`，64 passed。
+- 本轮 Provider projection focused tests：`python -m pytest src\\rollo\\tests\\test_archive_projection.py src\\rollo\\tests\\test_provider_content.py src\\rollo\\tests\\test_local_consumers.py -q --disable-warnings --tb=short`，63 passed。
+- fresh-process/local consumer 回归及全量 Python tests：`python -m pytest src\\rollo\\tests -q --disable-warnings --tb=short`，297 passed，2 个既有 warning。
+- `python -m compileall -q src\\rollo` 通过；本 change 通过 `openspec validate repair-runtime-projection-defects --type change --strict --no-interactive`；`git diff --check` 通过（仅有 Git 的换行符提示）。
 - 根目录 `python -m pytest -q` 未作为通过证据：benchmark 测试收集阶段缺少可选依赖 `harbor`（`ModuleNotFoundError`），与本次 Python 包实现无关。
 - 仍保留的 P1 边界：8.1–8.3、10.1–10.3；包括父子 Agent close barrier、更多历史版本兼容、真正的增量/range 读取和 ArchiveRead 最终 JSON envelope 的完整响应字节预算。本轮 11.x 的 Provider projection 单调性和最终容量 gate、12.x 的跨 run ref/continuation 修复均已实现，独立 Gap Closure 证据见 `implementation-validation.md`。
 
@@ -123,6 +123,6 @@
 验证记录（2026-09-09，本轮 Delta Gap Closure）：
 
 - `test_archive_capability.py` 与 `test_archive_projection.py` focused 回归：`48 passed`；覆盖跨 run 注册后真实 `read`、正确/错误 sha 与 size 校验、未注册 lineage 拒绝，以及仅 `offset`/无 offset 时的 continuation fallback。
-- Provider projection、完整 request budget 和本地消费者回归：`67 passed`；`src/mini_claude/tests` Python 测试全集：`303 passed`，存在既有 warning。
-- 根目录 `python -m pytest -q` 仍在 benchmark 收集阶段因缺少可选 `harbor` 包失败；因此 `303 passed` 仅表示 `src/mini_claude/tests` 全量通过，不表示全仓库通过。
+- Provider projection、完整 request budget 和本地消费者回归：`67 passed`；`src/rollo/tests` Python 测试全集：`303 passed`，存在既有 warning。
+- 根目录 `python -m pytest -q` 仍在 benchmark 收集阶段因缺少可选 `harbor` 包失败；因此 `303 passed` 仅表示 `src/rollo/tests` 全量通过，不表示全仓库通过。
 - 独立 `test-strategy-agent` 对 G-STR-05～G-STR-07 执行实施后 Delta Gap Closure；主 Agent 仅采纳有代码/测试证据的缺口补项，不将“缺测试”误判为产品缺陷。本轮另补 replay 形状缺失 tool name 的稳定 identity 回归，按同一工具调用映射验证。

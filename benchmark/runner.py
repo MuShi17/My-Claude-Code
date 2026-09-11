@@ -112,7 +112,7 @@ def run_task(task: dict[str, Any], workspace: Path, run_id: str) -> dict[str, An
 def _build_agent_cmd(prompt: str, step_budget: int) -> list[str]:
     """构建 agent 调用命令。"""
     return [
-        sys.executable, "-m", "mini_claude",
+        sys.executable, "-m", "rollo",
         "--yolo",
         "--max-turns", str(step_budget),
         prompt,
@@ -121,7 +121,7 @@ def _build_agent_cmd(prompt: str, step_budget: int) -> list[str]:
 
 def _find_latest_session_traces_dir() -> Path | None:
     """查找最近一次会话的 traces 目录。"""
-    sessions_dir = Path.home() / ".mini-claude" / "sessions"
+    sessions_dir = Path.home() / ".rollo" / "sessions"
     if not sessions_dir.exists():
         return None
 

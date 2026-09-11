@@ -1,6 +1,6 @@
 # Canonical Runtime Event 测试矩阵
 
-该矩阵覆盖 Canonical-only 运行时。fixture 位于 `src/mini_claude/tests/runtime_fixtures.py`，测试不依赖真实 API key、网络或用户目录。
+该矩阵覆盖 Canonical-only 运行时。fixture 位于 `src/rollo/tests/runtime_fixtures.py`，测试不依赖真实 API key、网络或用户目录。
 
 | 边界 | 主要场景 | 当前入口 |
 |---|---|---|

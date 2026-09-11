@@ -22,6 +22,6 @@
 
 ## Impact
 
-- 影响 `src/mini_claude/agent.py` 的大结果路径、C05 `llm_captures`、C08 projection/replay、session compaction 和本地 artifact 目录。
-- 可能新增 `~/.mini-claude/artifacts/` 文件；旧 tool-results 目录继续只读兼容。
+- 影响 `src/rollo/agent.py` 的大结果路径、C05 `llm_captures`、C08 projection/replay、session compaction 和本地 artifact 目录。
+- 可能新增 `~/.rollo/artifacts/` 文件；旧 tool-results 目录继续只读兼容。
 - 依赖 C01、C04、C05、C08；不增加第三方依赖，不改 canonical event history。

@@ -5,7 +5,7 @@
 
 ## 概述
 
-为 Mini Claude Code 建立可观测体系，追踪每次用户 ask 的性能指标：首 Token 速度、任务轮次、工具调用、Token 消耗、缓存命中率等。同时重构会话存储目录结构，支持每次 ask 生成独立 trace 文件。
+为 Rollo Code 建立可观测体系，追踪每次用户 ask 的性能指标：首 Token 速度、任务轮次、工具调用、Token 消耗、缓存命中率等。同时重构会话存储目录结构，支持每次 ask 生成独立 trace 文件。
 
 ## 架构
 
@@ -44,9 +44,9 @@ Agent 新增方法：`on(event, callback)`, `off(event, callback)`, `_emit(event
 ## 2. 目录结构
 
 ```
-之前:  ~/.mini-claude/sessions/{session_id}.json
+之前:  ~/.rollo/sessions/{session_id}.json
 
-之后:  ~/.mini-claude/sessions/{session_id}/
+之后:  ~/.rollo/sessions/{session_id}/
          ├── session.json          # 原会话数据（metadata + messages）
          └── traces/
               ├── 001.jsonl        # 第 1 次 ask
@@ -88,7 +88,7 @@ session.json 新增 `metadata.askCount` 用于追踪 ask 编号。
 
 ## 4. Tracer 模块
 
-`src/mini_claude/tracer.py`：
+`src/rollo/tracer.py`：
 
 - **`SessionTracer`**: 每轮 `chat()` 创建，订阅 Agent 事件
   - `on_turn_start()` — 记录本轮起始时间

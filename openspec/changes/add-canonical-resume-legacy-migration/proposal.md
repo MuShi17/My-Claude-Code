@@ -22,6 +22,6 @@
 
 ## Impact
 
-- 影响 `src/mini_claude/session.py`、`agent.py`、`__main__.py`、recovery projection 和 session 文件格式。
+- 影响 `src/rollo/session.py`、`agent.py`、`__main__.py`、recovery projection 和 session 文件格式。
 - 依赖 C05、C07、C08、C09；会读取旧 JSONL/session/traces/llm，但不把它们升级为 canonical authority。
 - 公开 `--resume`/session list 行为保持兼容，并新增明确的 open/corrupt/legacy diagnostics。

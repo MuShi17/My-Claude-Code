@@ -1,0 +1,2 @@
+[console_scripts]
+rollo = rollo.__main__:main

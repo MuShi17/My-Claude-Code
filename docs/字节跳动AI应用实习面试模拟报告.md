@@ -19,13 +19,13 @@
 | 维度 | 匹配度 | 分析 |
 |------|--------|------|
 | Python 编程 | **强匹配** | 两个项目全是 Python，深度使用 AsyncIO、LangChain |
-| Prompt Engineering | **强匹配** | MiniClaudeCode 中设计了混合指令+声明式机制 |
+| Prompt Engineering | **强匹配** | RolloCode 中设计了混合指令+声明式机制 |
 | RAG | **强匹配** | 财报系统完整实现了 RAG pipeline + 检索优化 |
 | Agent / Function Calling | **强匹配** | 自研 Agent 循环、Tool Calling、MCP 协议 |
 | Embedding | **强匹配** | 财报项目中用到了 embedding + Chroma 向量库 |
 | LangChain / LangGraph | **强匹配** | 两个项目分别深度使用 |
 | Dify / Coze / LlamaIndex | **弱匹配** | 简历未提及 |
-| FastAPI / Express | **弱匹配** | 简历未提及后端框架（MiniClaudeCode 有 Web 模式用 FastAPI？待确认） |
+| FastAPI / Express | **弱匹配** | 简历未提及后端框架（RolloCode 有 Web 模式用 FastAPI？待确认） |
 | Node.js | **缺口** | JD 提到但简历无相关经验 |
 | 多模态 | **缺口** | JD 提到文本/图片/视频多模态，简历未涉及 |
 
@@ -41,11 +41,11 @@
 
 **题目**：请用 2-3 分钟介绍一下你自己，重点说说你最有成就感的 AI 相关项目。
 
-**考察点**：JD "有 AI 应用 Demo、课程项目、开源项目经验者优先"；简历 MiniClaudeCode + 财报系统两个核心项目
+**考察点**：JD "有 AI 应用 Demo、课程项目、开源项目经验者优先"；简历 RolloCode + 财报系统两个核心项目
 
 **难度**：⭐⭐（基础 · 一面开场）
 
-**参考答案提示**：建议以 MiniClaudeCode 为主线，因为它是你独立主导的项目，技术深度更高。用 1 句话介绍背景 → 2-3 句话讲技术方案 → 2 句话讲量化成果（并行工具调用降低 15% 延迟、延迟加载节省 7k+ Tokens、5 种权限模式、JSONL trace）。最后用一句话带出财报项目作为多 Agent 实践。
+**参考答案提示**：建议以 RolloCode 为主线，因为它是你独立主导的项目，技术深度更高。用 1 句话介绍背景 → 2-3 句话讲技术方案 → 2 句话讲量化成果（并行工具调用降低 15% 延迟、延迟加载节省 7k+ Tokens、5 种权限模式、JSONL trace）。最后用一句话带出财报项目作为多 Agent 实践。
 
 **💡 追问方向**：如果回答太散，面试官会追问"这两个项目中你更满意哪一个？为什么？"
 
@@ -53,13 +53,13 @@
 
 ### Q2 · Agent 架构 + ReAct 模式
 
-**题目**：你简历里提到了 ReAct 和 Plan & Execute 两种 Agent 架构，能否讲讲它们的核心区别？在你的 MiniClaudeCode 项目中为什么选择了 ReAct？什么场景下 Plan & Execute 更合适？
+**题目**：你简历里提到了 ReAct 和 Plan & Execute 两种 Agent 架构，能否讲讲它们的核心区别？在你的 RolloCode 项目中为什么选择了 ReAct？什么场景下 Plan & Execute 更合适？
 
 **考察点**：JD "了解大模型相关基础概念，如 Agent、Function Calling"；简历 Agent 架构经验
 
 **难度**：⭐⭐⭐（中等 · 一面核心题）
 
-**参考答案提示**：先一句话给结论——ReAct 适合"边想边做"的开放式任务，Plan & Execute 适合"先规划再执行"的结构化任务。然后结合 MiniClaudeCode 解释：编程 Agent 需要根据每一步的工具返回结果动态调整下一步，ReAct 的 Observation → Thought → Action 循环天然匹配。最后举财报项目：LangGraph Supervisor 调度多个 Agent，先规划 DAG 再并行执行，是 Plan & Execute 的典型场景。
+**参考答案提示**：先一句话给结论——ReAct 适合"边想边做"的开放式任务，Plan & Execute 适合"先规划再执行"的结构化任务。然后结合 RolloCode 解释：编程 Agent 需要根据每一步的工具返回结果动态调整下一步，ReAct 的 Observation → Thought → Action 循环天然匹配。最后举财报项目：LangGraph Supervisor 调度多个 Agent，先规划 DAG 再并行执行，是 Plan & Execute 的典型场景。
 
 **💡 追问方向**："ReAct 循环中如果模型反复调用同一个工具陷入死循环，你怎么处理？"
 
@@ -93,7 +93,7 @@
 
 ---
 
-### Q5 · 项目深挖：MiniClaudeCode 上下文压缩
+### Q5 · 项目深挖：RolloCode 上下文压缩
 
 **题目**：你提到实现了"4 层压缩流水线"，这个设计很有意思。能详细讲讲每一层分别做了什么？在什么条件下触发？你有没有测过压缩前后的效果差异——比如压缩后模型回答质量有没有下降？
 
@@ -129,7 +129,7 @@
 
 **难度**：⭐⭐⭐（中等 · 一面基础题）
 
-**参考答案提示**：核心思想——LoRA 利用低秩分解（Low-Rank Decomposition），在冻结原始权重的基础上插入可训练的秩分解矩阵（A×B），训练参数量仅为全参数微调的千分之一。优势：显存占用小（单卡可训 7B 模型）、训练快、可插拔（不同任务换 LoRA 权重即可）。劣势：表达能力受秩 r 限制，极端复杂任务效果可能不及全参数微调。如果实际微调过要具体说（用了什么模型、什么任务、训练数据量、效果）。如果没有实操经验，诚实说并补充你在 MiniClaudeCode 中用 API 调用模型时如何通过 Prompt 和 system message 达到类似适配效果。
+**参考答案提示**：核心思想——LoRA 利用低秩分解（Low-Rank Decomposition），在冻结原始权重的基础上插入可训练的秩分解矩阵（A×B），训练参数量仅为全参数微调的千分之一。优势：显存占用小（单卡可训 7B 模型）、训练快、可插拔（不同任务换 LoRA 权重即可）。劣势：表达能力受秩 r 限制，极端复杂任务效果可能不及全参数微调。如果实际微调过要具体说（用了什么模型、什么任务、训练数据量、效果）。如果没有实操经验，诚实说并补充你在 RolloCode 中用 API 调用模型时如何通过 Prompt 和 system message 达到类似适配效果。
 
 **💡 追问方向**："LoRA 中的秩（rank）通常怎么选？r=8 和 r=64 有什么区别？你怎么判断秩是否够用？"
 
@@ -157,7 +157,7 @@
 
 **难度**：⭐⭐⭐（中等 · 二面/三面行为题）
 
-**参考答案提示**：用 STAR 法则。建议从你的两个项目中选一个来答——比如 MiniClaudeCode 中你如何从 0 搞懂 Anthropic API 的流式响应处理、AsyncIO 并发工具调用。Situation：要做 Coding Agent，需要理解流式 API、工具调用协议、异步并发。Task：2 个月内从入门到可运行原型。Action：①先看官方文档和 SDK 源码 ②写最小 demo 验证核心流程 ③遇到问题看 GitHub issues/社区 ④逐步迭代加入权限、压缩、记忆。Result：最终实现 13 个工具的 Agent，并行调用降低 15% 延迟。困难可以讲：AsyncIO 下流式解析和多工具并发调用的协调调试很痛苦。
+**参考答案提示**：用 STAR 法则。建议从你的两个项目中选一个来答——比如 RolloCode 中你如何从 0 搞懂 Anthropic API 的流式响应处理、AsyncIO 并发工具调用。Situation：要做 Coding Agent，需要理解流式 API、工具调用协议、异步并发。Task：2 个月内从入门到可运行原型。Action：①先看官方文档和 SDK 源码 ②写最小 demo 验证核心流程 ③遇到问题看 GitHub issues/社区 ④逐步迭代加入权限、压缩、记忆。Result：最终实现 13 个工具的 Agent，并行调用降低 15% 延迟。困难可以讲：AsyncIO 下流式解析和多工具并发调用的协调调试很痛苦。
 
 **💡 追问方向**："你觉得你学习新东西的方法论是什么？有什么刻意练习的习惯吗？"
 

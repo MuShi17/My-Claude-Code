@@ -1,1 +1,1 @@
-"""Benchmark package for Mini Claude Code regression testing."""
+"""Benchmark package for Rollo Code regression testing."""

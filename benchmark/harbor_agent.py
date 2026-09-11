@@ -1,4 +1,4 @@
-"""Harbor adapter for running Mini Claude Code in Terminal-Bench containers."""
+"""Harbor adapter for running Rollo Code in Terminal-Bench containers."""
 
 from __future__ import annotations
 
@@ -16,12 +16,12 @@ from harbor.models.agent.context import AgentContext
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = PROJECT_ROOT / "src"
-REMOTE_ROOT = "/tmp/mini-claude-py"
+REMOTE_ROOT = "/tmp/rollo"
 REMOTE_VENV = f"{REMOTE_ROOT}/.venv"
 REMOTE_PYTHON = f"{REMOTE_VENV}/bin/python"
 REMOTE_RUNTIME_DIR = "/logs/agent/runtime"
 PREBUILT_RUNTIME_IMPORT_CHECK = (
-    "import anthropic, openai, dotenv, rich, mini_claude"
+    "import anthropic, openai, dotenv, rich, rollo"
 )
 DEFAULT_MODEL = "claude-sonnet-4-5"
 DEFAULT_TIMEOUT_SEC = 1800
@@ -74,16 +74,16 @@ import json
 import os
 from pathlib import Path
 
-runtime_dir = os.environ.get("MINI_CLAUDE_RUNTIME_DIR")
-root = (Path(runtime_dir).expanduser() if runtime_dir else Path.home() / ".mini-claude") / "sessions"
+runtime_dir = os.environ.get("ROLLO_RUNTIME_DIR")
+root = (Path(runtime_dir).expanduser() if runtime_dir else Path.home() / ".rollo") / "sessions"
 
 # The SQLite ledger is the durable source of truth.  A timed-out agent may
 # still have many committed usage events but no final session.v2.json yet.
 databases = [path for path in root.glob("*/runtime.sqlite") if path.is_file()]
 if databases:
     try:
-        from mini_claude.projections.metrics_projection import CanonicalMetricsProjection
-        from mini_claude.runtime_store import SQLiteRuntimeStore
+        from rollo.projections.metrics_projection import CanonicalMetricsProjection
+        from rollo.runtime_store import SQLiteRuntimeStore
 
         database = max(databases, key=lambda path: path.stat().st_mtime_ns)
         store = SQLiteRuntimeStore(database, timeout=10)
@@ -210,12 +210,12 @@ def _load_project_env() -> dict[str, str]:
 PROJECT_ENV = _load_project_env()
 
 
-class MiniClaudeHarborAgent(BaseAgent):
+class RolloHarborAgent(BaseAgent):
     """Run the repository's CLI inside the Harbor task environment."""
 
     @staticmethod
     def name() -> str:
-        return "mini-claude-py"
+        return "rollo"
 
     def version(self) -> str | None:
         return "0.1.0"
@@ -264,8 +264,8 @@ class MiniClaudeHarborAgent(BaseAgent):
             return None
 
         try:
-            from mini_claude.projections.metrics_projection import CanonicalMetricsProjection
-            from mini_claude.runtime_store import SQLiteRuntimeStore
+            from rollo.projections.metrics_projection import CanonicalMetricsProjection
+            from rollo.runtime_store import SQLiteRuntimeStore
 
             database = max(databases, key=lambda path: path.stat().st_mtime_ns)
             store = SQLiteRuntimeStore(database, timeout=10)
@@ -383,14 +383,14 @@ class MiniClaudeHarborAgent(BaseAgent):
         return result.return_code == 0
 
     async def setup(self, environment: BaseEnvironment) -> None:
-        """Upload and prepare Mini Claude in the isolated task container."""
+        """Upload and prepare Rollo Code in the isolated task container."""
         await environment.upload_dir(SOURCE_ROOT, REMOTE_ROOT)
 
         if await self._prebuilt_runtime_ready(environment):
             return
 
         apt_mirror_setup = _apt_mirror_setup_command(
-            self._get_setting("MINI_CLAUDE_APT_MIRROR")
+            self._get_setting("ROLLO_APT_MIRROR")
         )
         bootstrap = (
             "if ! (command -v python3 >/dev/null 2>&1 && "
@@ -427,7 +427,7 @@ class MiniClaudeHarborAgent(BaseAgent):
                     f"{shlex.quote(REMOTE_PYTHON)} -m pip install "
                     f"--disable-pip-version-check --no-cache-dir "
                     f"--retries 3 --timeout 30"
-                    f"{_pip_index_option(self._get_setting('MINI_CLAUDE_PIP_INDEX_URL'))} "
+                    f"{_pip_index_option(self._get_setting('ROLLO_PIP_INDEX_URL'))} "
                     f"-e "
                     f"{shlex.quote(REMOTE_ROOT)}"
                 ),
@@ -444,7 +444,7 @@ class MiniClaudeHarborAgent(BaseAgent):
                 or self._local_log_text("setup.stdout.txt")
                 or "no output"
             )
-            raise RuntimeError(f"Mini Claude setup failed: {output}")
+            raise RuntimeError(f"Rollo Code setup failed: {output}")
 
     def _get_setting(self, key: str) -> str | None:
         """Resolve Harbor/host environment values before the project .env file."""
@@ -452,11 +452,11 @@ class MiniClaudeHarborAgent(BaseAgent):
 
     def _get_cli_model(self) -> str:
         """Resolve the model id expected by the configured API endpoint."""
-        explicit = self._get_setting("MINI_CLAUDE_MODEL_ID")
+        explicit = self._get_setting("ROLLO_MODEL_ID")
         if explicit:
             return explicit
 
-        model = self.model_name or self._get_setting("MINI_CLAUDE_MODEL") or DEFAULT_MODEL
+        model = self.model_name or self._get_setting("ROLLO_MODEL") or DEFAULT_MODEL
         # Harbor model names are normally provider/model. Anthropic and direct
         # OpenAI endpoints expect only the provider-local model id.
         if model.startswith("anthropic/"):
@@ -469,7 +469,7 @@ class MiniClaudeHarborAgent(BaseAgent):
 
     def _runtime_env(self) -> dict[str, str]:
         """Forward only model/API settings; never forward the whole host env."""
-        model = self.model_name or self._get_setting("MINI_CLAUDE_MODEL") or ""
+        model = self.model_name or self._get_setting("ROLLO_MODEL") or ""
         provider = model.split("/", 1)[0].lower() if "/" in model else ""
         if provider == "anthropic":
             keys = (
@@ -489,9 +489,9 @@ class MiniClaudeHarborAgent(BaseAgent):
                 "OPENAI_BASE_URL",
             )
         keys += (
-            "MINI_CLAUDE_MODEL",
-            "MINI_CLAUDE_MODEL_ID",
-            "MINI_CLAUDE_THINKING_EFFORT",
+            "ROLLO_MODEL",
+            "ROLLO_MODEL_ID",
+            "ROLLO_THINKING_EFFORT",
         )
         env = {
             key: value
@@ -501,7 +501,7 @@ class MiniClaudeHarborAgent(BaseAgent):
         # This directory is bind-mounted by Harbor as /logs/agent.  Keep it
         # separate from the task's HOME so task commands retain their normal
         # user configuration while canonical runtime data remains durable.
-        env["MINI_CLAUDE_RUNTIME_DIR"] = REMOTE_RUNTIME_DIR
+        env["ROLLO_RUNTIME_DIR"] = REMOTE_RUNTIME_DIR
         return env
 
     async def run(
@@ -510,7 +510,7 @@ class MiniClaudeHarborAgent(BaseAgent):
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
-        """Execute one Mini Claude one-shot session in the task workspace."""
+        """Execute one Rollo Code one-shot session in the task workspace."""
         workdir = getattr(environment.task_env_config, "workdir", None)
         if not workdir:
             pwd_result = await environment.exec("pwd", timeout_sec=10)
@@ -520,7 +520,7 @@ class MiniClaudeHarborAgent(BaseAgent):
 
         benchmark_instruction = self._benchmark_instruction(instruction)
         agent_command = (
-            f"{shlex.quote(REMOTE_PYTHON)} -u -m mini_claude --yolo "
+            f"{shlex.quote(REMOTE_PYTHON)} -u -m rollo --yolo "
             f"--model {shlex.quote(self._get_cli_model())} "
             f"{shlex.quote(benchmark_instruction)} < /dev/null"
         )
@@ -581,5 +581,5 @@ class MiniClaudeHarborAgent(BaseAgent):
                 or "no output"
             )
             raise RuntimeError(
-                f"Mini Claude exited with code {result.return_code}: {output}"
+                f"Rollo Code exited with code {result.return_code}: {output}"
             )

@@ -22,6 +22,6 @@
 
 ## Impact
 
-- 新增 `src/mini_claude/runtime_store.py` 及 SQLite schema/migration 测试。
-- 默认数据目录扩展为 `~/.mini-claude/runtime.sqlite`（实际路径由现有 session 配置解析），不删除 legacy 文件。
+- 新增 `src/rollo/runtime_store.py` 及 SQLite schema/migration 测试。
+- 默认数据目录扩展为 `~/.rollo/runtime.sqlite`（实际路径由现有 session 配置解析），不删除 legacy 文件。
 - 依赖 C01～C04 和 Python 标准库 `sqlite3`；不新增 ORM、migration framework 或外部服务。

@@ -59,7 +59,7 @@ R-01 至 R-10 的实现、集成测试和 R-11 工件回写已经完成，G0-G8 
 | I-09 | P0 | 真实 Agent Loop 没有发出 canonical user event | `agent.py:1491`、`agent.py:1813` 只追加 provider message array；Session/Model Replay 无法从 canonical stream 完整重建用户输入 |
 | I-10 | P1 | C11 one-shot/list/latest/resume 的真实 CLI 证据不足 | 现有 smoke 主要覆盖 help/resume，未证明临时 HOME 下真实 one-shot provider loop、shadow parity 和恢复链路 |
 | I-11 | P1 | pending `xfail` 和硬编码测试基线未清理 | 能力已经存在但仍有“not implemented yet” `xfail`；`test_cutover_gate.py:197` 仍写死 `109 passed, 1 xfailed`，与当前 119 passed 不一致 |
-| I-12 | P1 | canonical runtime.sqlite 路径不一致 | Item 05 要求 `~/.mini-claude/sessions/{session_id}/runtime.sqlite`，C05 与 `__main__.py:306` 使用 `~/.mini-claude/runtime.sqlite`，多 session 隔离和恢复对象不明确 |
+| I-12 | P1 | canonical runtime.sqlite 路径不一致 | Item 05 要求 `~/.rollo/sessions/{session_id}/runtime.sqlite`，C05 与 `__main__.py:306` 使用 `~/.rollo/runtime.sqlite`，多 session 隔离和恢复对象不明确 |
 | I-13 | P1 | 批次源文档没有真实 writeback | 00-批次总览、01-任务卡和 Item 01-11 仍为待确认/待开始，99 个验收项未勾选；无法证明需求侧验收已完成 |
 | I-14 | P1 | 现有 acceptance report 与代码证据矛盾 | `docs/architecture/agent-log-canonical-acceptance-report.md` 声称无未闭合 blocker，但两份独立审计已确认 I-01 至 I-09 等阻塞项 |
 
@@ -145,7 +145,7 @@ R-01 至 R-10 的实现、集成测试和 R-11 工件回写已经完成，G0-G8 
 
 对应问题：I-04、I-12，覆盖 C05、C10。
 
-- 统一 runtime store 路径，优先采用 `~/.mini-claude/sessions/{session_id}/runtime.sqlite`，并同步更新 C05、CLI、session manager、测试和文档。
+- 统一 runtime store 路径，优先采用 `~/.rollo/sessions/{session_id}/runtime.sqlite`，并同步更新 C05、CLI、session manager、测试和文档。
 - canonical 数据损坏时保留数据库与诊断信息，明确返回 corruption 状态；不得把打开失败当作“无 canonical 数据”并静默进入 legacy。
 - resume 只能在明确的受控策略下读取 legacy；fallback 必须可观测、可解释且不能覆盖 canonical 数据。
 

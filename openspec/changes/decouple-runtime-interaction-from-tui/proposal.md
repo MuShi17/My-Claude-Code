@@ -4,11 +4,11 @@
 
 ## What Changes
 
-- 新增 `src/mini_claude/runtime_ports.py`：定义**结构化输出端口**（文本/思考、工具状态、预算、错误、子 Agent 归属、生命周期）与默认的终端适配器实现；端口是**观察接口**，不参与 canonical 持久化。
-- 新增 `src/mini_claude/interactions.py`：定义**人工交互端口**（审批与提问），带 `request_id`、绑定 session/run/tool_call/参数摘要、状态机（pending/resolved/expired/cancelled）与异步等待对象；终端输入成为该端口的适配器实现。
+- 新增 `src/rollo/runtime_ports.py`：定义**结构化输出端口**（文本/思考、工具状态、预算、错误、子 Agent 归属、生命周期）与默认的终端适配器实现；端口是**观察接口**，不参与 canonical 持久化。
+- 新增 `src/rollo/interactions.py`：定义**人工交互端口**（审批与提问），带 `request_id`、绑定 session/run/tool_call/参数摘要、状态机（pending/resolved/expired/cancelled）与异步等待对象；终端输入成为该端口的适配器实现。
 - `agent.py`、`subagent.py`、`tools.py` 的审批接线改为经端口调用；**移除 runtime 内的终端 `input` fallback**（终端输入只存在于适配器）。
-- 新增 `src/mini_claude/tui_adapter.py`：把既有 TUI 行为（Rich 渲染、终端输入、Ctrl+C/EOF 语义、技能命令）实现为端口的消费方；不重写渲染层，不做大规模重命名。
-- 新增 `src/mini_claude/tests/tool_fixtures.py`：承接 GAP-I02-06 的可控工具夹具（可暂停、长输出、可取消 shell、晚到结果），供 C02 测试矩阵与后续 Change 复用。
+- 新增 `src/rollo/tui_adapter.py`：把既有 TUI 行为（Rich 渲染、终端输入、Ctrl+C/EOF 语义、技能命令）实现为端口的消费方；不重写渲染层，不做大规模重命名。
+- 新增 `src/rollo/tests/tool_fixtures.py`：承接 GAP-I02-06 的可控工具夹具（可暂停、长输出、可取消 shell、晚到结果），供 C02 测试矩阵与后续 Change 复用。
 - 不改变既有权限语义（allow/deny/plan/dontAsk 与先读后改保护不变）；不实现持久化交互、Application API、owner 锁或 stdio host（分别属 C03/C05）。
 
 ## Capabilities

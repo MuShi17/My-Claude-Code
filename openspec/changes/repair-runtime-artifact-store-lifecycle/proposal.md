@@ -24,7 +24,7 @@
 
 ## Impact
 
-- 影响 `src/mini_claude/agent.py` 的 Runtime Facade 初始化、`chat()` 收尾和资源关闭入口。
-- 影响 `src/mini_claude/__main__.py` 的 REPL、one-shot 和 resume 资源收尾。
+- 影响 `src/rollo/agent.py` 的 Runtime Facade 初始化、`chat()` 收尾和资源关闭入口。
+- 影响 `src/rollo/__main__.py` 的 REPL、one-shot 和 resume 资源收尾。
 - 新增 Runtime Store/Artifact Archive 生命周期与多轮归档集成测试。
 - 不新增依赖，不改变 SQLite schema、artifact schema、API 配置、16KB durable result boundary 或历史 artifact 文件。

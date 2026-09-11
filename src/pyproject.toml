@@ -1,7 +1,7 @@
 [project]
-name = "mini-claude-py"
+name = "rollo-code"
 version = "0.1.0"
-description = "A concise programming agent mimicking Claude Code"
+description = "A local coding agent with a replayable event runtime"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.scripts]
-mini-claude-py = "mini_claude.__main__:main"
+rollo = "rollo.__main__:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]

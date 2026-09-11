@@ -2,7 +2,7 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** 为 Mini Claude Code 建立可观测体系，追踪首Token速度、任务轮次、工具调用、Token消耗、缓存命中率，每次用户 ask 生成独立 trace 文件。
+**Goal:** 为 Rollo Code 建立可观测体系，追踪首Token速度、任务轮次、工具调用、Token消耗、缓存命中率，每次用户 ask 生成独立 trace 文件。
 
 **Architecture:** Observer 模式 — Agent 新增事件发射器，新建 tracer.py SessionTracer 订阅事件累积指标，session.py 重构目录结构为 `sessions/{id}/session.json` + `sessions/{id}/traces/*.jsonl`。
 
@@ -15,8 +15,8 @@
 ### Task 1: 改造 session.py 目录结构
 
 **Files:**
-- Modify: `src/mini_claude/session.py`
-- Modify: `src/mini_claude/agent.py:456-470` (_auto_save method)
+- Modify: `src/rollo/session.py`
+- Modify: `src/rollo/agent.py:456-470` (_auto_save method)
 
 **Step 1: 改造 save_session**
 
@@ -33,7 +33,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-SESSION_DIR = Path.home() / ".mini-claude" / "sessions"
+SESSION_DIR = Path.home() / ".rollo" / "sessions"
 
 
 def _ensure_dir() -> None:
@@ -53,7 +53,7 @@ def _traces_dir(session_id: str) -> Path:
 
 
 def _legacy_session_path(session_id: str) -> Path:
-    """旧格式路径：~/.mini-claude/sessions/{session_id}.json（向后兼容）"""
+    """旧格式路径：~/.rollo/sessions/{session_id}.json（向后兼容）"""
     return SESSION_DIR / f"{session_id}.json"
 
 
@@ -162,7 +162,7 @@ def _auto_save(self) -> None:
 
 ```bash
 cd src && python -c "
-from mini_claude.session import save_session, load_session, list_sessions, save_trace, SESSION_DIR
+from rollo.session import save_session, load_session, list_sessions, save_trace, SESSION_DIR
 import uuid
 sid = 'test_' + uuid.uuid4().hex[:8]
 save_session(sid, {'metadata': {'id': sid, 'model': 'test', 'startTime': 'now', 'messageCount': 0}})
@@ -182,7 +182,7 @@ print('PASS')
 **Step 4: Commit**
 
 ```bash
-git add src/mini_claude/session.py src/mini_claude/agent.py
+git add src/rollo/session.py src/rollo/agent.py
 git commit -m "feat: restructure session storage to dir-based layout with trace support"
 ```
 
@@ -191,7 +191,7 @@ git commit -m "feat: restructure session storage to dir-based layout with trace 
 ### Task 2: 创建 tracer.py 模块
 
 **Files:**
-- Create: `src/mini_claude/tracer.py`
+- Create: `src/rollo/tracer.py`
 
 **Step 1: 编写 SessionTracer 类**
 
@@ -294,7 +294,7 @@ class SessionTracer:
 
 ```bash
 cd src && python -c "
-from mini_claude.tracer import SessionTracer
+from rollo.tracer import SessionTracer
 t = SessionTracer(1, 'hello test')
 t.on_turn_start({'turn_index': 0})
 import time
@@ -317,7 +317,7 @@ print('PASS')
 **Step 3: Commit**
 
 ```bash
-git add src/mini_claude/tracer.py
+git add src/rollo/tracer.py
 git commit -m "feat: add SessionTracer for per-ask observability"
 ```
 
@@ -326,7 +326,7 @@ git commit -m "feat: add SessionTracer for per-ask observability"
 ### Task 3: 在 Agent 中添加事件发射器
 
 **Files:**
-- Modify: `src/mini_claude/agent.py:173-252` (__init__, 添加 _event_hooks, _ask_count, on/off/_emit 方法)
+- Modify: `src/rollo/agent.py:173-252` (__init__, 添加 _event_hooks, _ask_count, on/off/_emit 方法)
 
 **Step 1: 添加事件发射器基础设施**
 
@@ -373,7 +373,7 @@ git commit -m "feat: add SessionTracer for per-ask observability"
 
 ```bash
 cd src && python -c "
-from mini_claude.agent import Agent
+from rollo.agent import Agent
 import asyncio
 
 received = []
@@ -395,7 +395,7 @@ print('PASS')
 **Step 3: Commit**
 
 ```bash
-git add src/mini_claude/agent.py
+git add src/rollo/agent.py
 git commit -m "feat: add event emitter (on/off/_emit) to Agent"
 ```
 
@@ -404,10 +404,10 @@ git commit -m "feat: add event emitter (on/off/_emit) to Agent"
 ### Task 4: 在 Agent 循环中埋点 — Anthropic 后端
 
 **Files:**
-- Modify: `src/mini_claude/agent.py:352-378` (chat 方法)
-- Modify: `src/mini_claude/agent.py:896-1033` (_chat_anthropic 方法)
-- Modify: `src/mini_claude/agent.py:1047-1121` (_call_anthropic_stream 方法)
-- Modify: `src/mini_claude/agent.py:456-470` (_auto_save 方法)
+- Modify: `src/rollo/agent.py:352-378` (chat 方法)
+- Modify: `src/rollo/agent.py:896-1033` (_chat_anthropic 方法)
+- Modify: `src/rollo/agent.py:1047-1121` (_call_anthropic_stream 方法)
+- Modify: `src/rollo/agent.py:456-470` (_auto_save 方法)
 
 **Step 1: 改造 chat() 方法 — 创建 Tracer + 订阅 + 清理**
 
@@ -654,7 +654,7 @@ git commit -m "feat: add event emitter (on/off/_emit) to Agent"
 **Step 4: Commit**
 
 ```bash
-git add src/mini_claude/agent.py
+git add src/rollo/agent.py
 git commit -m "feat: instrument _chat_anthropic loop with event emissions"
 ```
 
@@ -663,8 +663,8 @@ git commit -m "feat: instrument _chat_anthropic loop with event emissions"
 ### Task 5: 在 Agent 循环中埋点 — OpenAI 后端
 
 **Files:**
-- Modify: `src/mini_claude/agent.py:1127-1266` (_chat_openai 方法)
-- Modify: `src/mini_claude/agent.py:1267-1366` (_call_openai_stream 方法)
+- Modify: `src/rollo/agent.py:1127-1266` (_chat_openai 方法)
+- Modify: `src/rollo/agent.py:1267-1366` (_call_openai_stream 方法)
 
 **Step 1: 改造 _chat_openai**
 
@@ -802,7 +802,7 @@ git commit -m "feat: instrument _chat_anthropic loop with event emissions"
 
 ```bash
 cd src && python -c "
-from mini_claude.agent import Agent
+from rollo.agent import Agent
 agent = Agent()
 events = []
 agent.on('chat_start', lambda p: events.append(('chat_start', p)))
@@ -821,7 +821,7 @@ print('PASS')
 **Step 3: Commit**
 
 ```bash
-git add src/mini_claude/agent.py
+git add src/rollo/agent.py
 git commit -m "feat: instrument _chat_openai loop with event emissions"
 ```
 
@@ -830,7 +830,7 @@ git commit -m "feat: instrument _chat_openai loop with event emissions"
 ### Task 6: 恢复会话时 ask_count 回填
 
 **Files:**
-- Modify: `src/mini_claude/agent.py:442-451` (restore_session 方法)
+- Modify: `src/rollo/agent.py:442-451` (restore_session 方法)
 
 **Step 1: 从 metadata 恢复 ask_count**
 
@@ -852,7 +852,7 @@ git commit -m "feat: instrument _chat_openai loop with event emissions"
 
 ```bash
 cd src && python -c "
-from mini_claude.agent import Agent
+from rollo.agent import Agent
 agent = Agent()
 agent.restore_session({
     'metadata': {'id': 'abc123', 'askCount': 5},
@@ -867,7 +867,7 @@ print('PASS')
 **Step 3: Commit**
 
 ```bash
-git add src/mini_claude/agent.py
+git add src/rollo/agent.py
 git commit -m "feat: restore ask_count from session metadata on resume"
 ```
 
@@ -880,9 +880,9 @@ git commit -m "feat: restore ask_count from session metadata on resume"
 ```bash
 cd src && python -c "
 # 验证所有模块导入正常
-from mini_claude.agent import Agent
-from mini_claude.tracer import SessionTracer
-from mini_claude.session import save_session, load_session, list_sessions, save_trace
+from rollo.agent import Agent
+from rollo.tracer import SessionTracer
+from rollo.session import save_session, load_session, list_sessions, save_trace
 print('All imports OK')
 
 # 验证 Agent 有事件系统
@@ -913,7 +913,7 @@ print('Tracer OK')
 import uuid, os, shutil
 sid = 'e2e_' + uuid.uuid4().hex[:8]
 save_session(sid, {'metadata': {'id': sid, 'model': 'test', 'askCount': 3}})
-session_dir = os.path.expanduser(f'~/.mini-claude/sessions/{sid}')
+session_dir = os.path.expanduser(f'~/.rollo/sessions/{sid}')
 assert os.path.isdir(session_dir)
 assert os.path.exists(os.path.join(session_dir, 'session.json'))
 trace_lines = ['{\"type\":\"ask\",\"ask_index\":1}', '{\"type\":\"turn\",\"turn_index\":1}']
@@ -929,7 +929,7 @@ print('ALL PASS')
 **Step 2: Commit**
 
 ```bash
-git add src/mini_claude/agent.py src/mini_claude/tracer.py src/mini_claude/session.py
+git add src/rollo/agent.py src/rollo/tracer.py src/rollo/session.py
 git commit -m "test: add end-to-end integration verification"
 ```
 

@@ -51,7 +51,7 @@
 ## 6. 验证记录与交付边界
 
 - [x] 6.1 运行 archive/projection/provider/replay/local-consumer focused tests，记录每条新增 requirement/scenario 对应的命令、结果和诊断证据。
-- [x] 6.2 运行 src/mini_claude/tests 全量测试、compileall、OpenSpec strict validation 和 git diff --check，区分可选 benchmark 依赖残留。
+- [x] 6.2 运行 src/rollo/tests 全量测试、compileall、OpenSpec strict validation 和 git diff --check，区分可选 benchmark 依赖残留。
 - [x] 6.3 生成 implementation-validation.md，区分本地测试、fake SDK/loopback、外部 Provider、部署和 Git 交付证据，记录未验证边界。
 - [x] 6.4 由主 Agent 对照 proposal/design/spec/tasks 复核最终 diff、request-cycle owner、identity matrix 和 deferred risks；commit、push、MR、部署等交付动作须另获明确授权。
 

@@ -22,6 +22,6 @@
 
 ## Impact
 
-- 影响 `src/mini_claude/logger.py`、`tracer.py`、`agent.py` 以及相关 session/child-agent 调用点。
-- 影响 `~/.mini-claude/logs`、`llm`、`traces` 的新写入格式，但不迁移旧文件。
+- 影响 `src/rollo/logger.py`、`tracer.py`、`agent.py` 以及相关 session/child-agent 调用点。
+- 影响 `~/.rollo/logs`、`llm`、`traces` 的新写入格式，但不迁移旧文件。
 - 依赖 C01 的边界与 C02 的离线 fixture；与 C04 的 canonical facade 依赖顺序为 legacy correctness 先行。

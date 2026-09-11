@@ -22,6 +22,6 @@ C01 已冻结事件语义，但 Agent Loop 仍直接调用 legacy `log_*` 方法
 
 ## Impact
 
-- 新增 `src/mini_claude/runtime_event.py`、`event_ids.py`、`redaction.py`、`event_sink.py`，并为 C05 的 SQLite sink 提供接口。
+- 新增 `src/rollo/runtime_event.py`、`event_ids.py`、`redaction.py`、`event_sink.py`，并为 C05 的 SQLite sink 提供接口。
 - 影响 logger/tracer 适配和后续 agent loop 接入，但本 change 不让 SQLite 成为执行路径事实源。
 - 依赖 C01、C02、C03；必须在 C05 store 不变量通过前保持内存/记录型 sink。

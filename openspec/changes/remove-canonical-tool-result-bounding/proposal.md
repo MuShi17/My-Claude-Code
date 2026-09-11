@@ -1,6 +1,6 @@
 ## Why
 
-当前 Mini Claude Code 可能在首次 Provider 请求前就把工具结果写成 `bounded_ref`，同时工具执行、durable boundary、redaction 和 Provider projection 还存在多个相互独立的尺寸边界。结果是模型、子代理和终端可能只能看到不可直接消费的 metadata，且 canonical event 无法再恢复原始安全结果。该变更依据 ISS002 对齐 Maka 的 first-use、stale projection 和 ArchiveRead 语义，并明确 16 MiB（16,777,216 字节）的 canonical JSON UTF-8 字节上限是所有工具共用的公共结果安全上限。
+当前 Rollo Code 可能在首次 Provider 请求前就把工具结果写成 `bounded_ref`，同时工具执行、durable boundary、redaction 和 Provider projection 还存在多个相互独立的尺寸边界。结果是模型、子代理和终端可能只能看到不可直接消费的 metadata，且 canonical event 无法再恢复原始安全结果。该变更依据 ISS002 对齐 Maka 的 first-use、stale projection 和 ArchiveRead 语义，并明确 16 MiB（16,777,216 字节）的 canonical JSON UTF-8 字节上限是所有工具共用的公共结果安全上限。
 
 ## What Changes
 
@@ -28,7 +28,7 @@
 
 ## Impact
 
-- 影响 `src/mini_claude/tools.py`、`runtime_lifecycle.py`、`redaction.py`、`event_sink.py`、Provider projection、ArchiveRead capability、`agent.py`、`subagent.py`、终端投影及相关测试。
+- 影响 `src/rollo/tools.py`、`runtime_lifecycle.py`、`redaction.py`、`event_sink.py`、Provider projection、ArchiveRead capability、`agent.py`、`subagent.py`、终端投影及相关测试。
 - 影响 Anthropic 和 OpenAI-compatible Provider 的工具结果消息，以及公共工具结果适配路径；不改变副作用工具的 dispatch、权限、retry、recovery 或 outcome-unknown 语义。
 - 需要复用现有 Canonical Runtime Event、ArtifactArchive、session/lineage scope 和模型 replay；不新增外部依赖，不迁移或删除历史 artifact/session 数据。
 - 参考 `D:/workspace/maka@57e08d83497d1d7ace7d6eff88e4e5267a0345b5` 的已核对源码语义，但不修改 Maka；Maka 的可选 `maxResultBytes` 和 8 MiB transport cap 作为证据边界，不作为本项目 16 MiB 公共上限的替代定义。
