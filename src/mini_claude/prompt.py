@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 from .memory import build_memory_prompt_section
+from .project_context import ProjectContext
 from .skills import build_skill_descriptions
 from .subagent import build_agent_descriptions
 from .tools import get_deferred_tool_names
@@ -144,7 +145,11 @@ def _resolve_includes(
 
 
 def _load_rules_dir(directory: Path) -> str:
-    """加载 .claude/rules/ 目录下的所有 .md 文件。"""
+    """加载 `<directory>/.claude/rules/` 下的所有 .md 文件。
+
+    调用方传 workspace 根（例如 `context.root`），本函数自行追加
+    `.claude/rules` 子路径；不要传入已经是 rules 目录的路径，否则会双重拼接。
+    """
     rules_dir = directory / ".claude" / "rules"
     if not rules_dir.is_dir():
         return ""
@@ -165,10 +170,12 @@ def _load_rules_dir(directory: Path) -> str:
         return ""
 
 
-def load_claude_md() -> str:
-    """从当前工作目录向上遍历，收集所有 CLAUDE.md 文件，并解析 @include 引用。"""
+def load_claude_md(context: ProjectContext | None = None) -> str:
+    """从 workspace 根向上遍历，收集所有 CLAUDE.md 文件，并解析 @include 引用。"""
+    if context is None:
+        context = ProjectContext.from_root(Path.cwd())
     parts: list[str] = []
-    d = Path.cwd().resolve()
+    d = context.root
     while True:
         f = d / "CLAUDE.md"
         if f.is_file():
@@ -182,18 +189,20 @@ def load_claude_md() -> str:
         if parent == d:
             break
         d = parent
-    # 从当前目录加载 .claude/rules/*.md
-    rules = _load_rules_dir(Path.cwd())
+    # 从 workspace 根加载 .claude/rules/*.md（本函数自行追加 .claude/rules）
+    rules = _load_rules_dir(context.root)
     claude_md = ""
     if parts:
         claude_md = "\n\n# Project Instructions (CLAUDE.md)\n" + "\n\n---\n\n".join(parts)
     return claude_md + rules
 
 
-def get_git_context() -> str:
-    """获取 Git 分支、最近提交和状态信息。"""
+def get_git_context(context: ProjectContext | None = None) -> str:
+    """获取 workspace 的 Git 分支、最近提交和状态信息。"""
+    if context is None:
+        context = ProjectContext.from_root(Path.cwd())
     try:
-        opts = {"encoding": "utf-8", "timeout": 3, "capture_output": True}
+        opts = {"encoding": "utf-8", "timeout": 3, "capture_output": True, "cwd": str(context.root)}
         branch = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], **opts).stdout.strip()
         log = subprocess.run(["git", "log", "--oneline", "-5"], **opts).stdout.strip()
         status = subprocess.run(["git", "status", "--short"], **opts).stdout.strip()
@@ -207,17 +216,19 @@ def get_git_context() -> str:
         return ""
 
 
-def build_system_prompt() -> str:
+def build_system_prompt(context: ProjectContext | None = None) -> str:
     """从嵌入模板 + 动态上下文构建完整的系统提示词。"""
     from datetime import date
+    if context is None:
+        context = ProjectContext.from_root(Path.cwd())
     today = date.today().isoformat()
     plat = f"{platform.system()} {platform.machine()}"
     shell = (os.environ.get("ComSpec") or "cmd.exe") if sys.platform == "win32" else os.environ.get("SHELL", "/bin/sh")
-    git_context = get_git_context()
-    claude_md = load_claude_md()
-    memory_section = build_memory_prompt_section()
-    skills_section = build_skill_descriptions()
-    agent_section = build_agent_descriptions()
+    git_context = get_git_context(context)
+    claude_md = load_claude_md(context)
+    memory_section = build_memory_prompt_section(context)
+    skills_section = build_skill_descriptions(context)
+    agent_section = build_agent_descriptions(context)
 
     deferred_names = get_deferred_tool_names()
     deferred_section = (
@@ -226,7 +237,7 @@ def build_system_prompt() -> str:
     )
 
     replacements = {
-        "{{cwd}}": str(Path.cwd()),
+        "{{cwd}}": str(context.root),
         "{{date}}": today,
         "{{platform}}": plat,
         "{{shell}}": shell,

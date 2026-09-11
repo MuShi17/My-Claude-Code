@@ -7,6 +7,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .frontmatter import parse_frontmatter
+from .project_context import ProjectContext
 from .tools import tool_definitions, ToolDef
 
 # ─── Read-only tools (for explore and plan agents) ──────────
@@ -75,21 +76,23 @@ Guidelines:
 
 # ─── Custom agent discovery ─────────────────────────────────
 
-_cached_custom_agents: dict[str, dict] | None = None
+_cached_custom_agents: dict[str, dict[str, dict]] = {}
 
 
-def _discover_custom_agents() -> dict[str, dict]:
-    global _cached_custom_agents
-    if _cached_custom_agents is not None:
-        return _cached_custom_agents
+def _discover_custom_agents(context: "ProjectContext | None" = None) -> dict[str, dict]:
+    if context is None:
+        context = ProjectContext.from_root(Path.cwd())
+    cached = _cached_custom_agents.get(context.workspace_id)
+    if cached is not None:
+        return cached
 
     agents: dict[str, dict] = {}
     # User-level (lower priority)
     _load_agents_from_dir(Path.home() / ".claude" / "agents", agents)
     # Project-level (higher priority, overwrites)
-    _load_agents_from_dir(Path.cwd() / ".claude" / "agents", agents)
+    _load_agents_from_dir(context.agents_dir, agents)
 
-    _cached_custom_agents = agents
+    _cached_custom_agents[context.workspace_id] = agents
     return agents
 
 
@@ -120,9 +123,9 @@ def _load_agents_from_dir(directory: Path, agents: dict[str, dict]) -> None:
 # ─── Main config function ───────────────────────────────────
 
 
-def get_sub_agent_config(agent_type: str) -> dict:
+def get_sub_agent_config(agent_type: str, context: "ProjectContext | None" = None) -> dict:
     """Return {system_prompt, tools} for the given agent type."""
-    custom = _discover_custom_agents().get(agent_type)
+    custom = _discover_custom_agents(context).get(agent_type)
     if custom:
         if custom["allowed_tools"]:
             tools = [t for t in tool_definitions if t["name"] in custom["allowed_tools"]]
@@ -143,19 +146,19 @@ def get_sub_agent_config(agent_type: str) -> dict:
 # ─── Available agent types (for system prompt) ──────────────
 
 
-def get_available_agent_types() -> list[dict[str, str]]:
+def get_available_agent_types(context: "ProjectContext | None" = None) -> list[dict[str, str]]:
     types = [
         {"name": "explore", "description": "Fast, read-only codebase search and exploration"},
         {"name": "plan", "description": "Read-only analysis with structured implementation plans"},
         {"name": "general", "description": "Full tools for independent tasks"},
     ]
-    for name, defn in _discover_custom_agents().items():
+    for name, defn in _discover_custom_agents(context).items():
         types.append({"name": name, "description": defn["description"]})
     return types
 
 
-def build_agent_descriptions() -> str:
-    types = get_available_agent_types()
+def build_agent_descriptions(context: "ProjectContext | None" = None) -> str:
+    types = get_available_agent_types(context)
     if len(types) <= 3:
         return ""  # Only built-in types, already in system prompt
 
@@ -167,5 +170,4 @@ def build_agent_descriptions() -> str:
 
 
 def reset_agent_cache() -> None:
-    global _cached_custom_agents
-    _cached_custom_agents = None
+    _cached_custom_agents.clear()

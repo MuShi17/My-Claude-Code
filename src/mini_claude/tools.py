@@ -22,6 +22,7 @@ from typing import Any
 
 from .memory import get_memory_dir
 from .frontmatter import parse_frontmatter
+from .project_context import ProjectContext
 from .tool_result import MAX_TOOL_RESULT_BYTES, is_tool_result_error, public_tool_result
 
 # ─── 权限模式 ──────────────────────────────────────────────
@@ -271,9 +272,24 @@ def _read_file_pagination(inp: dict) -> tuple[int, int | None] | str:
     return offset, limit
 
 
-def _read_file(inp: dict) -> str:
+def _resolve_tool_path(raw: str, context: "ProjectContext | None") -> str:
+    """把工具入参路径解析为绝对路径：显式绝对路径优先，否则以 context 根为基准。
+
+    context 缺省时按调用点 cwd 构造（与其它消费方一致）。
+    """
+
+    if context is None:
+        context = ProjectContext.from_root(Path.cwd())
+    candidate = Path(raw).expanduser()
+    if candidate.is_absolute():
+        return str(candidate)
+    return str(context.tool_cwd / candidate)
+
+
+def _read_file(inp: dict, *, context: "ProjectContext | None" = None) -> str:
     """读取分页后的文件内容，行号仍使用原文件的 1-based 行号。"""
 
+    inp = {**inp, "file_path": _resolve_tool_path(inp["file_path"], context)}
     pagination = _read_file_pagination(inp)
     if isinstance(pagination, str):
         return pagination
@@ -292,17 +308,17 @@ def _read_file(inp: dict) -> str:
     return numbered
 
 
-def _write_file(inp: dict) -> str:
-    """写入文件内容。
+def _write_file(inp: dict, *, context: "ProjectContext | None" = None) -> str:
+    """写入文件内容（相对路径以 context 根解析）。
     - 自动创建父目录
     - 如果写入的是记忆文件，自动更新 MEMORY.md 索引
     - 返回写入后的行数和前30行预览
     """
     try:
-        path = Path(inp["file_path"])
+        path = Path(_resolve_tool_path(inp["file_path"], context))
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(inp["content"], encoding="utf-8")
-        _auto_update_memory_index(str(path))
+        _auto_update_memory_index(str(path), context=context)
         lines = inp["content"].split("\n")
         line_count = len(lines)
         preview = "\n".join(f"{i+1:4d} | {l}" for i, l in enumerate(lines[:30]))
@@ -312,14 +328,17 @@ def _write_file(inp: dict) -> str:
         return f"Error writing file: {e}"
 
 
-def _auto_update_memory_index(file_path: str) -> None:
+def _auto_update_memory_index(
+    file_path: str, *, context: "ProjectContext | None" = None
+) -> None:
     """写入记忆目录下的 .md 文件后，自动重新生成 MEMORY.md 索引。
     解析每个记忆文件的 YAML frontmatter（name、type、description），
     生成 Markdown 格式的索引链接列表。
     非记忆目录下的文件或 MEMORY.md 本身不会触发重建。
+    记忆目录由 context 决定（不依赖进程当前目录）。
     """
     try:
-        mem_dir = str(get_memory_dir())
+        mem_dir = str(get_memory_dir(context))
         if file_path.startswith(mem_dir) and file_path.endswith(".md") and not file_path.endswith("MEMORY.md"):
             mem_path = Path(mem_dir)
             lines = ["# Memory Index", ""]
@@ -388,16 +407,18 @@ def _generate_diff(old_content: str, old_string: str, new_string: str) -> str:
     return "\n".join(parts)
 
 
-def _edit_file(inp: dict) -> str:
-    """编辑文件：查找 old_string 并替换为 new_string。
+def _edit_file(inp: dict, *, context: "ProjectContext | None" = None) -> str:
+    """编辑文件：查找 old_string 并替换为 new_string（相对路径以 context 根解析）。
     包含安全检查：
     - old_string 必须在文件中存在（支持引号规范化容错）
     - old_string 在文件中必须唯一（防止意外替换多处）
     - 返回 unified diff 格式的变更预览
     """
     try:
-        path = Path(inp["file_path"])
-        content, _ = _read_file_with_encoding(inp["file_path"])
+        resolved = _resolve_tool_path(inp["file_path"], context)
+        inp = {**inp, "file_path": resolved}
+        path = Path(resolved)
+        content, _ = _read_file_with_encoding(resolved)
 
         actual = _find_actual_string(content, inp["old_string"])
         if not actual:
@@ -417,18 +438,23 @@ def _edit_file(inp: dict) -> str:
         return f"Error editing file: {e}"
 
 
-def _list_files(inp: dict) -> str:
-    """按 glob 模式列出文件。
+def _list_files(inp: dict, *, context: "ProjectContext | None" = None) -> str:
+    """按 glob 模式列出文件（默认相对路径以 context 根解析）。
     - 自动跳过 node_modules 和 .git 目录
     - 最多返回 200 个匹配结果，超出部分截断并提示
     """
+    if context is None:
+        context = ProjectContext.from_root(Path.cwd())
     try:
-        base = Path(inp.get("path") or ".")
+        raw_path = inp.get("path")
+        base = Path(raw_path) if raw_path else context.tool_cwd
+        if not base.is_absolute():
+            base = context.tool_cwd / base
         pattern = inp["pattern"]
         files = []
         for p in base.glob(pattern):
             if p.is_file():
-                rel = str(p.relative_to(base) if base != Path(".") else p)
+                rel = str(p.relative_to(base))
                 # Skip node_modules and .git
                 if "node_modules" in rel or ".git" in rel.split(os.sep):
                     continue
@@ -445,14 +471,21 @@ def _list_files(inp: dict) -> str:
         return f"Error listing files: {e}"
 
 
-def _grep_search(inp: dict) -> str:
+def _grep_search(inp: dict, *, context: "ProjectContext | None" = None) -> str:
     """正则搜索文件内容，双引擎策略：
     - Linux/macOS：优先使用系统 grep（性能更好）
     - Windows 或 grep 不可用时：回退到纯 Python 实现
-    最多输出 100 行匹配结果，超出截断提示。
+    最多输出 100 行匹配结果，超出截断提示。默认相对路径以 context 根解析。
     """
+    if context is None:
+        context = ProjectContext.from_root(Path.cwd())
     pattern = inp["pattern"]
-    path = inp.get("path") or "."
+    raw_path = inp.get("path")
+    if raw_path:
+        candidate = Path(raw_path)
+        path = str(candidate if candidate.is_absolute() else context.tool_cwd / candidate)
+    else:
+        path = str(context.tool_cwd)
     include = inp.get("include")
 
     # Linux/macOS：优先使用系统 grep，利用 native 性能
@@ -463,7 +496,7 @@ def _grep_search(inp: dict) -> str:
                 args.append(f"--include={include}")
             args.extend(["--", pattern, path])
             result = subprocess.run(
-                args, capture_output=True, text=True, timeout=10
+                args, capture_output=True, text=True, timeout=10, cwd=str(context.tool_cwd)
             )
             if result.returncode == 1:
                 return "No matches found."
@@ -526,12 +559,14 @@ def _grep_python(pattern: str, directory: str, include: str | None) -> str:
     return output
 
 
-def _run_shell(inp: dict) -> str:
-    """执行 shell 命令。
+def _run_shell(inp: dict, *, context: "ProjectContext | None" = None) -> str:
+    """执行 shell 命令（cwd 由 ProjectContext 显式提供，不依赖进程当前目录）。
     - 默认超时 30 秒
     - 捕获 stdout 和 stderr
     - 非零退出码时返回详细错误信息（包含 stdout/stderr）
     """
+    if context is None:
+        context = ProjectContext.from_root(Path.cwd())
     try:
         timeout_ms = inp.get("timeout", 30000)
         timeout_s = timeout_ms / 1000
@@ -541,6 +576,7 @@ def _run_shell(inp: dict) -> str:
             capture_output=True,
             text=True,
             timeout=timeout_s,
+            cwd=str(context.tool_cwd),
         )
         output = result.stdout or ""
         if result.returncode != 0:
@@ -652,24 +688,26 @@ def _load_settings(file_path: Path) -> dict | None:
         return None
 
 
-_cached_rules: dict | None = None
+_cached_rules: dict[str, dict] = {}
 
 
-def load_permission_rules() -> dict:
+def load_permission_rules(context: "ProjectContext | None" = None) -> dict:
     """加载并合并用户级和项目级权限规则。
     用户级：~/.claude/settings.json
-    项目级：.claude/settings.json
-    结果缓存以避免重复读取磁盘。
+    项目级：由 ProjectContext 决定的 .claude/settings.json
+    结果按 workspace 身份缓存以避免重复读取磁盘。
     """
-    global _cached_rules
-    if _cached_rules is not None:
-        return _cached_rules
+    if context is None:
+        context = ProjectContext.from_root(Path.cwd())
+    cached = _cached_rules.get(context.workspace_id)
+    if cached is not None:
+        return cached
 
     allow: list[dict] = []
     deny: list[dict] = []
 
     user_settings = _load_settings(Path.home() / ".claude" / "settings.json")
-    project_settings = _load_settings(Path.cwd() / ".claude" / "settings.json")
+    project_settings = _load_settings(context.settings_path)
 
     for settings in [user_settings, project_settings]:
         if not settings or "permissions" not in settings:
@@ -680,14 +718,18 @@ def load_permission_rules() -> dict:
         for r in perms.get("deny", []):
             deny.append(_parse_rule(r))
 
-    _cached_rules = {"allow": allow, "deny": deny}
-    return _cached_rules
+    _cached_rules[context.workspace_id] = {"allow": allow, "deny": deny}
+    return _cached_rules[context.workspace_id]
 
 
-def _matches_rule(rule: dict, tool_name: str, inp: dict) -> bool:
+def _matches_rule(
+    rule: dict, tool_name: str, inp: dict, *, context: "ProjectContext | None" = None
+) -> bool:
     """检查工具调用是否匹配某条权限规则。
     pattern=None 时匹配该工具的所有调用；
     pattern 以 * 结尾时做前缀匹配；否则精确匹配。
+    文件类工具的路径在比较前统一按 context 根解析（两侧同基准），
+    避免进程 cwd 与 workspace 根不同时规则静默失配。
     """
     if rule["tool"] != tool_name:
         return False
@@ -699,24 +741,32 @@ def _matches_rule(rule: dict, tool_name: str, inp: dict) -> bool:
     if tool_name == "run_shell":
         value = inp.get("command", "")
     elif "file_path" in inp:
-        value = inp["file_path"]
+        value = _resolve_tool_path(inp["file_path"], context)
     else:
         return True
 
     pattern = rule["pattern"]
-    if pattern.endswith("*"):
+    prefix = pattern.endswith("*")
+    if tool_name != "run_shell":
+        # 规则里的相对路径同样以 context 根解析，例如 write_file(a.txt)
+        pattern = _resolve_tool_path(pattern[:-1] if prefix else pattern, context)
+        if prefix:
+            pattern += "*"
+    if prefix:
         return value.startswith(pattern[:-1])
     return value == pattern
 
 
-def _check_permission_rules(tool_name: str, inp: dict) -> str | None:
+def _check_permission_rules(
+    tool_name: str, inp: dict, *, context: "ProjectContext | None" = None
+) -> str | None:
     """根据 allow/deny 规则判断权限。deny 优先于 allow。"""
-    rules = load_permission_rules()
+    rules = load_permission_rules(context)
     for rule in rules["deny"]:
-        if _matches_rule(rule, tool_name, inp):
+        if _matches_rule(rule, tool_name, inp, context=context):
             return "deny"
     for rule in rules["allow"]:
-        if _matches_rule(rule, tool_name, inp):
+        if _matches_rule(rule, tool_name, inp, context=context):
             return "allow"
     return None
 
@@ -726,6 +776,8 @@ def check_permission(
     inp: dict,
     mode: str = "default",
     plan_file_path: str | None = None,
+    *,
+    context: "ProjectContext | None" = None,
 ) -> dict:
     """权限检查的主入口，按优先级顺序判断：
     1. bypassPermissions 模式 → 直接放行
@@ -739,8 +791,8 @@ def check_permission(
     if mode == "bypassPermissions":
         return {"action": "allow"}
 
-    # 声明式规则优先
-    rule_result = _check_permission_rules(tool_name, inp)
+    # 声明式规则优先（项目 settings 由 context 决定）
+    rule_result = _check_permission_rules(tool_name, inp, context=context)
     if rule_result == "deny":
         return {"action": "deny", "message": f"Denied by permission rule for {tool_name}"}
     if rule_result == "allow":
@@ -775,10 +827,14 @@ def check_permission(
     if tool_name == "run_shell" and is_dangerous(inp.get("command", "")):
         needs_confirm = True
         confirm_message = inp.get("command", "")
-    elif tool_name == "write_file" and not Path(inp.get("file_path", "")).exists():
+    elif tool_name == "write_file" and not Path(
+        _resolve_tool_path(inp.get("file_path", ""), context)
+    ).exists():
         needs_confirm = True
         confirm_message = f"write new file: {inp.get('file_path', '')}"
-    elif tool_name == "edit_file" and not Path(inp.get("file_path", "")).exists():
+    elif tool_name == "edit_file" and not Path(
+        _resolve_tool_path(inp.get("file_path", ""), context)
+    ).exists():
         needs_confirm = True
         confirm_message = f"edit non-existent file: {inp.get('file_path', '')}"
 
@@ -815,6 +871,8 @@ def commit_tool_state(
     inp: dict,
     result: Any,
     read_file_state: dict[str, float] | None,
+    *,
+    context: "ProjectContext | None" = None,
 ) -> None:
     """Commit先读后改状态 only after the caller accepts the result.
 
@@ -833,7 +891,7 @@ def commit_tool_state(
             return
     else:
         return
-    abs_path = str(Path(inp["file_path"]).resolve())
+    abs_path = _resolve_tool_path(inp["file_path"], context)
     try:
         read_file_state[abs_path] = os.path.getmtime(abs_path)
     except OSError:
@@ -841,7 +899,8 @@ def commit_tool_state(
 
 
 async def execute_tool_value(
-    name: str, inp: dict, read_file_state: dict[str, float] | None = None
+    name: str, inp: dict, read_file_state: dict[str, float] | None = None,
+    *, context: "ProjectContext | None" = None,
 ) -> Any:
     """Execute a tool and return its raw value to the durable boundary.
 
@@ -860,10 +919,10 @@ async def execute_tool_value(
     # ─── 先读后改 + mtime 新鲜度检查 ───────────────────────
     # 防止模型在未读取文件内容的情况下盲目编辑，以及外部并发修改导致的冲突
     if name == "read_file":
-        return _read_file(inp)
+        return _read_file(inp, context=context)
 
     if name in ("write_file", "edit_file") and read_file_state is not None:
-        abs_path = str(Path(inp["file_path"]).resolve())
+        abs_path = _resolve_tool_path(inp["file_path"], context)
         if os.path.exists(abs_path):
             if abs_path not in read_file_state:
                 verb = "writing" if name == "write_file" else "editing"
@@ -901,21 +960,38 @@ async def execute_tool_value(
     handler = handlers.get(name)
     if not handler:
         return f"Unknown tool: {name}"
+    if name in ("run_shell", "list_files", "grep_search", "read_file", "write_file", "edit_file"):
+        return handler(inp, context=context)
     return handler(inp)
 
 
 async def execute_tool(
-    name: str, inp: dict, read_file_state: dict[str, float] | None = None
+    name: str, inp: dict, read_file_state: dict[str, float] | None = None,
+    *, context: "ProjectContext | None" = None, mode: str = "default",
 ) -> str:
-    """Execute a tool through the public canonical JSON byte boundary."""
+    """Execute a tool through the public canonical JSON byte boundary.
 
-    value = await execute_tool_value(name, inp, read_file_state)
+    **权限在本边界内强制**：先做 `check_permission`，deny 直接返回错误、不进工具
+    实现；需要确认的调用在无交互端口时保守拒绝，而不是静默放行。这样公开执行
+    入口无法绕过策略（`agent.py` 走 `execute_tool_value` + 自己的权限分支，
+    语义不变）。
+    """
+
+    decision = check_permission(name, inp, mode, None, context=context)
+    if decision["action"] == "deny":
+        return f"Error: denied by permission policy: {decision.get('message', '')}"
+    if decision["action"] == "confirm":
+        return (
+            "Error: this call requires confirmation and the public execute_tool "
+            f"boundary has no interaction port: {decision.get('message', '')}"
+        )
+
+    value = await execute_tool_value(name, inp, read_file_state, context=context)
     result = public_tool_result(value, name)
-    commit_tool_state(name, inp, result, read_file_state)
+    commit_tool_state(name, inp, result, read_file_state, context=context)
     return result
 
 
 def reset_permission_cache() -> None:
     """重置权限规则缓存（通常在 settings.json 变更后调用）。"""
-    global _cached_rules
-    _cached_rules = None
+    _cached_rules.clear()

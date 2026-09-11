@@ -34,25 +34,22 @@ from .memory import (
     format_memories_for_injection,
     MemoryPrefetch,
 )
-from .ui import (
-    print_assistant_text,
-    print_tool_call,
-    print_tool_result,
-    print_error,
-    print_confirmation,
-    print_divider,
-    print_cost,
-    print_retry,
-    print_info,
-    print_sub_agent_start,
-    print_sub_agent_end,
-    start_spinner,
-    stop_spinner,
-)
 from .session import runtime_data_dir, runtime_store_path, save_session_v2
 from .prompt import build_system_prompt
 from .subagent import get_sub_agent_config
 from .mcp_client import McpManager
+from .interactions import (
+    DenyingInteractionPort,
+    InteractionError,
+    InteractionKind,
+    InteractionPort,
+    InteractionRegistry,
+    InteractionReply,
+    InteractionRequest,
+    digest_params,
+)
+from .project_context import ProjectContext
+from .runtime_ports import NullOutputPort, OutputEvent, OutputPort, emit_safely
 from .event_ids import IdentityFactory, RunContext
 from .event_sink import EventSink, RuntimeEventEmitter
 from .runtime_event import RuntimeEvent, canonical_json_bytes
@@ -116,7 +113,10 @@ async def _with_retry(fn, max_retries: int = 3, on_retry: Callable[[int, Excepti
             reason = f"HTTP {status}" if status else (getattr(error, "code", None) or "network error")
             if on_retry:
                 on_retry(attempt + 2, error)
-            print_retry(attempt + 1, max_retries, reason)
+            # 注意：重试事件的发布由调用方的 `on_retry` 负责；本函数是模块级
+            # 工具函数，没有 Agent 实例，不得在此引用 `self`（历史遗留会在
+            # 该分支触发 NameError，而该分支因 `_is_retryable` 的严格判定
+            # 在常规异常下不可达，属潜在崩溃点）。
             await asyncio.sleep(delay)
 
 
@@ -402,8 +402,26 @@ class Agent:
         artifact_archive: ArtifactArchive | None = None,
         archive_capability: ToolResultArchiveCapability | None = None,
         llm_capture_policy: LLMCapturePolicy | None = None,
+        project_context: ProjectContext | None = None,
+        output_port: OutputPort | None = None,
+        interaction_port: InteractionPort | None = None,
+        provider_client: Any | None = None,
     ):
         self.permission_mode = permission_mode
+        # 结构化输出端口：显式注入优先；缺省用 NullOutputPort（不写业务输出）。
+        # 本模块不隐式回退到终端渲染（design D1/D2）。
+        self.output_port: OutputPort = output_port if output_port is not None else NullOutputPort()
+        # 人工交互端口：显式注入优先；缺省保守拒绝（headless 不回退终端输入）。
+        self.interaction_port: InteractionPort = (
+            interaction_port if interaction_port is not None else DenyingInteractionPort()
+        )
+        self.interaction_registry = InteractionRegistry()
+        # 项目上下文：显式优先；缺省按构造点 cwd 一次性解析（D7 保留 CLI 默认语义）。
+        self.context = (
+            project_context
+            if project_context is not None
+            else ProjectContext.from_root(Path.cwd())
+        )
         self.thinking_effort = _normalize_thinking_effort(thinking_effort)
         # 保留旧版 thinking bool 参数：False 显式关闭；新的调用方应优先使用
         # thinking_effort，因此不让旧参数覆盖显式的 effort=none。
@@ -493,7 +511,7 @@ class Agent:
         self._read_file_state: dict[str, float] = {}
 
         # MCP 集成（主 Agent 首次聊天时惰性初始化）
-        self._mcp_manager = McpManager()
+        self._mcp_manager = McpManager(self.context)
         self._mcp_initialized = False
 
         # 记忆召回状态 — 每个用户轮次的语义预取
@@ -511,16 +529,22 @@ class Agent:
         self._openai_messages: list[dict] = []
 
         # Build system prompt
-        self._base_system_prompt = custom_system_prompt or build_system_prompt()
+        self._base_system_prompt = custom_system_prompt or build_system_prompt(self.context)
         if self.permission_mode == "plan":
             self._plan_file_path = self._generate_plan_file_path()
             self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
         else:
             self._system_prompt = self._base_system_prompt
 
-        # 初始化 API 客户端（Anthropic 或 OpenAI 兼容）
+        # 初始化 API 客户端（Anthropic 或 OpenAI 兼容）。provider_client 是
+        # 可选的显式构造注入点：生产入口仍按 api_base/api_key 创建 SDK，
+        # 本地消费者/测试可在 public Agent 构造点提供同一 SDK 接口的边界替身。
         if self.use_openai:
-            self._openai_client = openai.AsyncOpenAI(base_url=api_base, api_key=api_key)
+            self._openai_client = (
+                provider_client
+                if provider_client is not None
+                else openai.AsyncOpenAI(base_url=api_base, api_key=api_key)
+            )
             self._anthropic_client = None
             self._openai_messages.append({"role": "system", "content": self._system_prompt})
         else:
@@ -529,7 +553,11 @@ class Agent:
                 kwargs["api_key"] = api_key
             if anthropic_base_url:
                 kwargs["base_url"] = anthropic_base_url
-            self._anthropic_client = anthropic.AsyncAnthropic(**kwargs)
+            self._anthropic_client = (
+                provider_client
+                if provider_client is not None
+                else anthropic.AsyncAnthropic(**kwargs)
+            )
             self._openai_client = None
 
     def _resolve_thinking_mode(self) -> str:
@@ -837,7 +865,7 @@ class Agent:
             ),
         )
         if result.success:
-            commit_tool_state(name, inp, result.result, self._read_file_state)
+            commit_tool_state(name, inp, result.result, self._read_file_state, context=self.context)
         return result.result, result.success, result.executed
 
     def _emit_runtime_observation(self, event: str, payload: Any) -> None:
@@ -1078,6 +1106,11 @@ class Agent:
     def set_confirm_fn(self, fn: Callable[[str], Awaitable[bool]]) -> None:
         self.confirm_fn = fn
 
+    def set_interaction_port(self, port: InteractionPort) -> None:
+        """替换交互端口（入口注入终端适配器时使用）。"""
+
+        self.interaction_port = port
+
     def set_plan_approval_fn(self, fn: Callable[[str], Awaitable[dict]]) -> None:
         self._plan_approval_fn = fn
 
@@ -1094,7 +1127,7 @@ class Agent:
             self._system_prompt = self._base_system_prompt
             if self.use_openai and self._openai_messages:
                 self._openai_messages[0]["content"] = self._system_prompt
-            print_info(f"Exited plan mode → {self.permission_mode} mode")
+            self._out_info(f"Exited plan mode → {self.permission_mode} mode")
             return self.permission_mode
         # 进入plan模式
         else:
@@ -1104,7 +1137,7 @@ class Agent:
             self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
             if self.use_openai and self._openai_messages:
                 self._openai_messages[0]["content"] = self._system_prompt
-            print_info(f"Entered plan mode. Plan file: {self._plan_file_path}")
+            self._out_info(f"Entered plan mode. Plan file: {self._plan_file_path}")
             return "plan"
 
     def get_token_usage(self) -> dict:
@@ -1123,7 +1156,7 @@ class Agent:
                 if mcp_defs:
                     self.tools = self.tools + mcp_defs
             except Exception as e:
-                print(f"[mcp] Init failed: {e}", flush=True)
+                self._out_raw(f"[mcp] Init failed: {e}", flush=True)
 
         self._aborted = False
         self._ask_count += 1
@@ -1154,6 +1187,7 @@ class Agent:
         except Exception as error:
             primary_error = error
             try:
+                self._out_error(str(error))
                 await self._emit("chat_error", {"error": str(error)})
             except Exception as diagnostic_error:
                 canonical_failure = diagnostic_error
@@ -1171,7 +1205,7 @@ class Agent:
                     canonical_failure = canonical_failure or error
                     self._runtime_exit_status = "failed"
                     self._runtime_exit_reason = f"canonical partial flush failed: {error}"
-                    print(f"[runtime] partial flush failed: {error}", flush=True)
+                    self._out_raw(f"[runtime] partial flush failed: {error}", flush=True)
             if self._runtime_guard and not self._runtime_guard.is_terminal:
                 final_status = self._runtime_exit_status or (
                     "aborted" if self._aborted else "completed"
@@ -1185,7 +1219,7 @@ class Agent:
                     canonical_failure = canonical_failure or error
                     self._runtime_exit_status = "failed"
                     self._runtime_exit_reason = f"canonical terminal finalize failed: {error}"
-                    print(f"[runtime] terminal finalize failed: {error}", flush=True)
+                    self._out_raw(f"[runtime] terminal finalize failed: {error}", flush=True)
             if self._runtime_emitter:
                 try:
                     self._runtime_emitter.flush()
@@ -1193,7 +1227,7 @@ class Agent:
                     canonical_failure = canonical_failure or error
                     self._runtime_exit_status = "failed"
                     self._runtime_exit_reason = f"canonical flush failed: {error}"
-                    print(f"[runtime] flush failed: {error}", flush=True)
+                    self._out_raw(f"[runtime] flush failed: {error}", flush=True)
                 finally:
                     if self._runtime_store_owned:
                         try:
@@ -1221,7 +1255,7 @@ class Agent:
             raise primary_error
 
         if not self.is_sub_agent:
-            print_divider()
+            self._out_divider()
             if not snapshot_saved:
                 self._auto_save()
 
@@ -1333,7 +1367,118 @@ class Agent:
         if self._output_buffer is not None:
             self._output_buffer.append(text)
         else:
-            print_assistant_text(text)
+            self._out_assistant_text(text)
+
+    # ─── 输出端口（结构化观察接口）────────────────────────────
+
+    def _port_emit(self, kind: str, payload: dict[str, Any] | None = None, **ids: Any) -> None:
+        """把观察事件发布到输出端口。
+
+        端口是观察接口：canonical 事实仍由 emitter/store 承担；端口抛错由
+        `emit_safely` 隔离为诊断，不影响 run 终态。
+        """
+
+        event = OutputEvent(
+            kind=kind,
+            session_id=str(self.session_id),
+            run_id=str(self._runtime_run_id or self.session_id),
+            payload=dict(payload or {}),
+            attempt_id=ids.get("attempt_id"),
+            tool_call_id=ids.get("tool_call_id"),
+            stream=ids.get("stream"),
+        )
+        emit_safely(self.output_port, event)
+
+    def _out_assistant_text(self, text: str) -> None:
+        self._port_emit("assistant_text", {"text": text}, stream="assistant")
+
+    def _out_tool_call(self, name: str, inp: dict, tool_call_id: str | None = None) -> None:
+        self._port_emit(
+            "tool_call",
+            {"tool": name, "input": dict(inp or {})},
+            tool_call_id=tool_call_id,
+        )
+
+    def _out_tool_result(
+        self,
+        name: str,
+        result: str,
+        *args: Any,
+        tool_call_id: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        self._port_emit(
+            "tool_result", {"tool": name, "result": result}, tool_call_id=tool_call_id
+        )
+
+    def _out_tool_denied(self, tool: str, message: str, tool_call_id: str | None = None) -> None:
+        self._port_emit(
+            "tool_denied", {"tool": tool, "message": message}, tool_call_id=tool_call_id
+        )
+
+    def _out_confirmation(self, command: str) -> None:
+        self._port_emit("confirmation", {"command": command})
+
+    def _out_divider(self) -> None:
+        self._port_emit("divider")
+
+    def _out_cost(self, input_tokens: int, output_tokens: int) -> None:
+        self._port_emit("budget", {"input_tokens": input_tokens, "output_tokens": output_tokens})
+
+    def _out_retry(self, attempt: int, max_retries: int, reason: str) -> None:
+        self._port_emit(
+            "retry", {"attempt": attempt, "max_retries": max_retries, "reason": reason}
+        )
+
+    def _out_info(self, message: str) -> None:
+        self._port_emit("info", {"message": message})
+
+    def _out_error(self, message: str) -> None:
+        self._port_emit("error", {"message": message})
+
+    def _out_thinking(self, text: str) -> None:
+        self._port_emit("assistant_thinking", {"text": text}, stream="thinking")
+
+    def _out_lifecycle(self, phase: str, **extra: Any) -> None:
+        self._port_emit("lifecycle", {"phase": phase, **extra})
+
+    def _current_attempt_id(self) -> str | None:
+        """当前尝试身份（GAP-C02-18）：有 recorder 时取尝试号，否则 None。
+
+        `attempt_id` 只在存在真实尝试语义（重试记录器）时填充，不凭空编造。
+        """
+
+        recorder = self._runtime_recorder
+        attempt = getattr(recorder, "attempt", None) if recorder is not None else None
+        if attempt is None:
+            return None
+        return f"attempt-{attempt}"
+
+    def _out_sub_agent_start(self, agent_type: str, description: str) -> None:
+        self._port_emit(
+            "sub_agent_start", {"agent_type": agent_type, "description": description}
+        )
+
+    def _out_sub_agent_end(self, agent_type: str, description: str) -> None:
+        self._port_emit(
+            "sub_agent_end", {"agent_type": agent_type, "description": description}
+        )
+
+    def _out_start_spinner(self, label: str = "Thinking") -> None:
+        self._port_emit("spinner", {"active": True, "label": label})
+
+    def _out_stop_spinner(self) -> None:
+        self._port_emit("spinner", {"active": False})
+
+    def _out_raw(self, *args: Any, **kwargs: Any) -> None:
+        """诊断级别的原始输出（绕过端口家族）。
+
+        这些是后台/接线失败诊断（MCP 初始化、runtime 快照失败等），不属用户可见
+        的业务输出；发到诊断通道而不是终端，避免破坏"runtime 无终端依赖"。
+        """
+
+        message = " ".join(str(a) for a in args) if args else str(kwargs.get("sep", ""))
+        self._port_emit("diagnostic", {"message": message})
 
     # ─── REPL 命令 ───────────────────────────────────────────
 
@@ -1346,13 +1491,13 @@ class Agent:
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.last_input_token_count = 0
-        print_info("Conversation cleared.")
+        self._out_info("Conversation cleared.")
 
     def show_cost(self) -> None:
         total = self._get_current_cost_usd()
         budget_info = f" / ${self.max_cost_usd} budget" if self.max_cost_usd else ""
         turn_info = f" | Turns: {self.current_turns}/{self.max_turns}" if self.max_turns else ""
-        print_info(f"Tokens: {self.total_input_tokens} in / {self.total_output_tokens} out\n  Estimated cost: ${total:.4f}{budget_info}{turn_info}")
+        self._out_info(f"Tokens: {self.total_input_tokens} in / {self.total_output_tokens} out\n  Estimated cost: ${total:.4f}{budget_info}{turn_info}")
 
     def _get_current_cost_usd(self) -> float:
         return (self.total_input_tokens / 1_000_000) * 3 + (self.total_output_tokens / 1_000_000) * 15
@@ -1440,7 +1585,7 @@ class Agent:
                             ],
                         }
                     )
-        print_info(f"Canonical context restored ({self._get_message_count()} messages).")
+        self._out_info(f"Canonical context restored ({self._get_message_count()} messages).")
 
     def project_canonical_model_context(self, *, high_water: int | None = None):
         """Build a read-only replay from the active canonical store."""
@@ -1624,7 +1769,7 @@ class Agent:
 
     async def _check_and_compact(self) -> None:
         if self.last_input_token_count > self.effective_window * 0.85:
-            print_info("Context window filling up, compacting conversation...")
+            self._out_info("Context window filling up, compacting conversation...")
             await self._emit("compaction", {"tier": 4})
             await self._compact_conversation()
 
@@ -1638,7 +1783,7 @@ class Agent:
                 self._refresh_provider_context_from_canonical()
         else:
             return
-        print_info("Conversation compacted.")
+        self._out_info("Conversation compacted.")
 
     def _compaction_context_messages(self) -> list[dict[str, Any]]:
         """Return a complete, source-preserving neutral compaction tail."""
@@ -2216,7 +2361,7 @@ class Agent:
         # Route MCP tool calls to the MCP manager
         if self._mcp_manager.is_mcp_tool(name):
             return await self._mcp_manager.call_tool_value(name, inp)
-        return await execute_tool_value(name, inp, self._read_file_state)
+        return await execute_tool_value(name, inp, self._read_file_state, context=self.context)
 
     # ─── Skill 执行（支持 inline / fork 双模式）─────────────
     # inline: 返回解析后的 prompt，注入当前对话
@@ -2224,7 +2369,7 @@ class Agent:
 
     async def _execute_skill_tool(self, inp: dict) -> str:
         from .skills import execute_skill
-        result = execute_skill(inp.get("skill_name", ""), inp.get("args", ""))
+        result = execute_skill(inp.get("skill_name", ""), inp.get("args", ""), self.context)
         if not result:
             return f"Unknown skill: {inp.get('skill_name', '')}"
 
@@ -2240,7 +2385,7 @@ class Agent:
                 agent_type="skill-fork",
                 prompt=(inp.get("args") or ""),
             )
-            print_sub_agent_start("skill-fork", skill_name)
+            self._out_sub_agent_start("skill-fork", skill_name)
             child_run_id = f"run-{self.session_id}-skill-{skill_name}-{uuid.uuid4().hex[:8]}"
             child_session_id = (
                 self._runtime_context.session_id
@@ -2259,37 +2404,40 @@ class Agent:
                 if self._archive_capability is not None
                 else None
             )
-            sub_agent = Agent(
-                model=self.model,
-                api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
-                thinking_effort=self.thinking_effort,
-                custom_system_prompt=result["prompt"],
-                custom_tools=tools,
-                is_sub_agent=True,
-                permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
-                runtime_store=self._runtime_store,
-                runtime_sink=self._runtime_sink,
-                runtime_parent_run_id=child_parent_run_id,
-                runtime_run_id=child_run_id,
-                runtime_session_id=child_session_id,
-                runtime_context_id=self._identity_factory.new("context"),
-                runtime_parent_context_id=(
-                    self._runtime_context.context_id
-                    if self._runtime_context is not None
-                    else None
-                ),
-                artifact_archive=self._artifact_archive,
-                archive_capability=child_archive_capability,
-                llm_capture_policy=self._llm_capture_policy,
-            )
             try:
+                sub_agent = Agent(
+                    model=self.model,
+                    api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
+                    thinking_effort=self.thinking_effort,
+                    custom_system_prompt=result["prompt"],
+                    custom_tools=tools,
+                    is_sub_agent=True,
+                    permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
+                    runtime_store=self._runtime_store,
+                    runtime_sink=self._runtime_sink,
+                    runtime_parent_run_id=child_parent_run_id,
+                    runtime_run_id=child_run_id,
+                    runtime_session_id=child_session_id,
+                    runtime_context_id=self._identity_factory.new("context"),
+                    runtime_parent_context_id=(
+                        self._runtime_context.context_id
+                        if self._runtime_context is not None
+                        else None
+                    ),
+                    artifact_archive=self._artifact_archive,
+                    archive_capability=child_archive_capability,
+                    llm_capture_policy=self._llm_capture_policy,
+                    project_context=self.context,
+                    output_port=self.output_port,
+                    interaction_port=self.interaction_port,
+                )
                 sub_result = await sub_agent.run_once(inp.get("args") or "Execute this skill task.")
                 self.total_input_tokens += sub_result["tokens"]["input"]
                 self.total_output_tokens += sub_result["tokens"]["output"]
-                print_sub_agent_end("skill-fork", inp.get("skill_name", ""))
+                self._out_sub_agent_end("skill-fork", inp.get("skill_name", ""))
                 return sub_result["text"] or "(Skill produced no output)"
             except Exception as e:
-                print_sub_agent_end("skill-fork", inp.get("skill_name", ""))
+                self._out_sub_agent_end("skill-fork", inp.get("skill_name", ""))
                 return f"Skill fork error: {e}"
         # inline mode
         return f'[Skill "{inp.get("skill_name", "")}" activated]\n\n{result["prompt"]}'
@@ -2336,7 +2484,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             self._system_prompt = self._base_system_prompt + self._build_plan_mode_prompt()
             if self.use_openai and self._openai_messages:
                 self._openai_messages[0]["content"] = self._system_prompt
-            print_info("Entered plan mode (read-only). Plan file: " + self._plan_file_path)
+            self._out_info("Entered plan mode (read-only). Plan file: " + self._plan_file_path)
             return f"Entered plan mode. You are now in read-only mode.\n\nYour plan file: {self._plan_file_path}\nWrite your plan to this file. This is the only file you can edit.\n\nWhen your plan is complete, call exit_plan_mode."
 
         if name == "exit_plan_mode":
@@ -2379,7 +2527,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 if choice == "clear-and-execute":
                     self._clear_history_keep_system()
                     self._context_cleared = True
-                    print_info(f"Plan approved. Context cleared, executing in {target_mode} mode.")
+                    self._out_info(f"Plan approved. Context cleared, executing in {target_mode} mode.")
                     return (
                         f"User approved the plan. Context was cleared. Permission mode: {target_mode}\n\n"
                         f"Plan file: {saved_plan_path}\n\n"
@@ -2387,7 +2535,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         f"Proceed with implementation."
                     )
 
-                print_info(f"Plan approved. Executing in {target_mode} mode.")
+                self._out_info(f"Plan approved. Executing in {target_mode} mode.")
                 return (
                     f"User approved the plan. Permission mode: {target_mode}\n\n"
                     f"## Approved Plan:\n{plan_content}\n\n"
@@ -2401,7 +2549,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             self._system_prompt = self._base_system_prompt
             if self.use_openai and self._openai_messages:
                 self._openai_messages[0]["content"] = self._system_prompt
-            print_info("Exited plan mode. Restored to " + self.permission_mode + " mode.")
+            self._out_info("Exited plan mode. Restored to " + self.permission_mode + " mode.")
             return f"Exited plan mode. Permission mode restored to: {self.permission_mode}\n\n## Your Plan:\n{plan_content}"
 
         return f"Unknown plan mode tool: {name}"
@@ -2421,7 +2569,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
         description = inp.get("description", "sub-agent task")
         prompt = inp.get("prompt", "")
 
-        print_sub_agent_start(agent_type, description)
+        self._out_sub_agent_start(agent_type, description)
 
         self._record_sub_agent_event(
             name=description,
@@ -2429,7 +2577,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             prompt=prompt,
         )
 
-        config = get_sub_agent_config(agent_type)
+        config = get_sub_agent_config(agent_type, self.context)
         child_run_id = f"run-{self.session_id}-{agent_type}-{uuid.uuid4().hex[:8]}"
         child_session_id = (
             self._runtime_context.session_id
@@ -2448,38 +2596,40 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
             if self._archive_capability is not None
             else None
         )
-        sub_agent = Agent(
-            model=self.model,
-            api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
-            thinking_effort=self.thinking_effort,
-            custom_system_prompt=config["system_prompt"],
-            custom_tools=config["tools"],
-            is_sub_agent=True,
-            permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
-            runtime_store=self._runtime_store,
-            runtime_sink=self._runtime_sink,
-            runtime_parent_run_id=child_parent_run_id,
-            runtime_run_id=child_run_id,
-            runtime_session_id=child_session_id,
-            runtime_context_id=self._identity_factory.new("context"),
-            runtime_parent_context_id=(
-                self._runtime_context.context_id
-                if self._runtime_context is not None
-                else None
-            ),
-            artifact_archive=self._artifact_archive,
-            archive_capability=child_archive_capability,
-            llm_capture_policy=self._llm_capture_policy,
-        )
-
         try:
+            sub_agent = Agent(
+                model=self.model,
+                api_base=str(self._openai_client.base_url) if self.use_openai and self._openai_client else None,
+                thinking_effort=self.thinking_effort,
+                custom_system_prompt=config["system_prompt"],
+                custom_tools=config["tools"],
+                is_sub_agent=True,
+                permission_mode="plan" if self.permission_mode == "plan" else "bypassPermissions",
+                runtime_store=self._runtime_store,
+                runtime_sink=self._runtime_sink,
+                runtime_parent_run_id=child_parent_run_id,
+                runtime_run_id=child_run_id,
+                runtime_session_id=child_session_id,
+                runtime_context_id=self._identity_factory.new("context"),
+                runtime_parent_context_id=(
+                    self._runtime_context.context_id
+                    if self._runtime_context is not None
+                    else None
+                ),
+                artifact_archive=self._artifact_archive,
+                archive_capability=child_archive_capability,
+                llm_capture_policy=self._llm_capture_policy,
+                project_context=self.context,
+                output_port=self.output_port,
+                interaction_port=self.interaction_port,
+            )
             result = await sub_agent.run_once(prompt)
             self.total_input_tokens += result["tokens"]["input"]
             self.total_output_tokens += result["tokens"]["output"]
-            print_sub_agent_end(agent_type, description)
+            self._out_sub_agent_end(agent_type, description)
             return result["text"] or "(Sub-agent produced no output)"
         except Exception as e:
-            print_sub_agent_end(agent_type, description)
+            self._out_sub_agent_end(agent_type, description)
             return f"Sub-agent error: {e}"
 
     # ─── Anthropic 后端 ─────────────────────────────────────
@@ -2496,6 +2646,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 memory_prefetch = start_memory_prefetch(
                     user_message, sq,
                     self._already_surfaced_memories, self._session_memory_bytes,
+                    self.context,
                 )
 
         while True:
@@ -2530,7 +2681,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 memory_prefetch.consumed = True
 
             if not self.is_sub_agent:
-                start_spinner()
+                self._out_start_spinner()
 
             api_start = time.time()
             self._start_runtime_model_call(request_id, "anthropic", {"messages": self._anthropic_messages})
@@ -2541,7 +2692,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 raise
 
             if not self.is_sub_agent:
-                stop_spinner()
+                self._out_stop_spinner()
 
             self.last_api_call_time = time.time()
             self.total_input_tokens += response.usage.input_tokens
@@ -2636,13 +2787,19 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
 
             if not tool_uses:
                 if not self.is_sub_agent:
-                    print_cost(self.total_input_tokens, self.total_output_tokens)
+                    self._out_cost(self.total_input_tokens, self.total_output_tokens)
+                self._out_lifecycle(
+                    "turn_complete",
+                    turns=self.current_turns,
+                    attempt_id=self._current_attempt_id(),
+                )
                 break
 
             self.current_turns += 1
             budget = self._check_budget()
             if budget["exceeded"]:
-                print_info(f"Budget exceeded: {budget['reason']}")
+                self._out_info(f"Budget exceeded: {budget['reason']}")
+                self._out_error(f"Budget exceeded: {budget['reason']}")
                 self._record_budget_exceeded(budget["reason"])
                 break
 
@@ -2653,12 +2810,16 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 if context_break or self._aborted:
                     break
                 inp = dict(tu.input) if hasattr(tu.input, 'items') else tu.input
-                print_tool_call(tu.name, inp)
+                self._out_tool_call(tu.name, inp, getattr(tu, "id", None))
 
                 # 非提前启动工具的权限检查
-                perm = check_permission(tu.name, inp, self.permission_mode, self._plan_file_path)
+                perm = check_permission(
+                    tu.name, inp, self.permission_mode, self._plan_file_path,
+                    context=self.context,
+                )
                 if perm["action"] == "deny":
-                    print_info(f"Denied: {perm.get('message', '')}")
+                    self._out_info(f"Denied: {perm.get('message', '')}")
+                    self._out_tool_denied(tu.name, perm.get("message", ""), getattr(tu, "id", None))
                     raw, success, executed = await self._run_durable_tool(
                         request_id=request_id, call_id=tu.id, name=tu.name, inp=inp,
                         permission={"decision": "deny", "reason": perm.get("message", "")},
@@ -2669,9 +2830,31 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self._confirmed_paths:
                     confirmed = await self._confirm_dangerous(perm["message"])
                     if not confirmed:
+                        self._out_tool_denied(
+                            tu.name, perm.get("message", ""), getattr(tu, "id", None)
+                        )
                         raw, success, executed = await self._run_durable_tool(
                             request_id=request_id, call_id=tu.id, name=tu.name, inp=inp,
                             permission={"decision": "deny", "reason": perm["message"]},
+                        )
+                        res = materialize_tool_result(raw, provider="anthropic")
+                        tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
+                        continue
+                    current_perm = check_permission(
+                        tu.name, inp, self.permission_mode, self._plan_file_path,
+                        context=self.context,
+                    )
+                    if current_perm["action"] == "deny":
+                        self._out_info(f"Denied: {current_perm.get('message', '')}")
+                        self._out_tool_denied(
+                            tu.name, current_perm.get("message", ""), getattr(tu, "id", None)
+                        )
+                        raw, success, executed = await self._run_durable_tool(
+                            request_id=request_id, call_id=tu.id, name=tu.name, inp=inp,
+                            permission={
+                                "decision": "deny",
+                                "reason": current_perm.get("message", ""),
+                            },
                         )
                         res = materialize_tool_result(raw, provider="anthropic")
                         tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": res})
@@ -2692,9 +2875,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     "result_length": len(materialized_content_bytes(res)) if res else 0,
                     "success": success,
                 })
-                print_tool_result(
+                self._out_tool_result(
                     tu.name,
                     self._display_tool_result(raw, provider="anthropic"),
+                    tool_call_id=getattr(tu, "id", None),
                 )
 
                 # Plan Mode 'clear-and-execute' 后：直接追加工具结果并跳出
@@ -2816,7 +3000,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                                 block_index=getattr(event, "index", -1),
                             )
                             if first_text:
-                                stop_spinner()
+                                self._out_stop_spinner()
                                 self._emit_text("\n")
                                 first_text = False
                                 # ★ 发射 first_token 事件
@@ -2832,11 +3016,12 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                                 block_index=getattr(event, "index", -1),
                             )
                             if first_thinking:
-                                stop_spinner()
+                                self._out_stop_spinner()
                                 self._emit_text("\n")
                                 first_thinking = False
                                 # ★ 发射 first_token 事件
                                 await self._emit("first_token", {"is_thinking": True})
+                            self._out_thinking(thinking)
                             self._emit_text(thinking)
                             if self._runtime_recorder:
                                 self._runtime_recorder.partial_text(thinking, kind="thinking")
@@ -2887,6 +3072,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 memory_prefetch = start_memory_prefetch(
                     user_message, sq,
                     self._already_surfaced_memories, self._session_memory_bytes,
+                    self.context,
                 )
 
         while True:
@@ -2921,7 +3107,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 memory_prefetch.consumed = True
 
             if not self.is_sub_agent:
-                start_spinner()
+                self._out_start_spinner()
 
             api_start = time.time()
             self._start_runtime_model_call(request_id, "openai", {"messages": self._openai_messages})
@@ -2935,7 +3121,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 raise
 
             if not self.is_sub_agent:
-                stop_spinner()
+                self._out_stop_spinner()
 
             self.last_api_call_time = time.time()
 
@@ -3027,13 +3213,19 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 )
             if not tool_calls:
                 if not self.is_sub_agent:
-                    print_cost(self.total_input_tokens, self.total_output_tokens)
+                    self._out_cost(self.total_input_tokens, self.total_output_tokens)
+                self._out_lifecycle(
+                    "turn_complete",
+                    turns=self.current_turns,
+                    attempt_id=self._current_attempt_id(),
+                )
                 break
 
             self.current_turns += 1
             budget = self._check_budget()
             if budget["exceeded"]:
-                print_info(f"Budget exceeded: {budget['reason']}")
+                self._out_info(f"Budget exceeded: {budget['reason']}")
+                self._out_error(f"Budget exceeded: {budget['reason']}")
                 self._record_budget_exceeded(budget["reason"])
                 break
 
@@ -3045,17 +3237,22 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 if tc.get("type") != "function":
                     continue
                 fn_name = tc["function"]["name"]
+                fn_id = tc.get("id")
                 raw_arguments = tc["function"].get("arguments", "")
                 try:
                     inp = json.loads(raw_arguments)
                 except Exception:
                     inp = {}
 
-                print_tool_call(fn_name, inp)
+                self._out_tool_call(fn_name, inp, fn_id)
 
-                perm = check_permission(fn_name, inp, self.permission_mode, self._plan_file_path)
+                perm = check_permission(
+                    fn_name, inp, self.permission_mode, self._plan_file_path,
+                    context=self.context,
+                )
                 if perm["action"] == "deny":
-                    print_info(f"Denied: {perm.get('message', '')}")
+                    self._out_info(f"Denied: {perm.get('message', '')}")
+                    self._out_tool_denied(fn_name, perm.get("message", ""), tc.get("id"))
                     oai_checked.append({
                         "tc": tc, "fn": fn_name, "inp": inp, "allowed": False,
                         "arguments_raw": raw_arguments, "decision": "deny", "reason": perm.get("message", ""),
@@ -3064,9 +3261,25 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                 if perm["action"] == "confirm" and perm.get("message") and perm["message"] not in self._confirmed_paths:
                     confirmed = await self._confirm_dangerous(perm["message"])
                     if not confirmed:
+                        self._out_tool_denied(fn_name, perm["message"], tc.get("id"))
                         oai_checked.append({
                             "tc": tc, "fn": fn_name, "inp": inp, "allowed": False,
                             "arguments_raw": raw_arguments, "decision": "deny", "reason": perm["message"],
+                        })
+                        continue
+                    current_perm = check_permission(
+                        fn_name, inp, self.permission_mode, self._plan_file_path,
+                        context=self.context,
+                    )
+                    if current_perm["action"] == "deny":
+                        self._out_info(f"Denied: {current_perm.get('message', '')}")
+                        self._out_tool_denied(
+                            fn_name, current_perm.get("message", ""), tc.get("id")
+                        )
+                        oai_checked.append({
+                            "tc": tc, "fn": fn_name, "inp": inp, "allowed": False,
+                            "arguments_raw": raw_arguments, "decision": "deny",
+                            "reason": current_perm.get("message", ""),
                         })
                         continue
                     self._confirmed_paths.add(perm["message"])
@@ -3113,9 +3326,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                             "result_length": len(materialized_content_bytes(res)) if res else 0,
                             "success": success,
                         })
-                        print_tool_result(
+                        self._out_tool_result(
                             ct_item["fn"],
                             self._display_tool_result(raw, provider="openai"),
+                            tool_call_id=ct_item.get("tc", {}).get("id"),
                         )
                         self._openai_messages.append({"role": "tool", "tool_call_id": ct_item["tc"]["id"], "content": res})
                 else:
@@ -3143,9 +3357,10 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         )
                         tool_duration = int((time.time() - t0) * 1000)
                         res = materialize_tool_result(raw, provider="openai")
-                        print_tool_result(
+                        self._out_tool_result(
                             ct["fn"],
                             self._display_tool_result(raw, provider="openai"),
+                            tool_call_id=ct["tc"].get("id"),
                         )
                         await self._emit("tool_end", {
                             "tool_name": ct["fn"],
@@ -3223,6 +3438,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                     if not reasoning_content:
                         self._emit_text("\n")
                         await self._emit("first_token", {"is_thinking": True})
+                    self._out_thinking(rc)
                     self._emit_text(rc)
                     if self._runtime_recorder:
                         self._runtime_recorder.partial_text(rc, kind="thinking")
@@ -3236,7 +3452,7 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
                         block_index=0,
                     )
                     if first_text:
-                        stop_spinner()
+                        self._out_stop_spinner()
                         self._emit_text("\n")
                         first_text = False
                         await self._emit("first_token", {"is_thinking": False})
@@ -3313,13 +3529,74 @@ IMPORTANT: When your plan is complete, you MUST call exit_plan_mode. Do NOT ask 
     # ─── 共享方法 ────────────────────────────────────────────
 
     async def _confirm_dangerous(self, command: str) -> bool:
-        """危险操作确认：调用 confirm_fn 或 fallback 到阻塞式 input。"""
-        print_confirmation(command)
+        """危险操作确认：经交互端口请求批准。
+
+        顺序（design D1/D5）：
+        1. 显式注入的 `confirm_fn`（既有兼容入口，仍可用）；
+        2. 交互端口（默认 `DenyingInteractionPort`，headless 下保守拒绝）；
+        3. runtime 内**不再**回退到终端 `input`（spec interactive-requests）。
+        """
+
+        self._out_confirmation(command)
         if self.confirm_fn:
-            return await self.confirm_fn(command)
-        # Fallback: blocking input
+            # 兼容入口：`confirm_fn` 仍可用，但**结果必须落定到交互注册表**，
+            # 使"批准"与"端口/一次性授权"语义一致（GAP-C02-19：此前它会绕过
+            # 注册表，导致取消/幂等/失效判定对该路径全部失效）。
+            approved = await self.confirm_fn(command)
+            request = InteractionRequest(
+                request_id=f"approval-{self.session_id}-legacy-{uuid.uuid4().hex[:8]}",
+                kind=InteractionKind.APPROVAL,
+                session_id=str(self.session_id),
+                run_id=str(self._runtime_run_id or self.session_id),
+                params_digest=digest_params({"command": command}),
+                prompt=command,
+            )
+            self.interaction_registry.open(request)
+            self.interaction_registry.resolve(
+                InteractionReply(
+                    request_id=request.request_id,
+                    approved=bool(approved),
+                    params_digest=request.params_digest,
+                    source="confirm_fn",
+                )
+            )
+            return bool(approved)
+
+        request = InteractionRequest(
+            request_id=f"approval-{self.session_id}-{uuid.uuid4().hex[:8]}",
+            kind=InteractionKind.APPROVAL,
+            session_id=str(self.session_id),
+            run_id=str(self._runtime_run_id or self.session_id),
+            params_digest=digest_params({"command": command}),
+            prompt=command,
+        )
+        self.interaction_registry.open(request)
         try:
-            answer = input("  Allow? (y/n): ")
-            return answer.lower().startswith("y")
-        except EOFError:
+            reply = await self.interaction_port.request(request)
+        except asyncio.CancelledError:
+            # 等待期间被取消：请求转 cancelled，且不授权执行。
+            try:
+                self.interaction_registry.cancel(request.request_id)
+            except InteractionError:
+                pass
+            raise
+        try:
+            resolved = self.interaction_registry.resolve(reply)
+        except InteractionError:
+            # 过期/冲突/参数不匹配一律不授权（spec interactive-requests）。
             return False
+        return bool(resolved.approved)
+
+    def cancel_pending_interactions(self) -> list[str]:
+        """取消所有等待中的人工交互（run 取消 / UI 断连入口）。
+
+        两步：①把 pending 请求转 `cancelled`；②通知端口解除**实际等待**（若端口
+        支持 `cancel_pending()`，例如可取消的终端读取），使等待方不会永远挂着。
+        返回被取消的 request_id 列表。
+        """
+
+        cancelled = self.interaction_registry.cancel_all()
+        notifier = getattr(self.interaction_port, "cancel_pending", None)
+        if callable(notifier):
+            notifier()
+        return cancelled

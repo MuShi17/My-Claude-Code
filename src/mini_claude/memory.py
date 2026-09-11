@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import re
 import time
@@ -13,6 +12,8 @@ from pathlib import Path
 from typing import Any
 
 from .frontmatter import parse_frontmatter, format_frontmatter
+from .project_context import ProjectContext
+from .runtime_ports import emit_diagnostic
 
 # 可调用对象：发送提示词并返回模型文本响应。
 # 签名：async (system: str, user_message: str) -> str
@@ -41,21 +42,22 @@ class MemoryEntry:
 # ─── 路径 ──────────────────────────────────────────────────
 
 
-def _project_hash() -> str:
-    """基于当前工作目录生成项目哈希（用于隔离不同项目的内存）。"""
-    return hashlib.sha256(str(Path.cwd()).encode()).hexdigest()[:16]
+def get_memory_dir(context: ProjectContext | None = None) -> Path:
+    """获取本 workspace 的 memory 目录路径，如果不存在则创建。
 
+    context 由消费方显式传入；缺省时按调用点 cwd 一次性构造（不缓存、不共享）。
+    """
 
-def get_memory_dir() -> Path:
-    """获取当前项目的内存目录路径，如果不存在则创建。"""
-    d = Path.home() / ".mini-claude" / "projects" / _project_hash() / "memory"
+    if context is None:
+        context = ProjectContext.from_root(Path.cwd())
+    d = context.resolve_memory_dir()
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
-def _get_index_path() -> Path:
+def _get_index_path(context: ProjectContext | None = None) -> Path:
     """获取 MEMORY.md 索引文件的路径。"""
-    return get_memory_dir() / "MEMORY.md"
+    return get_memory_dir(context) / "MEMORY.md"
 
 
 # ─── Slugify ────────────────────────────────────────────────
@@ -71,9 +73,9 @@ def _slugify(text: str) -> str:
 # ─── CRUD ───────────────────────────────────────────────────
 
 
-def list_memories() -> list[MemoryEntry]:
+def list_memories(context: ProjectContext | None = None) -> list[MemoryEntry]:
     """列出所有内存条目，按修改时间倒序排列。"""
-    d = get_memory_dir()
+    d = get_memory_dir(context)
     entries: list[MemoryEntry] = []
     for f in sorted(d.glob("*.md")):
         if f.name == "MEMORY.md":
@@ -98,41 +100,43 @@ def list_memories() -> list[MemoryEntry]:
     return entries
 
 
-def save_memory(name: str, description: str, type: str, content: str) -> str:
+def save_memory(
+    name: str, description: str, type: str, content: str, context: ProjectContext | None = None
+) -> str:
     """保存一条内存，自动更新索引文件。"""
-    d = get_memory_dir()
+    d = get_memory_dir(context)
     filename = f"{type}_{_slugify(name)}.md"
     text = format_frontmatter({"name": name, "description": description, "type": type}, content)
     (d / filename).write_text(text)
-    _update_memory_index()
+    _update_memory_index(context)
     return filename
 
 
-def delete_memory(filename: str) -> bool:
+def delete_memory(filename: str, context: ProjectContext | None = None) -> bool:
     """删除指定内存文件，自动更新索引文件。"""
-    filepath = get_memory_dir() / filename
+    filepath = get_memory_dir(context) / filename
     if not filepath.exists():
         return False
     filepath.unlink()
-    _update_memory_index()
+    _update_memory_index(context)
     return True
 
 
 # ─── 索引 ──────────────────────────────────────────────────
 
 
-def _update_memory_index() -> None:
+def _update_memory_index(context: ProjectContext | None = None) -> None:
     """根据当前所有内存文件更新 MEMORY.md 索引。"""
-    memories = list_memories()
+    memories = list_memories(context)
     lines = ["# Memory Index", ""]
     for m in memories:
         lines.append(f"- **[{m.name}]({m.filename})** ({m.type}) — {m.description}")
-    _get_index_path().write_text("\n".join(lines))
+    _get_index_path(context).write_text("\n".join(lines))
 
 
-def load_memory_index() -> str:
+def load_memory_index(context: ProjectContext | None = None) -> str:
     """加载内存索引内容，如果过大则截断。"""
-    index_path = _get_index_path()
+    index_path = _get_index_path(context)
     if not index_path.exists():
         return ""
     content = index_path.read_text(encoding="utf-8")
@@ -164,9 +168,9 @@ MAX_MEMORY_BYTES_PER_FILE = 4096
 MAX_SESSION_MEMORY_BYTES = 60 * 1024  # 每个会话累积最多 60KB
 
 
-def scan_memory_headers() -> list[MemoryHeader]:
+def scan_memory_headers(context: ProjectContext | None = None) -> list[MemoryHeader]:
     """扫描内存目录 — 只读取 frontmatter（前 30 行）以提高速度。"""
-    d = get_memory_dir()
+    d = get_memory_dir(context)
     headers: list[MemoryHeader] = []
     for f in d.glob("*.md"):
         if f.name == "MEMORY.md":
@@ -250,9 +254,10 @@ async def select_relevant_memories(
     query: str,
     side_query: SideQueryFn,
     already_surfaced: set[str],
+    context: ProjectContext | None = None,
 ) -> list[RelevantMemory]:
     """调用模型进行语义选择相关记忆。"""
-    headers = scan_memory_headers()
+    headers = scan_memory_headers(context)
     if not headers:
         return []
 
@@ -296,7 +301,7 @@ async def select_relevant_memories(
     except Exception as e:
         if "cancel" in str(e).lower():
             return []
-        print(f"[memory] semantic recall failed: {e}")
+        emit_diagnostic(f"[memory] semantic recall failed: {e}")
         return []
 
 
@@ -319,6 +324,7 @@ def start_memory_prefetch(
     side_query: SideQueryFn,
     already_surfaced: set[str],
     session_memory_bytes: int,
+    context: ProjectContext | None = None,
 ) -> MemoryPrefetch | None:
     """启动异步内存预取。返回用于轮询结果的句柄。"""
     # 门槛：仅限多词输入
@@ -330,13 +336,13 @@ def start_memory_prefetch(
         return None
 
     # 门槛：记忆文件必须存在
-    d = get_memory_dir()
+    d = get_memory_dir(context)
     has_memories = any(f.suffix == ".md" and f.name != "MEMORY.md" for f in d.iterdir())
     if not has_memories:
         return None
 
     task = asyncio.create_task(
-        select_relevant_memories(query, side_query, already_surfaced)
+        select_relevant_memories(query, side_query, already_surfaced, context)
     )
     return MemoryPrefetch(task)
 
@@ -352,10 +358,10 @@ def format_memories_for_injection(memories: list[RelevantMemory]) -> str:
 # ─── 系统提示词部分 ──────────────────────────────────
 
 
-def build_memory_prompt_section() -> str:
+def build_memory_prompt_section(context: ProjectContext | None = None) -> str:
     """构建系统提示中关于内存系统的说明部分。"""
-    index = load_memory_index()
-    memory_dir = str(get_memory_dir())
+    index = load_memory_index(context)
+    memory_dir = str(get_memory_dir(context))
 
     return f"""# Memory System
 

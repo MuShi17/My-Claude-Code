@@ -17,6 +17,8 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from .project_context import ProjectContext
+from .runtime_ports import emit_diagnostic
 from .tool_result import public_tool_result
 
 
@@ -27,18 +29,19 @@ class McpConnection:
     """管理单个 MCP 服务器进程和 JSON-RPC 通信。"""
 
     def __init__(self, server_name: str, command: str, args: list[str] | None = None,
-                 env: dict[str, str] | None = None):
+                 env: dict[str, str] | None = None, cwd: str | None = None):
         self.server_name = server_name
         self.command = command
         self.args = args or []
         self.env = env or {}
+        self.cwd = cwd
         self._process: asyncio.subprocess.Process | None = None
         self._next_id = 1
         self._pending: dict[int, asyncio.Future] = {}
         self._reader_task: asyncio.Task | None = None
 
     async def connect(self) -> None:
-        """启动服务器进程。"""
+        """启动服务器进程（显式使用 ProjectContext 的 cwd）。"""
         merged_env = {**os.environ, **self.env}
         self._process = await asyncio.create_subprocess_exec(
             self.command, *self.args,
@@ -46,6 +49,7 @@ class McpConnection:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=merged_env,
+            cwd=self.cwd,
         )
         # 在后台启动读取 stdout 的任务
         self._reader_task = asyncio.create_task(self._read_loop())
@@ -155,10 +159,16 @@ class McpManager:
     """管理所有 MCP 服务器连接。调用 load_and_connect() 一次，
     然后使用 get_tool_definitions() 和 call_tool() 与 agent 集成。"""
 
-    def __init__(self):
+    def __init__(self, context: "ProjectContext | None" = None):
         self._connections: dict[str, McpConnection] = {}
         self._tools: list[dict] = []
         self._connected = False
+        self._context = context
+
+    def _resolve_context(self) -> "ProjectContext":
+        if self._context is not None:
+            return self._context
+        return ProjectContext.from_root(Path.cwd())
 
     async def load_and_connect(self) -> None:
         """读取配置，连接所有配置的 MCP 服务器，发现工具。"""
@@ -166,6 +176,7 @@ class McpManager:
             return
         self._connected = True
 
+        context = self._resolve_context()
         configs = self._load_configs()
         if not configs:
             return
@@ -178,6 +189,7 @@ class McpManager:
                 cfg["command"],
                 cfg.get("args"),
                 cfg.get("env"),
+                cwd=str(context.tool_cwd),
             )
             try:
                 await conn.connect()
@@ -185,9 +197,9 @@ class McpManager:
                 server_tools = await asyncio.wait_for(conn.list_tools(), timeout=timeout)
                 self._connections[name] = conn
                 self._tools.extend(server_tools)
-                print(f"[mcp] Connected to '{name}' — {len(server_tools)} tools", flush=True)
+                emit_diagnostic(f"[mcp] Connected to '{name}' — {len(server_tools)} tools")
             except Exception as e:
-                print(f"[mcp] Failed to connect to '{name}': {e}", flush=True)
+                emit_diagnostic(f"[mcp] Failed to connect to '{name}': {e}")
                 conn.close()
 
     def get_tool_definitions(self) -> list[dict]:
@@ -242,18 +254,17 @@ class McpManager:
 
     def _load_configs(self) -> dict[str, dict]:
         merged: dict[str, dict] = {}
+        context = self._resolve_context()
 
         # 1. 全局配置：~/.claude/settings.json
         global_path = Path.home() / ".claude" / "settings.json"
         self._merge_config_file(global_path, merged)
 
-        # 2. 项目配置：.claude/settings.json（当前工作目录）
-        project_path = Path.cwd() / ".claude" / "settings.json"
-        self._merge_config_file(project_path, merged)
+        # 2. 项目配置：由 ProjectContext 决定的 .claude/settings.json
+        self._merge_config_file(context.settings_path, merged)
 
         # 3. 同时检查 .mcp.json（Claude Code 约定）
-        mcp_json_path = Path.cwd() / ".mcp.json"
-        self._merge_config_file(mcp_json_path, merged)
+        self._merge_config_file(context.mcp_config_path, merged)
 
         return merged
 

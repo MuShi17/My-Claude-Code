@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .frontmatter import parse_frontmatter
+from .project_context import ProjectContext
 
 # ─── Types ──────────────────────────────────────────────────
 
@@ -27,13 +28,22 @@ class SkillDefinition:
 
 # ─── Discovery ──────────────────────────────────────────────
 
-_cached_skills: list[SkillDefinition] | None = None
+_cached_skills: dict[str, list[SkillDefinition]] = {}
 
 
-def discover_skills() -> list[SkillDefinition]:
-    global _cached_skills
-    if _cached_skills is not None:
-        return _cached_skills
+def _resolve_context(context: "ProjectContext | None") -> "ProjectContext":
+    """解析消费方 context：显式优先，缺省按调用点 cwd 一次性构造（不缓存、不共享）。"""
+
+    if context is not None:
+        return context
+    return ProjectContext.from_root(Path.cwd())
+
+
+def discover_skills(context: "ProjectContext | None" = None) -> list[SkillDefinition]:
+    resolved = _resolve_context(context)
+    cached = _cached_skills.get(resolved.workspace_id)
+    if cached is not None:
+        return cached
 
     skills: dict[str, SkillDefinition] = {}
 
@@ -46,11 +56,11 @@ def discover_skills() -> list[SkillDefinition]:
     # _load_skills_from_dir(plugins_dir, "user", skills)
 
     # Project-level skills (higher priority, overwrites)
-    project_dir = Path.cwd() / ".claude" / "skills"
+    project_dir = resolved.skills_dir
     _load_skills_from_dir(project_dir, "project", skills)
 
-    _cached_skills = list(skills.values())
-    return _cached_skills
+    _cached_skills[resolved.workspace_id] = list(skills.values())
+    return _cached_skills[resolved.workspace_id]
 
 
 def _load_skills_from_dir(
@@ -108,8 +118,8 @@ def _parse_skill_file(
 # ─── Resolution ─────────────────────────────────────────────
 
 
-def get_skill_by_name(name: str) -> SkillDefinition | None:
-    for s in discover_skills():
+def get_skill_by_name(name: str, context: ProjectContext | None = None) -> SkillDefinition | None:
+    for s in discover_skills(context):
         if s.name == name:
             return s
     return None
@@ -124,9 +134,9 @@ def resolve_skill_prompt(skill: SkillDefinition, args: str) -> str:
 
 
 def execute_skill(
-    skill_name: str, args: str
+    skill_name: str, args: str, context: ProjectContext | None = None
 ) -> dict | None:
-    skill = get_skill_by_name(skill_name)
+    skill = get_skill_by_name(skill_name, context)
     if not skill:
         return None
     return {
@@ -139,8 +149,8 @@ def execute_skill(
 # ─── System prompt section ──────────────────────────────────
 
 
-def build_skill_descriptions() -> str:
-    skills = discover_skills()
+def build_skill_descriptions(context: ProjectContext | None = None) -> str:
+    skills = discover_skills(context)
     if not skills:
         return ""
 
@@ -169,5 +179,4 @@ def build_skill_descriptions() -> str:
 
 
 def reset_skill_cache() -> None:
-    global _cached_skills
-    _cached_skills = None
+    _cached_skills.clear()

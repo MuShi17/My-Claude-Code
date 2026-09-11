@@ -31,8 +31,11 @@ from mini_claude.artifact_archive import ArtifactArchive
 from mini_claude.runtime_event import canonical_json_bytes
 from mini_claude.runtime_lifecycle import DurableToolBoundary
 from mini_claude.runtime_store import SQLiteRuntimeStore
+from mini_claude.project_context import ProjectContext
 from mini_claude.tool_result import MAX_TOOL_RESULT_BYTES
 from mini_claude.projections.provider_context import ProviderCapacityError
+from mini_claude.interactions import DenyingInteractionPort
+from mini_claude.runtime_ports import RecordingOutputPort, payload_is_safe
 
 
 LARGE_CONTENT = "内容🙂\n" * 4_500
@@ -356,13 +359,16 @@ def _provider_client(
     *,
     response_text: str = "ack",
     response_body: bytes | None = None,
+    response_status: int = 200,
 ):
+    content_type = "text/event-stream" if response_status == 200 else "application/json"
+
     if provider == "anthropic":
         def handler(request: Any):
             captured.append(json.loads(request.content))
             return anthropic_httpx.Response(
-                200,
-                headers={"content-type": "text/event-stream"},
+                response_status,
+                headers={"content-type": content_type},
                 content=response_body or _anthropic_stream_body(response_text),
             )
 
@@ -377,8 +383,8 @@ def _provider_client(
     def handler(request: httpx.Request) -> httpx.Response:
         captured.append(json.loads(request.content))
         return httpx.Response(
-            200,
-            headers={"content-type": "text/event-stream"},
+            response_status,
+            headers={"content-type": content_type},
             content=response_body or _openai_stream_body(response_text),
         )
 
@@ -393,13 +399,14 @@ def _agent_chat_provider_client(
     provider: str,
     captured: list[dict[str, Any]],
     tool_arguments: str,
+    tool_name: str = "read_file",
 ):
     if provider == "anthropic":
         def handler(request: Any):
             captured.append(json.loads(request.content))
             if len(captured) == 1:
                 body = _anthropic_stream_body_with_tool(
-                    "read_file", tool_arguments
+                    tool_name, tool_arguments
                 )
             else:
                 body = _anthropic_stream_body("done")
@@ -420,7 +427,7 @@ def _agent_chat_provider_client(
     def handler(request: httpx.Request) -> httpx.Response:
         captured.append(json.loads(request.content))
         if len(captured) == 1:
-            body = _openai_stream_body_with_tool("read_file", tool_arguments)
+            body = _openai_stream_body_with_tool(tool_name, tool_arguments)
         else:
             body = _openai_stream_body("done")
         return httpx.Response(
@@ -595,6 +602,344 @@ def test_actual_agent_sdk_thinking_stream_uses_isolated_partial_kind(
             await agent.aclose()
             await client.close()
             store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_public_agent_chat_emits_provider_events_through_output_port(
+    tmp_path: Path, provider: str
+) -> None:
+    """C02：本地 SDK 边界替身驱动完整 `Agent.chat()` 输出事件链。"""
+
+    async def scenario() -> None:
+        store = SQLiteRuntimeStore(tmp_path / f"{provider}-output.sqlite")
+        port = RecordingOutputPort()
+        model = "claude-sonnet-4-6" if provider == "anthropic" else "fixture-model"
+        captured: list[dict[str, Any]] = []
+        body = (
+            _anthropic_stream_body_with_thinking(thinking="reasoning", text="answer")
+            if provider == "anthropic"
+            else _openai_stream_body_with_reasoning(reasoning="reasoning", text="answer")
+        )
+        client = _provider_client(provider, captured, response_body=body)
+        agent = Agent(
+            api_base="https://fixture.invalid/v1" if provider == "openai" else None,
+            api_key="fixture-key",
+            model=model,
+            thinking_effort="low" if provider == "anthropic" else "none",
+            custom_system_prompt="fixture system",
+            runtime_store=store,
+            output_port=port,
+            provider_client=client,
+        )
+        agent._mcp_initialized = True
+        try:
+            await agent.chat("hello")
+
+            kinds = set(port.kinds())
+            assert {"assistant_thinking", "assistant_text", "budget", "lifecycle"} <= kinds
+            assert any(
+                event.payload.get("phase") == "turn_complete"
+                for event in port.of_kind("lifecycle")
+            )
+            assert all(event.session_id == str(agent.session_id) for event in port.events)
+            assert all(event.run_id for event in port.events)
+            assert all(payload_is_safe(event.payload) for event in port.events)
+            assert any(event.is_terminal for event in store.read_events())
+        finally:
+            await agent.aclose()
+            await client.close()
+            store.close()
+
+        assert captured, "Agent.chat() 未到达本地 Provider SDK 边界"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_public_agent_chat_provider_error_seals_failed_canonical_run(
+    tmp_path: Path, provider: str
+) -> None:
+    """普通 SDK Provider 错误同时可观察，并封存 failed/chat_error canonical 事实。"""
+
+    async def scenario() -> None:
+        store = SQLiteRuntimeStore(tmp_path / f"{provider}-error.sqlite")
+        port = RecordingOutputPort()
+        agent = Agent(
+            api_base="https://fixture.invalid/v1" if provider == "openai" else None,
+            api_key="fixture-key",
+            model="fixture-model",
+            thinking_effort="none",
+            custom_system_prompt="fixture system",
+            is_sub_agent=True,
+            runtime_store=store,
+            output_port=port,
+        )
+        agent._mcp_initialized = True
+        captured: list[dict[str, Any]] = []
+        body = json.dumps(
+            {
+                "type": "error",
+                "error": {
+                    "type": "server_error",
+                    "message": "fixture provider failure",
+                    "code": "fixture_error",
+                },
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+        client = _provider_client(
+            provider,
+            captured,
+            response_body=body,
+            response_status=500,
+        )
+        try:
+            if provider == "anthropic":
+                agent._anthropic_client = client
+            else:
+                agent._openai_client = client
+            with pytest.raises(Exception, match="fixture provider failure"):
+                await agent.chat("hello")
+
+            assert captured, "public Agent.chat() 未到达 SDK 错误边界"
+            assert any(
+                event.kind == "error"
+                and "fixture provider failure" in event.payload["message"]
+                for event in port.events
+            )
+            records = store.read_events()
+            assert any(
+                event.kind == "error"
+                and event.metadata.get("lifecycle") == "provider_error"
+                and event.status == "failed"
+                for event in records
+                if event.metadata
+            ), [
+                {
+                    "kind": event.kind,
+                    "status": event.status,
+                    "lifecycle": (event.metadata or {}).get("lifecycle"),
+                    "actions": dict(event.actions or {}),
+                }
+                for event in records
+            ]
+            assert any(
+                event.is_terminal
+                and event.status == "failed"
+                and event.kind == "error"
+                for event in records
+            )
+        finally:
+            await agent.aclose()
+            await client.close()
+            store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_public_agent_chat_port_failure_preserves_sdk_messages_and_canonical_state(
+    tmp_path: Path, provider: str
+) -> None:
+    """端口是观察面：双 Provider public chat 失败时不改 Provider 请求或 canonical 终态。"""
+
+    class _BoomPort:
+        name = "boom"
+
+        def __init__(self) -> None:
+            self.failures: list[str] = []
+
+        def emit(self, event) -> None:
+            self.failures.append(event.kind)
+            raise RuntimeError(f"renderer failed for {event.kind}")
+
+    def canonical_shape(store: SQLiteRuntimeStore) -> list[tuple]:
+        return [
+            (
+                event.role,
+                event.author,
+                event.status,
+                event.partial,
+                event.content.get("kind") if event.content else None,
+                event.content.get("text") if event.content else None,
+                event.content.get("message") if event.content else None,
+                event.metadata.get("lifecycle") if event.metadata else None,
+            )
+            for event in store.read_events()
+        ]
+
+    async def run(output_port, suffix: str) -> tuple[list[tuple], list[dict[str, Any]]]:
+        store = SQLiteRuntimeStore(tmp_path / f"{provider}-{suffix}.sqlite")
+        agent = Agent(
+            api_base="https://fixture.invalid/v1" if provider == "openai" else None,
+            api_key="fixture-key",
+            model="fixture-model",
+            thinking_effort="none",
+            custom_system_prompt="fixture system",
+            is_sub_agent=True,
+            runtime_store=store,
+            output_port=output_port,
+            runtime_session_id=f"session-port-{provider}",
+            runtime_run_id=f"run-port-{provider}",
+        )
+        agent._mcp_initialized = True
+        captured: list[dict[str, Any]] = []
+        body = (
+            _anthropic_stream_body("provider text")
+            if provider == "anthropic"
+            else _openai_stream_body("provider text")
+        )
+        client = _provider_client(provider, captured, response_body=body)
+        try:
+            if provider == "anthropic":
+                agent._anthropic_client = client
+            else:
+                agent._openai_client = client
+            await agent.chat("hello")
+            return canonical_shape(store), captured
+        finally:
+            await agent.aclose()
+            await client.close()
+            store.close()
+
+    boom = _BoomPort()
+    normal, normal_requests = asyncio.run(run(RecordingOutputPort(), "normal"))
+    failed, failed_requests = asyncio.run(run(boom, "failed"))
+
+    assert boom.failures
+    assert normal == failed
+    assert normal_requests == failed_requests
+
+
+def test_public_openai_agent_chat_preserves_sequential_tool_call_ids(
+    tmp_path: Path,
+) -> None:
+    """C02：OpenAI 顺序工具 dispatch 的输出与下一请求都保留各自 call id。"""
+
+    call_ids = ["call-sequential-first", "call-sequential-second"]
+    first_body = _openai_stream_body_with_tools(
+        [
+            (
+                "write_file",
+                json.dumps({"file_path": "first.txt", "content": "first"}),
+                call_ids[0],
+            ),
+            (
+                "write_file",
+                json.dumps({"file_path": "second.txt", "content": "second"}),
+                call_ids[1],
+            ),
+        ]
+    )
+
+    async def scenario() -> None:
+        store = SQLiteRuntimeStore(tmp_path / "openai-sequential.sqlite")
+        port = RecordingOutputPort()
+        captured: list[dict[str, Any]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(json.loads(request.content))
+            body = first_body if len(captured) == 1 else _openai_stream_body("done")
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content=body,
+            )
+
+        client = AsyncOpenAI(
+            api_key="fixture-key",
+            base_url="https://fixture.invalid/v1",
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+        agent = Agent(
+            api_base="https://fixture.invalid/v1",
+            api_key="fixture-key",
+            model="fixture-model",
+            thinking_effort="none",
+            permission_mode="acceptEdits",
+            custom_system_prompt="fixture system",
+            project_context=ProjectContext.from_root(tmp_path),
+            runtime_store=store,
+            output_port=port,
+            provider_client=client,
+            is_sub_agent=True,
+        )
+        agent._mcp_initialized = True
+        try:
+            await agent.chat("write both files")
+        finally:
+            await agent.aclose()
+            await client.close()
+            store.close()
+
+        assert (tmp_path / "first.txt").read_text(encoding="utf-8") == "first"
+        assert (tmp_path / "second.txt").read_text(encoding="utf-8") == "second"
+        assert [event.tool_call_id for event in port.of_kind("tool_call")] == call_ids
+        assert [event.tool_call_id for event in port.of_kind("tool_result")] == call_ids
+        assert len(captured) == 2
+
+        assistant = next(
+            message
+            for message in captured[1]["messages"]
+            if message.get("role") == "assistant"
+        )
+        assert [call["id"] for call in assistant["tool_calls"]] == call_ids
+        tool_messages = [
+            message for message in captured[1]["messages"] if message.get("role") == "tool"
+        ]
+        assert [message["tool_call_id"] for message in tool_messages] == call_ids
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "openai"])
+def test_public_agent_chat_preserves_tool_call_id_when_approval_is_denied(
+    tmp_path: Path, provider: str
+) -> None:
+    """C02：完整 Provider 工具路径的 tool_call/tool_denied 使用真实调用 ID。"""
+
+    async def scenario() -> None:
+        store = SQLiteRuntimeStore(tmp_path / f"{provider}-deny.sqlite")
+        port = RecordingOutputPort()
+        target = tmp_path / f"{provider}-must-not-write.txt"
+        agent = Agent(
+            api_base="https://fixture.invalid/v1" if provider == "openai" else None,
+            api_key="fixture-key",
+            model="fixture-model",
+            thinking_effort="none",
+            custom_system_prompt="fixture system",
+            is_sub_agent=True,
+            runtime_store=store,
+            output_port=port,
+            interaction_port=DenyingInteractionPort(),
+        )
+        agent._mcp_initialized = True
+        captured: list[dict[str, Any]] = []
+        client = _agent_chat_provider_client(
+            provider,
+            captured,
+            json.dumps({"file_path": str(target), "content": "should not write"}),
+            tool_name="write_file",
+        )
+        try:
+            if provider == "anthropic":
+                agent._anthropic_client = client
+            else:
+                agent._openai_client = client
+            await agent.chat("write the file")
+        finally:
+            await agent.aclose()
+            await client.close()
+            store.close()
+
+        assert target.exists() is False
+        expected_call_id = "call-agent-read" if provider == "anthropic" else "call-cli-read"
+        for event in port.events:
+            if event.kind in {"tool_call", "tool_denied"}:
+                assert event.tool_call_id == expected_call_id
+        assert {event.kind for event in port.events} >= {"tool_call", "tool_denied"}
 
     asyncio.run(scenario())
 
@@ -1359,6 +1704,58 @@ def _openai_stream_body_with_tool(
             "model": "fixture-model",
             "choices": [],
             "usage": {"prompt_tokens": 11, "completion_tokens": 1, "total_tokens": 12},
+        },
+    ]
+    return b"".join(
+        b"data: "
+        + json.dumps(chunk, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        + b"\n\n"
+        for chunk in chunks
+    ) + b"data: [DONE]\n\n"
+
+
+def _openai_stream_body_with_tools(
+    tool_calls: list[tuple[str, str, str]],
+) -> bytes:
+    """构造同一 Provider 响应中的多个工具调用，覆盖顺序 dispatch。"""
+
+    delta_tool_calls = [
+        {
+            "index": index,
+            "id": call_id,
+            "type": "function",
+            "function": {"name": name, "arguments": arguments},
+        }
+        for index, (name, arguments, call_id) in enumerate(tool_calls)
+    ]
+    chunks = [
+        {
+            "id": "chatcmpl-sequential-tools",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "fixture-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {"role": "assistant", "tool_calls": delta_tool_calls},
+                    "finish_reason": None,
+                }
+            ],
+        },
+        {
+            "id": "chatcmpl-sequential-tools",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "fixture-model",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+        },
+        {
+            "id": "chatcmpl-sequential-tools",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "fixture-model",
+            "choices": [],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 2, "total_tokens": 13},
         },
     ]
     return b"".join(

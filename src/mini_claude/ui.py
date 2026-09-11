@@ -98,6 +98,13 @@ def print_info(msg: str) -> None:
     console.print(f"\n  [cyan]ℹ {msg}[/cyan]")
 
 
+def print_diagnostic(msg: str) -> None:
+    """诊断输出：走 stderr，避免污染 stdout 上的业务/协议输出。"""
+
+    sys.stderr.write(msg.rstrip("\n") + "\n")
+    sys.stderr.flush()
+
+
 # ─── Spinner ──────────────────────────────────────────────
 
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]

@@ -11,7 +11,10 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv()
 from .agent import Agent, DEFAULT_THINKING_EFFORT
-from .ui import print_welcome, print_user_prompt, print_error, print_info, print_plan_for_approval, print_plan_approval_options
+from .project_context import ProjectContext, ProjectContextError, WorkspaceNotFoundError
+from .runtime_ports import set_diagnostic_sink
+from .tui_adapter import TerminalInteractionPort, TerminalOutputPort
+from .ui import print_welcome, print_user_prompt, print_error, print_info, print_plan_for_approval, print_plan_approval_options, print_diagnostic
 from .session import (
     CanonicalRecoveryError,
     get_latest_session_id,
@@ -121,14 +124,10 @@ def _open_latest_canonical_store() -> tuple[SQLiteRuntimeStore | None, str | Non
 async def run_repl(agent: Agent) -> None:
     """Interactive REPL loop."""
 
-    async def confirm_fn(message: str) -> bool:
-        try:
-            answer = input("  Allow? (y/n): ")
-            return answer.lower().startswith("y")
-        except EOFError:
-            return False
-
-    agent.set_confirm_fn(confirm_fn)
+    # 终端交互统一经适配器：阻塞 input 在独立线程中执行、不阻塞事件循环，
+    # 且取消可以解除等待。**不再注册 `confirm_fn`** —— 它内部的同步 input
+    # 会优先于端口，使端口收不到任何请求（复核 N-12）。
+    agent.set_interaction_port(TerminalInteractionPort())
 
     async def plan_approval_fn(plan_content: str) -> dict:
         print_plan_for_approval(plan_content)
@@ -210,7 +209,7 @@ async def run_repl(agent: Agent) -> None:
                 print_error(str(e))
             continue
         if inp == "/memory":
-            memories = list_memories()
+            memories = list_memories(agent.context)
             if not memories:
                 print_info("No memories saved yet.")
             else:
@@ -219,7 +218,7 @@ async def run_repl(agent: Agent) -> None:
                     print(f"    [{m.type}] {m.name} — {m.description}")
             continue
         if inp == "/skills":
-            skills = discover_skills()
+            skills = discover_skills(agent.context)
             if not skills:
                 print_info("No skills found. Add skills to .claude/skills/<name>/SKILL.md")
             else:
@@ -234,12 +233,12 @@ async def run_repl(agent: Agent) -> None:
             space_idx = inp.find(" ")
             cmd_name = inp[1:space_idx] if space_idx > 0 else inp[1:]
             cmd_args = inp[space_idx + 1:] if space_idx > 0 else ""
-            skill = get_skill_by_name(cmd_name)
+            skill = get_skill_by_name(cmd_name, agent.context)
             if skill and skill.user_invocable:
                 print_info(f"Invoking skill: {skill.name}")
                 try:
                     if skill.context == "fork":
-                        result = execute_skill(skill.name, cmd_args)
+                        result = execute_skill(skill.name, cmd_args, agent.context)
                         if result:
                             await agent.chat(f'Use the skill tool to invoke "{skill.name}" with args: {cmd_args or "(none)"}')
                     else:
@@ -276,8 +275,34 @@ async def _run_one_shot(agent: Agent, prompt: str) -> None:
         await agent.aclose()
 
 
+def _entry_workspace() -> Path:
+    """读取入口的 workspace 根（未指定时为进程当前目录）。
+
+    进程当前目录不可读取时转换为可诊断的 ProjectContext 错误，避免裸 OSError
+    冒泡成未处理堆栈（D8）。
+    """
+
+    try:
+        return Path.cwd()
+    except OSError as exc:
+        raise WorkspaceNotFoundError(
+            f"无法读取进程当前目录（可能已被删除或不可访问）：{exc}"
+        ) from exc
+
+
 def main() -> None:
     args = parse_args()
+
+    # 入口一次性解析 workspace 上下文（D7：未指定时使用进程当前目录）。
+    # 解析失败时给出可诊断错误与非零退出码，不打印未处理堆栈（D8）。
+    try:
+        project_context = ProjectContext.from_root(_entry_workspace())
+    except ProjectContextError as exc:
+        print_error(f"Cannot resolve workspace: {exc}")
+        sys.exit(2)
+
+    # 诊断通道：把 MCP/记忆等后台诊断接到 stderr（不污染 stdout）。
+    set_diagnostic_sink(print_diagnostic)
 
     if args.help:
         print("""
@@ -433,6 +458,9 @@ Examples:
         thinking_effort=thinking_effort,
         max_cost_usd=args.max_cost,
         max_turns=args.max_turns,
+        project_context=project_context,
+        output_port=TerminalOutputPort(),
+        interaction_port=TerminalInteractionPort(),
         api_base=resolved_api_base if resolved_use_openai else None,
         anthropic_base_url=resolved_api_base if not resolved_use_openai else None,
         api_key=resolved_api_key,
